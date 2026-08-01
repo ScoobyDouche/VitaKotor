@@ -1,0 +1,44 @@
+
+Dynamic section at offset 0x5a269c contains 41 entries:
+  Tag        Type                         Name/Value
+ 0x00000003 (PLTGOT)                     0x5a6ab0
+ 0x00000002 (PLTRELSZ)                   76424 (bytes)
+ 0x00000017 (JMPREL)                     0x15a874
+ 0x00000014 (PLTREL)                     REL
+ 0x00000011 (REL)                        0x13e2bc
+ 0x00000012 (RELSZ)                      116152 (bytes)
+ 0x00000013 (RELENT)                     8 (bytes)
+ 0x6ffffffa (RELCOUNT)                   320
+ 0x00000006 (SYMTAB)                     0x1f0
+ 0x0000000b (SYMENT)                     16 (bytes)
+ 0x00000005 (STRTAB)                     0x45070
+ 0x0000000a (STRSZ)                      698222 (bytes)
+ 0x6ffffef5 (GNU_HASH)                   0xef7e0
+ 0x00000004 (HASH)                       0x11445c
+ 0x00000001 (NEEDED)                     Shared library: [libandroid_port.so]
+ 0x00000001 (NEEDED)                     Shared library: [libfmod.so]
+ 0x00000001 (NEEDED)                     Shared library: [libdl.so]
+ 0x00000001 (NEEDED)                     Shared library: [liblog.so]
+ 0x00000001 (NEEDED)                     Shared library: [libfreetype.so]
+ 0x00000001 (NEEDED)                     Shared library: [libSDL2.so]
+ 0x00000001 (NEEDED)                     Shared library: [libGLESv1_CM.so]
+ 0x00000001 (NEEDED)                     Shared library: [libandroid.so]
+ 0x00000001 (NEEDED)                     Shared library: [libLzmaLib.so]
+ 0x00000001 (NEEDED)                     Shared library: [libminiz.so]
+ 0x00000001 (NEEDED)                     Shared library: [libGLESv2.so]
+ 0x00000001 (NEEDED)                     Shared library: [libOpenSLES.so]
+ 0x00000001 (NEEDED)                     Shared library: [libm.so]
+ 0x00000001 (NEEDED)                     Shared library: [libc.so]
+ 0x0000000e (SONAME)                     Library soname: [libKOTOR.so]
+ 0x0000001a (FINI_ARRAY)                 0x5a3624
+ 0x0000001c (FINI_ARRAYSZ)               8 (bytes)
+ 0x00000019 (INIT_ARRAY)                 0x5a362c
+ 0x0000001b (INIT_ARRAYSZ)               112 (bytes)
+ 0x0000001e (FLAGS)                      BIND_NOW
+ 0x6ffffffb (FLAGS_1)                    Flags: NOW
+ 0x6ffffff0 (VERSYM)                     0x135870
+ 0x6ffffffc (VERDEF)                     0x13e240
+ 0x6ffffffd (VERDEFNUM)                  1
+ 0x6ffffffe (VERNEED)                    0x13e25c
+ 0x6fffffff (VERNEEDNUM)                 3
+ 0x00000000 (NULL)                       0x0

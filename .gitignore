@@ -1,0 +1,17 @@
+# === NEVER COMMIT GAME BINARIES OR ASSETS (copyrighted, user-owned) ===
+# Extracted APK (native libs, dex, resources, manifest)
+apk/
+# OBB expansion files (game data)
+com.aspyr.swkotor/
+*.obb
+*.apk
+
+# Build output
+build/
+backups/
+*.vpk
+*.velf
+*.self
+
+# Editor / OS cruft
+.DS_Store

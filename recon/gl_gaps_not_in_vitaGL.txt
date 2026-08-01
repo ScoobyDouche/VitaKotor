@@ -1,0 +1,14 @@
+glBlendColor
+glCompressedTexSubImage2D
+glDetachShader
+glGetRenderbufferParameteriv
+glGetShaderPrecisionFormat
+glGetTexParameterfv
+glGetTexParameteriv
+glGetUniformfv
+glGetUniformiv
+glIsBuffer
+glIsShader
+glSampleCoverage
+glTexParameterfv
+glValidateProgram
