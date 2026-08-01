@@ -11,7 +11,8 @@ with a from-scratch FMOD audio implementation over `sceAudiodec` and
 `sceAudioOut` underneath.
 
 > **You must own the Android version of KOTOR.** Nothing here contains game
-> code, data or assets, and it does nothing on its own. You supply the game.
+> code or data — only the loader, plus artwork used for the LiveArea. It does
+> nothing on its own. You supply the game.
 
 ---
 
@@ -137,6 +138,10 @@ cmake --build build -j"$(nproc)"
 The build globs GLSL shaders and font metrics out of `apk/assets/`, so extract
 your own APK to `apk/` in the repo root first. That directory is gitignored and
 must never be committed.
+
+The LiveArea assets in `sce_sys/` are generated from the APK's own artwork by
+`tools/mklivearea.sh` (needs ImageMagick). They are checked in, so you only need
+to re-run it if you want to change how they look.
 
 Tunables live in `loader/config.h` — MSAA mode, the redundant texture-bind
 filter, memory layout. `RECON.md` documents the binary analysis the port is
