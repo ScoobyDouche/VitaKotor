@@ -31,6 +31,8 @@ add_executable(KOTOR
   loader/main.c
   loader/so_util.c
   loader/dynlib.c
+  loader/obb_index.c
+  loader/loadscreen.c
   loader/jni_patch.c
   loader/audio_patch.c
   loader/audio_mp3.c

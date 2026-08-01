@@ -21,6 +21,7 @@ extern volatile int g_io_trace;
 // probes report the handle count next to each stream event, so stream lifetime
 // and handle growth can be correlated from a single log line.
 int io_open_count(void);
+void io_obb_mount_done(void);
 
 // Every thread the game creates, recorded by our pthread_create wrapper. `entry`
 // is the thread body's address -- feed it to addr2line against libKOTOR.so /

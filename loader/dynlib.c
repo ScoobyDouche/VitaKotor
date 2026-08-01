@@ -31,6 +31,9 @@
 #include "fs_patch.h"
 #include "log.h"
 #include "main.h"
+#include "config.h"
+#include "obb_index.h"
+#include "loadscreen.h"
 
 // ---- generic stubs (category b) ------------------------------------------
 int ret0(void) { return 0; }
@@ -333,13 +336,18 @@ static void io_dump_open(void) {
  * buffered sequential scan of ~27k zip entries into unbuffered card reads --
  * that is what made attempt #1 crawl (main thread had 2.7M runClk at t=660s
  * versus 135M by t=420 in a healthy run). Only seek when actually needed. */
-typedef struct { int refs; FILE *real; long size; long rpos; char path[72]; } SharedFile;
+/* fd replaces the old FILE*: sceIoPread is one syscall against an absolute
+ * offset, where fseek+fread is two plus a newlib buffer that the seek discards
+ * anyway. rpos is kept only for the seek-ratio diagnostic now. */
+typedef struct {
+  int refs; SceUID fd; long size; long rpos; char path[72]; ObbIndex *idx;
+} SharedFile;
 typedef struct { int used; SharedFile *sf; long pos; int eof, err; } VFile;
 
 static SharedFile g_sf[SF_MAX];
 static VFile      g_vf[VF_MAX];
 static SceUID     g_io_mutex = -1;
-static unsigned   g_vreads = 0, g_vseeks = 0;
+static unsigned   g_vreads = 0, g_vseeks = 0, g_vhits = 0;
 static int        g_vlive = 0;
 
 static void io_lock(void) {
@@ -388,21 +396,21 @@ static FILE *fopen_shared(const char *path, const char *mode) {
   io_lock();
   SharedFile *sf = NULL;
   for (int i = 0; i < SF_MAX; i++)
-    if (g_sf[i].real && !strcmp(g_sf[i].path, path)) { sf = &g_sf[i]; break; }
+    if (g_sf[i].fd && !strcmp(g_sf[i].path, path)) { sf = &g_sf[i]; break; }
 
   if (!sf) {
     for (int i = 0; i < SF_MAX; i++)
-      if (!g_sf[i].real) { sf = &g_sf[i]; break; }
+      if (!g_sf[i].fd) { sf = &g_sf[i]; break; }
     if (!sf) { io_unlock(); return NULL; }
-    sf->real = fopen(path, mode);
-    if (!sf->real) { io_unlock(); return NULL; }
-    setvbuf(sf->real, NULL, _IOFBF, 64 * 1024);   /* fewer, larger card reads */
-    fseek(sf->real, 0, SEEK_END);
-    sf->size = ftell(sf->real);
-    fseek(sf->real, 0, SEEK_SET);
+    SceUID fd = sceIoOpen(path, SCE_O_RDONLY, 0);
+    if (fd < 0) { io_unlock(); return NULL; }
+    sf->fd   = fd;
+    sf->size = (long)sceIoLseek(fd, 0, SCE_SEEK_END);
+    sceIoLseek(fd, 0, SCE_SEEK_SET);
     sf->rpos = 0;
     sf->refs = 0;
     snprintf(sf->path, sizeof sf->path, "%s", path);
+    sf->idx  = obbidx_open(path, sf->size);
     g_files_open++;
     log_printf("[io] shared archive opened: %s (%ld bytes) -- further opens "
                "share this one handle", path, sf->size);
@@ -422,6 +430,17 @@ static FILE *fopen_shared(const char *path, const char *mode) {
 }
 
 int io_open_count(void) { return g_files_open; }
+
+/* Called once the archives are mounted. Stops recording and writes each cache
+ * out; recording every read for the whole session would grow without bound. */
+void io_obb_mount_done(void) {
+  io_lock();
+  for (int i = 0; i < SF_MAX; i++)
+    if (g_sf[i].fd && g_sf[i].idx) obbidx_finish(g_sf[i].idx);
+  io_unlock();
+  log_printf("[io] mount complete: %u card reads, %u served from cache, %d handles live",
+             g_vreads, g_vhits, g_vlive);
+}
 
 static FILE *fopen_diag(const char *path, const char *mode) {
   if (share_this(path, mode)) {
@@ -457,7 +476,8 @@ static int fclose_diag(FILE *f) {
     v->used = 0;
     g_vlive--;
     if (sf && --sf->refs <= 0) {
-      fclose(sf->real);
+      sceIoClose(sf->fd);
+      obbidx_close(sf->idx);
       log_printf("[io] shared archive closed: %s", sf->path);
       memset(sf, 0, sizeof *sf);
       g_files_open--;
@@ -527,32 +547,38 @@ static size_t fread_diag(void *p, size_t sz, size_t n, FILE *f) {
   VFile *v = vf_of(f);
   if (v) {
     if (!sz || !n) return 0;
-    /* Seek-then-read atomically: many virtual handles share one real position. */
     io_lock();
     SharedFile *sf = v->sf;
-    size_t r = 0;
-    int ok = 1;
-    if (sf->rpos != v->pos) {                 /* only when another reader moved it */
-      g_vseeks++;
-      if (fseek(sf->real, v->pos, SEEK_SET) == 0) sf->rpos = v->pos;
-      else { ok = 0; v->err = 1; }
+    long want = (long)(sz * n);
+    long got  = 0;
+
+    /* 1. Replay cache. On any boot after the first this is nearly every read of
+     *    the mount, and costs a memcpy instead of a card round trip. */
+    if (obbidx_serve(sf->idx, v->pos, p, want)) {
+      got = want;
+      g_vhits++;
+    } else {
+      /* 2. One positional read; no seek, no newlib buffer to invalidate. */
+      if (sf->rpos != v->pos) g_vseeks++;      /* diagnostic only now */
+      int rr = sceIoPread(sf->fd, p, (SceSize)want, (SceOff)v->pos);
+      if (rr < 0) { v->err = 1; rr = 0; }
+      got = rr;
+      sf->rpos = v->pos + got;
+      if (got > 0) obbidx_record(sf->idx, v->pos, p, got);
+      g_vreads++;
     }
-    if (ok) {
-      r = fread(p, sz, n, sf->real);
-      long got = (long)(r * sz);
-      sf->rpos += got;
-      v->pos   += got;
-      if (r < n) v->eof = 1;
-    }
-    /* The whole fix rides on this ratio. Seeks near 0% means stdio buffering
-     * survived; anywhere near 100% means readers are interleaving and we are
-     * back to attempt #1's unbuffered crawl. */
-    if ((++g_vreads & 8191) == 0)
-      log_printf("[io] shared reads=%u seeks=%u (%u%%), %d virtual handles live",
-                 g_vreads, g_vseeks, (unsigned)((uint64_t)g_vseeks * 100 / g_vreads),
-                 g_vlive);
+
+    v->pos += got;
+    if (got < want) v->eof = 1;
+
+    if (((g_vreads + g_vhits) & 8191) == 0)
+      log_printf("[io] shared reads=%u (cache hits=%u, %u%%) seeks=%u, %d handles live",
+                 g_vreads, g_vhits,
+                 (unsigned)((uint64_t)g_vhits * 100 / (g_vreads + g_vhits)),
+                 g_vseeks, g_vlive);
     io_unlock();
-    return r;
+    loadscreen_tick();                          /* outside the lock; throttled */
+    return (size_t)got / sz;
   }
   size_t r = fread(p, sz, n, f);
   // Sparse heartbeat: OBB mount reads ~27k tiny local headers off slow storage.
@@ -575,7 +601,9 @@ static void rewind_diag(FILE *f) {
   if (f) rewind(f);
 }
 static int fflush_diag(FILE *f) { if (vf_of(f)) return 0; return f ? fflush(f) : 0; }
-static int fileno_diag(FILE *f) { VFile *v = vf_of(f); if (v) return fileno(v->sf->real); return f ? fileno(f) : -1; }
+/* Virtual archive handles are backed by a SceUID, not a newlib FILE*; hand
+ * that back. Nothing in the .so does more than test it for validity. */
+static int fileno_diag(FILE *f) { VFile *v = vf_of(f); if (v) return (int)v->sf->fd; return f ? fileno(f) : -1; }
 static int setvbuf_diag(FILE *f, char *b, int m, size_t n) {
   if (vf_of(f)) return 0;
   return f ? setvbuf(f, b, m, n) : -1;

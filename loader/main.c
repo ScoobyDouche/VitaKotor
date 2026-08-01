@@ -20,6 +20,7 @@
 #include "config.h"
 #include "so_util.h"
 #include "dynlib.h"
+#include "loadscreen.h"
 #include "jni_patch.h"
 #include "audio_patch.h"
 #include "bink_patch.h"
@@ -2119,8 +2120,20 @@ static void *game_main_thread(void *arg) {
   }
 
   // Mount the OBB archives so SDL_main's wait loop (g_obbMounted &&
-  // g_patchObbMounted) proceeds.
+  // g_patchObbMounted) proceeds. This is the slowest part of startup on a cold
+  // cache, so put a progress bar up first -- vitaGL is already initialised
+  // above, and the bar draws from this thread via the archive read path.
+  // A prebuilt .idx means the mount replays from cache and startup is about a
+  // minute shorter, so the bar needs the matching estimate.
+  int warm = 0;
+  { SceUID t = sceIoOpen(DATA_PATH "/main.obb.idx", SCE_O_RDONLY, 0);
+    if (t >= 0) { warm = 1; sceIoClose(t); } }
+  loadscreen_begin(warm);
+
   mount_obbs();
+  io_obb_mount_done();      // stop recording, write the replay caches
+  // NOT loadscreen_end() here: the game draws nothing for another ~59s. The
+  // bar stays up until the first glDraw* call hands the screen over.
 
   ensure_writable_dirs();
 

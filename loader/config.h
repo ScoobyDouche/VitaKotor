@@ -71,6 +71,38 @@
 //   SCE_GXM_MULTISAMPLE_4X    original, prettiest, slowest
 #define GL_MSAA_MODE SCE_GXM_MULTISAMPLE_NONE
 
+// ---- Archive mount speed & feedback ----------------------------------------
+// Mounting main.obb reads a ~46-byte local header at each of ~16k entries,
+// scattered across 1.75 GB. Measured from the real archive: mean gap between
+// consecutive headers 107 KB, median 38 KB. Read-ahead was tried and DISPROVED
+// (log122): a 32 KB block buffer moved 373 MB to eliminate 30% of the reads and
+// made the mount slower, 95s -> 103s. Sparse access defeats prefetching.
+//
+// What works instead is that the mount reads the same bytes every boot, so we
+// record them once and replay them from a small file afterwards. See
+// obb_index.h. First boot is unchanged; later boots should skip the scattered
+// reads. Delete ux0:data/kotor/main.obb.idx to force a re-record.
+#define OBB_INDEX_CACHE      1
+#define OBB_INDEX_BUDGET_KB  4096   // cap on recorded bytes (~735 KB expected)
+#define OBB_INDEX_MAX_RANGE  4096   // ignore reads bigger than this: asset data,
+                                    // not metadata, and it would bloat the cache
+
+// Read archives with sceIoPread instead of fseek+fread. One syscall per read
+// rather than two, and no newlib buffer to invalidate -- which matters because
+// every archive read is preceded by a seek to the virtual handle's position.
+#define OBB_USE_PREAD        1
+
+// Progress bar for startup. The game draws NOTHING until its first draw call --
+// log124 measured that at 69.3s, later even than the "Main Menu" analytics
+// string at 56.1s -- so without this the console looks hung for over a minute.
+// The bar spans loader start to that first draw, estimating from how long the
+// previous boot took (saved in ux0:data/kotor/startup.tim). Warm and cold
+// archive-cache timings are tracked separately; they differ by about a minute.
+#define LOADSCREEN_ENABLE         1
+#define LOADSCREEN_REDRAW_MS      100
+#define LOADSCREEN_DEFAULT_WARM_S 70    // first-ever run with a built .idx cache
+#define LOADSCREEN_DEFAULT_COLD_S 135   // first-ever run, building the cache
+
 // Skip glBindTexture calls that rebind what is already bound. log120 measured
 // 1.008 texture binds per draw call, so nearly all of them are redundant.
 // Set to 0 if textures ever look wrong, to rule this out.

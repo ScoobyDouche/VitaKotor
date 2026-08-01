@@ -30,6 +30,7 @@
 #include "glsl_prep.h"
 #include "dynlib.h"
 #include "log.h"
+#include "loadscreen.h"
 
 static inline float u2f(uint32_t u) { union { uint32_t u; float f; } c; c.u = u; return c.f; }
 
@@ -402,6 +403,7 @@ static inline void draw_note_source(void) {
 }
 
 static void glDrawArrays_t(GLenum mode, GLint first, GLsizei count) {
+  if (loadscreen_active()) loadscreen_end();   /* first real frame: hand over */
   if (g_draw_n < 20) log_printf("[GL] glDrawArrays(mode=0x%x, first=%d, count=%d) #%d",
                                (unsigned)mode, first, (int)count, g_draw_n);
   if (g_gl_text_draw && g_textdraw_n < TEXTDRAW_LOG_MAX)
@@ -412,6 +414,7 @@ static void glDrawArrays_t(GLenum mode, GLint first, GLsizei count) {
   glDrawArrays(mode, first, count);
 }
 static void glDrawElements_t(GLenum mode, GLsizei count, GLenum type, const void *idx) {
+  if (loadscreen_active()) loadscreen_end();   /* first real frame: hand over */
   if (g_draw_n < 20) log_printf("[GL] glDrawElements(mode=0x%x, count=%d, type=0x%x) #%d",
                                (unsigned)mode, (int)count, (unsigned)type, g_draw_n);
   if (g_gl_text_draw && g_textdraw_n < TEXTDRAW_LOG_MAX)
@@ -520,6 +523,7 @@ static void glGetFloatv_t(GLenum pname, GLfloat *params) {
     else if (_s == GL_TRACE_LIMIT) \
       log_printf("[GL] per-call GL trace silenced after %d calls (steady state; " \
                  "frame/shader/link/crash logs continue)", GL_TRACE_LIMIT); \
+    loadscreen_tick(); \
   } while (0)
 static void glEnable_e(GLenum cap) { GLLOG("glEnable(0x%x)", (unsigned)cap); glEnable(cap); }
 static void glDisable_e(GLenum cap) { GLLOG("glDisable(0x%x)", (unsigned)cap); glDisable(cap); }
