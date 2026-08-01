@@ -34,9 +34,9 @@
 
 static inline float u2f(uint32_t u) { union { uint32_t u; float f; } c; c.u = u; return c.f; }
 
-// Per-call GL trace budget (declared early so both glViewport_t and the GLLOG
-// block below can gate on it). See the GLLOG definition for the rationale.
-#define GL_TRACE_LIMIT 4000
+// Per-call GL trace budget lives in config.h (GL_TRACE_LIMIT) so it can be
+// re-armed for bring-up without editing this file. Declared early so both
+// glViewport_t and the GLLOG block below can gate on it.
 static int g_gl_seq = 0;
 
 /* -- (2) softfp->hardfp float-by-value shims -------------------------------- */
@@ -459,7 +459,8 @@ void gl_patch_on_swap(void) {
 // low frame rate. The *diagnostic* value is all in init (~18 cap queries) and the
 // UNWRITTEN case; steady-state values are noise. Budget the normal case, and keep
 // UNWRITTEN unconditional since it always signals a real vitaGL gap.
-#define GLGET_TRACE_LIMIT 256
+/* GLGET_TRACE_LIMIT lives in config.h so it can be re-armed without editing
+ * this file. 0 disables the budgeted case; UNWRITTEN stays unconditional. */
 static int g_glget_n = 0;
 #define GLGETLOG(...) do { \
     if (g_glget_n < GLGET_TRACE_LIMIT) { \
@@ -480,7 +481,7 @@ static void glGetIntegerv_t(GLenum pname, GLint *params) {
     GLGETLOG("[GL] glGetIntegerv(0x%x) -> %d", (unsigned)pname, params ? *params : 0);
   // 0xd57 is init()'s LAST cap query; the hang is just past here. Arm heap
   // tracing now so OpenGLESState::init's allocations become visible.
-  if (pname == 0xd57 && !g_mem_trace) {
+  if (MEM_TRACE_ENABLE && pname == 0xd57 && !g_mem_trace) {
     log_printf("[GL] --- arming heap trace (entering GL engine setup) ---");
     g_mem_trace = 1;
   }

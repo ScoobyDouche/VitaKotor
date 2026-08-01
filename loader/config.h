@@ -103,6 +103,33 @@
 #define LOADSCREEN_DEFAULT_WARM_S 70    // first-ever run with a built .idx cache
 #define LOADSCREEN_DEFAULT_COLD_S 135   // first-ever run, building the cache
 
+// Per-call GL trace budget. Every traced call is one sceIoWrite to the memory
+// card, and log125/126 measured what that costs: gaps after a log line sit at a
+// flat ~8-11ms floor regardless of WHICH line it was, and the two slowest gaps
+// mod 64 are residues 0 and 1 in both runs -- exactly log.c's close/reopen
+// boundary. So the logger, not the engine, sets the pace. Before the first draw
+// (70.3s) both runs wrote ~4-5.4k lines, ~60% of startup, of which the per-call
+// GL trace alone was 1958 lines / 21.0s (log125) and 3148 / 24.7s (log126).
+// The budget is never exhausted before the menu, so a shipping build pays all of
+// it. 0 disables the trace (GLLOG still ticks the loadscreen and emits one
+// "silenced" line); raise it to 4000 to get the bring-up trace back.
+#define GL_TRACE_LIMIT 0
+
+// Heap tracing. gl_patch.c arms it at the last GL cap query (entering engine
+// setup) to catch an UNBOUNDED alloc loop during bring-up, and never disarms it,
+// so it runs for the whole session. MEM_TRACE is already throttled to every
+// 1024th allocation -- but KOTOR allocates ~2.3M times in a 700s session, so the
+// heartbeat alone emitted 2249 lines in log119, the single largest log source in
+// gameplay (26% of all lines, ~54s of frame time). Off for release; set to 1 to
+// hunt an allocation loop again.
+#define MEM_TRACE_ENABLE 0
+
+// glGet* value trace. The diagnostic value is all in init (~18 cap queries);
+// steady-state values are noise, and log119 still spent 231 lines on them. The
+// UNWRITTEN case stays unconditional either way -- it always signals a real
+// vitaGL gap. Raise to 256 to restore the bring-up trace.
+#define GLGET_TRACE_LIMIT 0
+
 // Skip glBindTexture calls that rebind what is already bound. log120 measured
 // 1.008 texture binds per draw call, so nearly all of them are redundant.
 // Set to 0 if textures ever look wrong, to rule this out.
