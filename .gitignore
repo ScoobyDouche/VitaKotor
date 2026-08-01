@@ -15,3 +15,6 @@ backups/
 
 # Editor / OS cruft
 .DS_Store
+
+# Local tooling config -- regenerates on every permission grant, machine-specific
+.claude/
