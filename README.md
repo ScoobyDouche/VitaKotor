@@ -27,6 +27,7 @@ save.
 
 | | |
 |---|---|
+| Startup | ~2 min on first launch, then under a minute |
 | Frame rate | ~30–38 fps typical, dips in dense scenes |
 | Audio | Sound effects and some music; parts of the music and a few voice lines are missing |
 | Input | Physical controls, plus front touchscreen for menus |
@@ -75,7 +76,14 @@ just a zip — open it with any archive tool to get at the libraries inside.
    patch.<version>.com.aspyr.swkotor.obb  ->  patch.obb   (~453 MB)
    ```
 
-5. **Launch it.** First boot is slow — it is mounting a 2.1 GB archive.
+5. **Launch it.** The **first** boot takes around two minutes: it reads through
+   the 2.1 GB archive and records what it needed into `main.obb.idx` beside it.
+   Every boot after that reuses the recording and reaches the game in under a
+   minute. A progress bar is on screen throughout, so you can tell it is
+   working rather than hung.
+
+   Delete the `.idx` files if you ever replace an `.obb`; they are rebuilt
+   automatically, and a mismatched one is ignored rather than trusted.
 
 You should end up with:
 
@@ -88,6 +96,9 @@ ux0:data/kotor/
 ├── main.obb
 └── patch.obb
 ```
+
+The loader adds `main.obb.idx`, `patch.obb.idx`, `startup.tim` and `log.txt`
+here on first run.
 
 Shaders and font metrics ship inside the VPK, so there is nothing else to copy.
 
