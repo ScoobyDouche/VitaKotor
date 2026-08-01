@@ -1,6 +1,8 @@
 # Per-handle read buffering for shared .obb handles
 
-**Status:** designed, not implemented
+**Status:** implemented, MEASURED, and REJECTED. Superseded by the replay cache
+described under "Outcome" below. Kept because the negative result is the reason
+the working fix looks the way it does.
 **Date:** 2026-08-01
 
 ## Problem
@@ -176,3 +178,60 @@ immediately, before anything is built on top of it.
 - Set the block size to 0 in `loader/config.h` and rebuild.
 - Or, without reinstalling, create `ux0:data/kotor/no_obb_share` on the card to
   bypass the sharing layer entirely.
+
+---
+
+## Outcome (2026-08-01, log122)
+
+**The design above was built, measured, and rejected.** It made startup slower:
+the mount went from 95.6s to 103.7s, and the seek ratio barely moved, 100% to
+99%.
+
+The estimate at the end of "Verification" was the thing that turned out to be
+wrong. Read-ahead assumed the archive is read roughly sequentially. It is not.
+Measured offline against the real `main.obb` (15,984 entries, all stored, 1.79 MB
+contiguous central directory):
+
+| Gap between consecutive local headers | |
+|---|---|
+| mean | 107 KB |
+| median | 38 KB |
+
+A 32 KB block sits just below the median, which is the worst possible place.
+Simulating the real offsets:
+
+| Block | Backing reads | Bytes moved |
+|---|---|---|
+| unbuffered | 15,984 | **1.0 MB** |
+| 32 KB (shipped) | 11,383 | **373 MB** |
+| 64 KB | 7,032 | 461 MB |
+| 1 MB | 792 | 830 MB |
+
+The mount needs ~46 bytes out of every ~107 KB. Prefetching is the wrong tool
+for access that sparse: 30% fewer reads cost 373x the bytes. Even 1 MB blocks
+only reach 20x fewer reads by moving 830 MB, which on a memory card costs more
+than it saves. No block size wins.
+
+### What replaced it
+
+Two changes, both in the commit "Cut startup from ~142s to ~54s":
+
+1. **`sceIoPread` instead of `fseek` + `fread`.** One syscall against an
+   absolute offset instead of two plus a discarded newlib buffer. Cold mount
+   95.6s -> 70.5s on its own.
+2. **A replay cache** (`loader/obb_index.c`). The mount reads the same bytes
+   every boot, so record them once into `main.obb.idx` (906 KB, 30,658 ranges)
+   and serve them from memory afterwards. Mount 70.5s -> **2.0s**, logged as
+   "4 card reads, 31788 served from cache".
+
+Startup to first frame: ~142s -> ~54s.
+
+### What to take from this
+
+The instrumentation was right and the conclusion drawn from it was wrong. A
+100% seek ratio was read as "buffering is being defeated, so add buffering",
+when it actually meant "these reads are scattered". The distinguishing
+measurement -- the distribution of gaps between reads -- was available offline
+from the archive itself the whole time, and would have killed the design in
+minutes without a hardware round trip. Characterise the access pattern before
+choosing a caching strategy, not after.
