@@ -15,7 +15,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VPK="$ROOT/build/KOTOR.vpk"
 ELF="$ROOT/build/KOTOR"
 DIR="$ROOT/backups"
-KEEP="${KEEP_BUILDS:-3}"
+KEEP="${KEEP_BUILDS:-4}"
 
 [ -f "$VPK" ] || { echo "snapshot: no $VPK yet, skipping"; exit 0; }
 mkdir -p "$DIR" || exit 0
@@ -23,7 +23,8 @@ mkdir -p "$DIR" || exit 0
 # Name by the stamp baked into the ELF so a backup always matches its log header.
 STAMP="$(strings -a "$ELF" 2>/dev/null | sed -n 's/^=== BUILD \(.*\) ===$/\1/p' | head -1)"
 [ -n "$STAMP" ] || STAMP="$(date '+%b %d %Y %H:%M:%S')"
-SLUG="$(echo "$STAMP" | tr ' :' '--')"
+# __DATE__ space-pads a single-digit day ("Aug  1"); zero-pad it so names sort.
+SLUG="$(echo "$STAMP" | sed 's/  \([0-9]\) / 0\1 /' | tr ' :' '--')"
 
 if [ -f "$DIR/KOTOR-$SLUG.vpk" ]; then exit 0; fi   # same stamp, already saved
 

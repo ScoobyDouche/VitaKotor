@@ -136,7 +136,7 @@ vita_create_vpk(KOTOR.vpk ${VITA_TITLEID} eboot.bin
 # Keep the last few builds (vpk + matching source tarball) under backups/ so a
 # bad change can be undone without a rebuild. Never fails the build.
 add_custom_command(TARGET KOTOR.vpk-vpk POST_BUILD
-  COMMAND ${CMAKE_COMMAND} -E env KEEP_BUILDS=3
+  COMMAND ${CMAKE_COMMAND} -E env KEEP_BUILDS=4
           bash ${CMAKE_SOURCE_DIR}/tools/snapshot.sh || ${CMAKE_COMMAND} -E true
   COMMENT "Snapshotting build to backups/"
 )

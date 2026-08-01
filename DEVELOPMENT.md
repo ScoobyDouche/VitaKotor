@@ -38,8 +38,8 @@ cmake --build build -j"$(nproc)"
 
 **Rollback safety net.** Every build auto-snapshots to `backups/` via
 `tools/snapshot.sh` (POST_BUILD, never fails the build). It keeps the newest
-**3** pairs, named by the stamp baked into the ELF so a backup always matches
-its `log.txt` header:
+**4** pairs — the build you'd ship plus three to fall back to — named by the
+stamp baked into the ELF so a backup always matches its `log.txt` header:
 
 ```
 backups/KOTOR-Jul-31-2026-18-36-11.vpk    # reinstall this to revert on the Vita
@@ -50,6 +50,10 @@ The `.vpk` reverts the device; the tarball is what lets development resume from
 that point (`tar xzf backups/src-<stamp>.tar.gz` at the repo root). Override the
 count with `KEEP_BUILDS=n`. Note `touch loader/log.c` before building or the
 BUILD stamp — and therefore the snapshot name — goes stale.
+
+`build/KOTOR.vpk` is the release artifact: it is the file to attach to a GitHub
+release, and the newest `backups/KOTOR-<stamp>.vpk` is a byte-identical copy of
+it. There is no separate hand-maintained release copy to keep in sync.
 
 Inspecting the Android binaries (recon):
 
