@@ -115,6 +115,21 @@
 // "silenced" line); raise it to 4000 to get the bring-up trace back.
 #define GL_TRACE_LIMIT 0
 
+// Log write buffering. Every log line used to be its own sceIoWrite to the
+// memory card, measured at 8-11ms, which put the logger on the critical path of
+// both startup and frames (logs 127/128: ~3370 gameplay lines per session, ~34s
+// of ~175s of frame time, 18-19%). Batch lines into one buffer instead and write
+// when it fills or when LOG_FLUSH_MS has elapsed, so a burst costs one card
+// write rather than hundreds while a quiet period still reaches disk promptly.
+//
+// The time-based flush is what bounds the risk: on a hard hang (not a CPU fault,
+// which has its own path) at most LOG_FLUSH_MS of log is unwritten. This project
+// has chased several stalls, so that ceiling matters more than the last few
+// syscalls. Set LOG_BUFFER_KB to 0 for the old unbuffered line-at-a-time
+// behaviour.
+#define LOG_BUFFER_KB  8
+#define LOG_FLUSH_MS   1000
+
 // Heap tracing. gl_patch.c arms it at the last GL cap query (entering engine
 // setup) to catch an UNBOUNDED alloc loop during bring-up, and never disarms it,
 // so it runs for the whole session. MEM_TRACE is already throttled to every

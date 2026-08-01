@@ -108,6 +108,10 @@ static const char *type_name(uint32_t t) {
 }
 
 static void crash_handler(KuKernelExceptionContext *c) {
+  // Before anything else: drain the buffered log and switch to unbuffered,
+  // lock-free writes. The faulting thread may itself hold the log lock, so
+  // taking it here would park the dump forever instead of writing it.
+  log_panic();
   log_printf("========================================");
   log_printf("[CRASH] CPU fault: %s (type=%u)", type_name(c->exceptionType),
              (unsigned)c->exceptionType);

@@ -12,9 +12,15 @@
 // crash handler). Safe to call once from main() before anything else.
 void log_init(void);
 
-// Close the log fd so everything written so far is durable. Called automatically
-// every LOG_FLUSH_EVERY lines and explicitly from the crash handler.
+// Drain the buffer and close the log fd so everything written so far is durable.
+// Called automatically every LOG_FLUSH_MS and explicitly from the crash handler.
 void log_flush(void);
+
+// Enter panic mode: drain what is buffered, then make every later log_printf
+// write straight to the card without taking the log lock. crash.c MUST call this
+// before it logs anything, so a fault that happened while another thread held
+// the lock cannot deadlock the dump. Irreversible by design.
+void log_panic(void);
 
 // Append a printf-formatted line (timestamp + newline added automatically).
 void log_printf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));

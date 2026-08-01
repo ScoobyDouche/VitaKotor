@@ -108,6 +108,41 @@ all three logs report exactly 600. The true count is higher and unknown.
    `[SDL]` 498, `[FS]` 458, `[snd?]` 374, `[model]` 359. Buffering `log.c` writes
    would cut all of them at once and keep the diagnostics, at the cost of adding
    a lock to a path several threads call — see the startup spec.
+   **Done — see Outcome below.**
+
+## Outcome: buffering worked, and it separates the two problems
+
+`LOG_BUFFER_KB 8` / `LOG_FLUSH_MS 1000`, measured on hardware in log129 against
+log127 (the fair comparison — both ~210-220 draws/frame; log128 was a lighter
+scene at 132 and is not comparable):
+
+| | v0.1.8 (log127) | buffered (log129) |
+|---|---|---|
+| per-log-line cost | 11.63ms | **0.27ms** |
+| lines landing in <1ms | 1% | **61%** |
+| logging share of frame time | 19% | **0.7%** |
+| worst window | 16.0 fps | **20.2 fps** |
+| slowest 10% | 19.9 fps | **22.1 fps** |
+| median | 31.0 fps | 31.1 fps |
+| startup to first frame | 43.5s | **28.4s** |
+
+Ordering is intact: 0 out-of-order timestamps across 5196 lines, so the mutex is
+correctly serialising the shared buffer across threads.
+
+**The important result is the median NOT moving.** Content-normalised cost per
+draw call is 166.1us before and 166.2us after — identical. The logging tax was
+concentrated in the burst windows, not spread across every frame, so removing it
+flattens the dips and leaves the ceiling untouched. The remaining ~31 fps median
+and the 38.7 fps cap are now pure rendering cost, with the instrumentation out of
+the measurement for the first time. Everything measured from here is the game.
+
+The `ms/logline` regression slope fell from 13.91 to 4.27, confirming log volume
+no longer drives frame time; the residual is the old confound, that log-heavy
+windows are loading-heavy windows.
+
+**Untested:** `log_panic()` has never fired on hardware — no fault occurred in
+log129. It is verified by construction and by the host test, not by a real crash.
+`LOG_BUFFER_KB 0` restores the old line-at-a-time behaviour exactly.
 
 ## Method note
 
