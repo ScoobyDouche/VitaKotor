@@ -18,20 +18,28 @@ with a from-scratch FMOD audio implementation over `sceAudiodec` and
 
 ## Status
 
-**Playable.** It boots, gets through character creation, and plays past the
-Endar Spire onto the first planet. Combat, dialogue, inventory, containers and
-saves all work.
+**Work in progress — not yet good enough to play through.**
 
-It is not finished — read [Known issues](#known-issues) before starting a long
-save.
+It boots, gets through character creation, and plays past the Endar Spire onto
+Taris. Combat, dialogue, inventory, containers and saves all work, and it looks
+and sounds like the game. But **it crashes when moving between areas after
+roughly 10–20 minutes of play**, every time, and that is a hard blocker on
+actually finishing anything. See [Known issues](#known-issues).
+
+Treat it as something to look at, not something to start a playthrough on.
 
 | | |
 |---|---|
 | Startup | ~2 min on first launch, then under a minute |
-| Frame rate | ~30–38 fps typical, dips in dense scenes |
-| Audio | Sound effects and some music; parts of the music and a few voice lines are missing |
+| Frame rate | ~30–38 fps typical, dips into the low 20s in dense scenes |
+| Session length | **~10–20 min before an area transition crashes it** |
+| Audio | Effects and voice work; long music tracks are silent |
+| Cutscenes | Not played — the video codec is stubbed out |
 | Input | Physical controls, plus front touchscreen for menus |
 | Saves | Work, stored on the Vita |
+
+`main` is usually ahead of the newest [release](../../releases); the issue list
+below says which fixes have not been released yet.
 
 ---
 
@@ -106,16 +114,37 @@ Shaders and font metrics ship inside the VPK, so there is nothing else to copy.
 
 ## Known issues
 
+### Blocking
+
+- **Crashes when changing area, after 10–20 minutes of play.** The heap
+  fragments until a routine 1 MB allocation cannot find contiguous room —
+  there is plenty of memory free, just none of it in one piece — and the game
+  aborts. It looks like a freeze on the console because the crash handler stops
+  the app where it stands; `log.txt` will say `UNDEFINED_INSTRUCTION` and, on
+  builds newer than v0.1.9, print the heap state that caused it. **This is the
+  thing being worked on.** Save often; the crash costs you everything since the
+  last save.
+
+### Rough edges
+
 - **Stutter in dense scenes.** Busy areas issue around 700 draw calls a frame
-  and the frame rate drops. This is a graphics-throughput limit and is the main
-  thing being worked on.
-- **Music is partly missing.** Long tracks are replaced with correctly-timed
-  silence so dialogue and cutscene pacing stay right. Shorter music and combat
-  stings do play.
-- **A few voice lines don't play.**
+  and the frame rate drops into the low 20s. A graphics-throughput limit.
+- **Long music tracks are silent.** Anything over about 90 seconds is replaced
+  with correctly-timed silence, so pacing stays right but the score does not
+  play. Shorter music and combat stings do. Voice and effects are unaffected.
+- **Cutscenes are skipped.** The Bink video decoder is stubbed out, so FMVs are
+  passed over rather than played.
 - **Rear touch panel is disabled** deliberately — it sits under your fingers
   while holding the console and fired spurious taps.
 - **No trophies.**
+
+### Fixed in `main`, not yet in a release
+
+- **Sound thinning out and then disappearing entirely, voices included**, over a
+  long session — and taking the game down with it. The engine was never told
+  when a sound finished, so it never reused a voice or closed a music stream;
+  the leak eventually exhausted both file handles and memory. If you are on
+  v0.1.9 or earlier this is the audio behaviour you will see.
 
 ## Troubleshooting
 
@@ -128,7 +157,12 @@ a bug report.
 | Black screen, no error | `libshacccg.suprx` missing from `ur0:data/` |
 | Crashes immediately at launch | `kubridge.skprx` not installed |
 | Hangs at the loading spinner | An `.obb` is missing, misnamed, or still copying |
+| Freezes on an area transition | The known memory bug above — not your install |
 | Textures look wrong | Set `GL_FILTER_REDUNDANT_BINDS 0` in `loader/config.h` and rebuild |
+
+A "freeze" is usually not a freeze: the crash handler parks the app in place so
+the log survives. Check the end of `log.txt` for a `[CRASH]` block before
+assuming it hung.
 
 ---
 
