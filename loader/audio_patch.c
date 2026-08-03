@@ -9,7 +9,15 @@
  * CClientExoAppInternal::IsSoundPlayingInDialog (+0x1a576c), which bottoms out in
  * CExoStreamingSoundSource::IsPlaying(). With the old no-op stubs there was never
  * a playing source, so every line reported finished the instant it started and
- * dialogue was unreadable. isPlaying() telling the truth is what fixes that.
+ * dialogue was unreadable.
+ *
+ * That path does NOT reach FMOD::ChannelControl::isPlaying, though -- which is
+ * why implementing it correctly changed nothing and why it is called zero times
+ * in a whole session. FModAudioSystem::GetIsChannelPlaying (+0x746a5) reads a
+ * cached flag on its own ChannelInfo, and the sole writer of that flag is
+ * HandleChannelEnd, reached only from the END callback the game installs with
+ * setCallback. Delivering that callback is what makes the engine's view of
+ * playback true; see the end-of-sound section below.
  *
  * ---- HOW THE COMPANION CALLS US ---------------------------------------------
  * Established by disassembly 2026-07-31; both of its entry points funnel into
@@ -103,6 +111,11 @@ typedef struct {
   AudioPcm  pcm;                           /* borrowed copy of ent->pcm */
 } Snd;
 
+/* The END callback the companion registers on every voice. All parameters are
+ * integers or pointers, so unlike setVolume/setPan this needs no softfp shim. */
+typedef int (*chan_cb)(void *chanctl, int controltype, int callbacktype,
+                       void *cmd1, void *cmd2);
+
 typedef struct {
   int    used;
   unsigned stamp;                         /* allocation order, for voice stealing */
@@ -112,6 +125,8 @@ typedef struct {
   float  vol, pan;
   int    playing, paused;
   void  *userdata;
+  chan_cb cb;                             /* FModAudioSystem::ChannelCallback */
+  int    end_pending;                     /* finished naturally, END not yet sent */
 } Chan;
 
 static Snd      g_snd[MAX_SOUNDS];
@@ -199,6 +214,33 @@ static void cache_release(PcmEntry *e) {
   if (e && e->refs > 0) e->refs--;
 }
 
+/* ---- end-of-sound notification --------------------------------------------
+ * FModAudioSystem does NOT poll FMOD to find out whether a voice is still
+ * going: FModAudioSystem::PlaySound (+0x735a1) registers ChannelCallback and
+ * then GetIsChannelPlaying (+0x746a5) just reads ChannelInfo+0x1c, a flag whose
+ * only writer is HandleChannelEnd, reached only from that callback with
+ * FMOD_CHANNELCONTROL_CALLBACK_END. Stubbing setCallback therefore told the
+ * game that every sound it had ever started was still playing, forever:
+ * channel slots were never recycled (playSound dried up after ~2 minutes),
+ * streams were never closed (log139: 216 opened, 144 closed, then "out of
+ * virtual handles for main.obb" from t=1088s), and the leaked sources ate the
+ * heap until every decode failed and became silence (t=1307s) and the game
+ * fell over. It is also why looping ambience only ever played once --
+ * HandleChannelEnd's other branch is the loop restart.
+ *
+ * Flag the completion in the mixer, deliver it from System::update on the
+ * game's own thread. Never deliver it from the audio thread: HandleChannelEnd
+ * calls playSound/setUserData/setCallback straight back into us. */
+static unsigned g_ends_fired = 0, g_updates = 0;
+
+/* Caller holds the lock. `end_pending` is set even when no callback is
+ * installed yet: a 3 ms effect can finish before the companion gets back from
+ * playSound to register one, and the flag simply waits for it. */
+static void chan_finish(Chan *c) {
+  c->playing     = 0;
+  c->end_pending = 1;
+}
+
 /* ---- mixer ---------------------------------------------------------------- */
 static int32_t g_acc[OUT_GRAIN * OUT_CH];
 static int16_t g_out[OUT_GRAIN * OUT_CH];
@@ -213,10 +255,10 @@ static void mix_grain(void) {
     Snd *s = ch->snd;
     const int16_t *src = s->pcm.pcm;
     unsigned n = s->pcm.nsamples, sch = s->pcm.channels;
-    if (!n) { ch->playing = 0; continue; }
+    if (!n) { chan_finish(ch); continue; }
     if (!src) {                       /* silent placeholder: keep time, emit nothing */
       ch->pos += ch->step * (double)OUT_GRAIN;
-      if (ch->pos >= (double)n) ch->playing = 0;
+      if (ch->pos >= (double)n) chan_finish(ch);
       continue;
     }
 
@@ -226,7 +268,7 @@ static void mix_grain(void) {
 
     for (int i = 0; i < OUT_GRAIN; i++) {
       unsigned i0 = (unsigned)ch->pos;
-      if (i0 + 1 >= n) { ch->playing = 0; break; }
+      if (i0 + 1 >= n) { chan_finish(ch); break; }
       float frac = (float)(ch->pos - (double)i0);
 
       float l, r;
@@ -362,6 +404,37 @@ static int Sys_init(void *self, int maxch, unsigned flags, void *extra) {
   return FMOD_OK;
 }
 static int Sys_getNumDrivers(void *self, int *n) { (void)self; if (n) *n = 1; return FMOD_OK; }
+
+/* Real FMOD dispatches channel callbacks from System::update, on the caller's
+ * thread, precisely so a callback may re-enter the API. The companion calls
+ * this from FModAudioSystem::UpdateSystem (+0x72ecd), which libKOTOR drives
+ * from its per-frame audio update -- the same thread that calls playSound, so
+ * the re-entry HandleChannelEnd performs is on its home thread and our lock is
+ * never held across it. */
+#define FMOD_CHANNELCONTROL_CHANNEL      0
+#define FMOD_CHANNELCONTROL_CALLBACK_END 0
+
+static int Sys_update(void *self) {
+  (void)self;
+  static int draining = 0;
+  g_updates++;
+  if (draining) return FMOD_OK;         /* HandleChannelEnd -> playSound -> ... */
+  draining = 1;
+  for (int i = 0; i < g_nchannels; i++) {
+    Chan *c = &g_chan[i];
+    lock();
+    chan_cb cb = c->cb;
+    int fire = c->end_pending && cb;
+    if (fire) c->end_pending = 0;
+    unlock();
+    if (fire) {                          /* never under the lock */
+      g_ends_fired++;
+      cb(c, FMOD_CHANNELCONTROL_CHANNEL, FMOD_CHANNELCONTROL_CALLBACK_END, NULL, NULL);
+    }
+  }
+  draining = 0;
+  return FMOD_OK;
+}
 
 /* ---- streams arrive through FMOD's file callbacks, not by path --------------
  * FModAudioSystem::CreateStream builds a name with snprintf that is just a
@@ -593,9 +666,10 @@ have_pcm:;
     static unsigned n = 0;
     if ((++n & 127) == 0)
       log_printf("[snd] stats: %u createSound, cache %u hit / %u miss, "
-                 "%u KB PCM held, %u decode fail, voices reused %u/%u (done/live)",
+                 "%u KB PCM held, %u decode fail, voices reused %u/%u (done/live), "
+                 "%u END sent over %u updates",
                  n, g_cache_hits, g_cache_miss, g_pcm_bytes / 1024, g_missing,
-                 g_steals, g_steals_live);
+                 g_steals, g_steals_live, g_ends_fired, g_updates);
   }
 
   lock();
@@ -665,7 +739,10 @@ static int Snd_release(void *self) {
   Snd *s = (Snd *)self;
   lock();
   for (int i = 0; i < g_nchannels; i++)
-    if (g_chan[i].used && g_chan[i].snd == s) { g_chan[i].playing = 0; g_chan[i].used = 0; }
+    if (g_chan[i].used && g_chan[i].snd == s) {
+      g_chan[i].playing = 0; g_chan[i].used = 0;
+      g_chan[i].end_pending = 0; g_chan[i].cb = NULL;   /* the source is gone */
+    }
   cache_release(s->ent);          /* samples stay cached for the next request */
   s->ent = NULL;
   memset(&s->pcm, 0, sizeof s->pcm);
@@ -691,11 +768,18 @@ static int Ch_isPlaying(void *self, char *b) {
   *b = (char)(c->used && c->playing);
   return FMOD_OK;
 }
+/* An explicit stop must NOT raise END. FModAudioSystem::StopChannel (+0x73cd1)
+ * already calls ChannelInfo::Reset itself right after stop(), and a late END on
+ * a looping voice would send HandleChannelEnd down its restart branch and bring
+ * back the sound the game just silenced. */
 static int Ch_stop(void *self) {
   if (!chan_valid(self)) return FMOD_ERR_INVALID_PARAM;
   lock();
-  ((Chan *)self)->playing = 0;
-  ((Chan *)self)->used    = 0;
+  Chan *c = (Chan *)self;
+  c->playing = 0;
+  c->used    = 0;
+  c->end_pending = 0;
+  c->cb      = NULL;
   unlock();
   return FMOD_OK;
 }
@@ -745,6 +829,13 @@ static int Ch_setPosition(void *self, unsigned pos, unsigned unit) {
   unlock();
   return FMOD_OK;
 }
+static int Ch_setCallback(void *self, chan_cb cb) {
+  if (!chan_valid(self)) return FMOD_ERR_INVALID_PARAM;
+  lock();
+  ((Chan *)self)->cb = cb;
+  unlock();
+  return FMOD_OK;
+}
 static int Ch_setUserData(void *self, void *ud) {
   if (!chan_valid(self)) return FMOD_ERR_INVALID_PARAM;
   ((Chan *)self)->userdata = ud;
@@ -779,7 +870,7 @@ static const so_default_dynlib audio_dynlib[] = {
 
   // ---- FMOD C++ API (name-mangled) ----
   { "_ZN4FMOD6System4initEijPv", (uintptr_t)&Sys_init },
-  { "_ZN4FMOD6System6updateEv", (uintptr_t)&fmod_stub },
+  { "_ZN4FMOD6System6updateEv", (uintptr_t)&Sys_update },
   { "_ZN4FMOD6System7releaseEv", (uintptr_t)&fmod_stub },
   { "_ZN4FMOD6System9playSoundEPNS_5SoundEPNS_12ChannelGroupEbPPNS_7ChannelE", (uintptr_t)&Sys_playSound },
   { "_ZN4FMOD6System9setOutputE15FMOD_OUTPUTTYPE", (uintptr_t)&fmod_stub },
@@ -806,7 +897,7 @@ static const so_default_dynlib audio_dynlib[] = {
   { "_ZN4FMOD14ChannelControl14set3DOcclusionEff", (uintptr_t)&fmod_stub },
   { "_ZN4FMOD14ChannelControl15set3DAttributesEPK11FMOD_VECTORS3_S3_", (uintptr_t)&fmod_stub },
   { "_ZN4FMOD14ChannelControl19set3DMinMaxDistanceEff", (uintptr_t)&fmod_stub },
-  { "_ZN4FMOD14ChannelControl11setCallbackEPF11FMOD_RESULTP19FMOD_CHANNELCONTROL24FMOD_CHANNELCONTROL_TYPE33FMOD_CHANNELCONTROL_CALLBACK_TYPEPvS6_E", (uintptr_t)&fmod_stub },
+  { "_ZN4FMOD14ChannelControl11setCallbackEPF11FMOD_RESULTP19FMOD_CHANNELCONTROL24FMOD_CHANNELCONTROL_TYPE33FMOD_CHANNELCONTROL_CALLBACK_TYPEPvS6_E", (uintptr_t)&Ch_setCallback },
 };
 
 const int audio_dynlib_size = sizeof(audio_dynlib);
