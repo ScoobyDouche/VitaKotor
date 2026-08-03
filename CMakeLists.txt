@@ -43,6 +43,7 @@ add_executable(KOTOR
   loader/gl_patch.c
   loader/glsl_prep.c
   loader/crash.c
+  loader/heap.c
   loader/log.c
 )
 

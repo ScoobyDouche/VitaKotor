@@ -30,6 +30,7 @@
 #include "dynlib.h"
 #include "fs_patch.h"
 #include "log.h"
+#include "heap.h"
 #include "main.h"
 #include "config.h"
 #include "obb_index.h"
@@ -644,8 +645,10 @@ static char *fgets_diag(char *buf, int n, FILE *f) {
 static void *malloc_diag(size_t n) { MEM_TRACE("malloc", n); return malloc(n); }
 static void *calloc_diag(size_t a, size_t b) { MEM_TRACE("calloc", a * b); return calloc(a, b); }
 static void *realloc_diag(void *p, size_t n) { MEM_TRACE("realloc", n); return realloc(p, n); }
-static void *Znwj_diag(size_t n) { MEM_TRACE("new", n); return real_Znwj(n); }
-static void *Znaj_diag(size_t n) { MEM_TRACE("new[]", n); return real_Znaj(n); }
+/* Record the size so the new-handler can report what the failing request was;
+ * a single huge allocation and a heap that is simply full need different fixes. */
+static void *Znwj_diag(size_t n) { MEM_TRACE("new", n); g_heap_last_new = n; return real_Znwj(n); }
+static void *Znaj_diag(size_t n) { MEM_TRACE("new[]", n); g_heap_last_new = n; return real_Znaj(n); }
 
 // ---- libm gaps (absent from this newlib) ----------------------------------
 // Derive from available primitives; accuracy is ample for game math.

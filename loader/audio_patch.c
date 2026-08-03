@@ -214,6 +214,29 @@ static void cache_release(PcmEntry *e) {
   if (e && e->refs > 0) e->refs--;
 }
 
+unsigned audio_cache_bytes(void) { return g_pcm_bytes; }
+
+/* Called from the new-handler when the heap is exhausted. Everything here is a
+ * pure speed optimisation -- worst case the next createSound decodes again --
+ * so give all of it back rather than let an allocation fail. Entries a live
+ * Sound still references stay. Safe to call from any thread: nothing under this
+ * lock allocates, so it cannot re-enter the handler. */
+unsigned audio_cache_purge(void) {
+  unsigned freed = 0;
+  lock();
+  for (int i = 0; i < MAX_CACHE; i++) {
+    PcmEntry *e = &g_cache[i];
+    if (!e->used || e->refs > 0) continue;
+    unsigned bytes = pcm_bytes_of(&e->pcm);
+    g_pcm_bytes = (g_pcm_bytes > bytes) ? g_pcm_bytes - bytes : 0;
+    audio_pcm_free(&e->pcm);
+    memset(e, 0, sizeof *e);
+    freed += bytes;
+  }
+  unlock();
+  return freed;
+}
+
 /* ---- end-of-sound notification --------------------------------------------
  * FModAudioSystem does NOT poll FMOD to find out whether a voice is still
  * going: FModAudioSystem::PlaySound (+0x735a1) registers ChannelCallback and

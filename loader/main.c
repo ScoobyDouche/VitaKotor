@@ -28,6 +28,7 @@
 #include "sdl_patch.h"
 #include "gl_patch.h"
 #include "crash.h"
+#include "heap.h"
 #include "log.h"
 
 #include <pthread.h>
@@ -117,6 +118,11 @@ static void *watchdog_thread(void *arg) {
   uint64_t last_run = 0;
   for (;;) {
     sceKernelDelayThread(3 * 1000 * 1000);
+    /* Heap occupancy, sampled here because this is the one thread that already
+     * ticks on a fixed schedule. One line per 3s costs ~0.3ms and is what tells
+     * us whether headroom drains steadily, steps down per area, or falls off a
+     * cliff -- the three explanations need different fixes. */
+    heap_log(NULL);
     SceUID thid = g_game_thid;
     if (thid < 0)
       continue;
@@ -2191,6 +2197,11 @@ int main(int argc, char *argv[]) {
   // hardware fault (incl. during static ctors below or inside the game) writes
   // its PC/LR to log.txt instead of silently stopping the log.
   crash_init();
+
+  // Arm the new-handler before any of the game's static ctors run, so a heap
+  // exhaustion anywhere from here on is reported and survivable rather than an
+  // uncaught bad_alloc (log140).
+  heap_init();
 
   // Stub Bink (companion-provided) so cutscenes are skipped for now.
   bink_patch(&port_mod);
