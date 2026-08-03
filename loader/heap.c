@@ -25,16 +25,26 @@
  * the allocation throws exactly as it does today rather than spinning forever on
  * a handler that cannot make progress.
  *
- * The telemetry is the point of this pass. We have never had a number for heap
- * occupancy, so it is unknown whether the audio cache (22 MB held, 40 MB
- * allowed) is the difference between fitting and not. `headroom` below is the
- * number that settles it: unallocated sbrk room plus what is free inside the
- * arena.
+ * log141 then answered the question that motivated the telemetry, and answered
+ * it against the obvious suspect. The fatal allocation was 1 MB with 62.8 MB
+ * free across 3994 blocks and the arena pinned at the 192 MB cap, while the
+ * audio cache held 3.6 MB. So this is fragmentation against a ceiling, not
+ * exhaustion, and not our cache: purging bought two earlier saves and could not
+ * possibly have helped the third. See docs/specs/2026-08-02-heap-fragmentation.md.
+ *
+ * What is measured here now is aimed at choosing the fix. `headroom` is sbrk
+ * room plus free-in-arena; `largest block` is what the heap can actually still
+ * serve, which mallinfo will not tell you and which separates "barely short"
+ * from "hopeless"; and the large-allocation census says whether megabyte
+ * requests are constant or occasional -- constant makes their own churn the
+ * shredder and a size-classed recycler the fix, occasional means the damage is
+ * being done by something else entirely.
  */
 
 #include <vitasdk.h>
 #include <malloc.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 
 #include "heap.h"
@@ -55,6 +65,71 @@ extern void *_ZSt15set_new_handlerPFvvE(void (*)(void));
  * formatting. */
 static unsigned tenths_mb(unsigned bytes) {
   return (unsigned)(((uint64_t)bytes * 10u) / (1024u * 1024u));
+}
+
+/* ---- large-allocation census ----------------------------------------------
+ * log141 killed the run on a 1 MB request while 62.8 MB sat free in 3994
+ * pieces. What it cannot say is whether requests that size are constant or
+ * occasional, and that decides the fix: a few of them means something else is
+ * shredding the heap and recycling them would achieve nothing, while hundreds
+ * of them makes the churn itself the shredder and a size-classed recycler the
+ * answer. Counting is nearly free -- a branch and an increment on allocations
+ * we already funnel through dynlib.c -- so count rather than guess again.
+ *
+ * Classes are powers of two from 256 KB up; anything smaller is ignored, since
+ * it is not what fails. */
+#define BIG_MIN_SHIFT 18                       /* 256 KB */
+#define BIG_CLASSES   8                        /* 256K, 512K, 1M, 2M, 4M, 8M, 16M, 32M+ */
+static unsigned g_big_count[BIG_CLASSES];
+static unsigned g_big_peak[BIG_CLASSES];       /* largest request seen in class */
+
+void heap_note_alloc(unsigned n) {
+  if (n < (1u << BIG_MIN_SHIFT)) return;
+  int c = 0;
+  unsigned v = n >> BIG_MIN_SHIFT;
+  while (v > 1 && c < BIG_CLASSES - 1) { v >>= 1; c++; }
+  g_big_count[c]++;
+  if (n > g_big_peak[c]) g_big_peak[c] = n;
+}
+
+static void heap_log_big(void) {
+  char buf[224];
+  unsigned pos = 0;
+  int any = 0;
+  for (int c = 0; c < BIG_CLASSES && pos + 32 < sizeof buf; c++) {
+    if (!g_big_count[c]) continue;
+    unsigned kb = (1u << (BIG_MIN_SHIFT + c)) / 1024u;
+    int w = snprintf(buf + pos, sizeof buf - pos, "%s%uK+:%u(max %uK)",
+                     any ? "  " : "", kb, g_big_count[c], g_big_peak[c] / 1024u);
+    if (w <= 0) break;
+    pos += (unsigned)w;
+    any = 1;
+  }
+  if (any) log_printf("[heap] large allocations so far: %s", buf);
+}
+
+/* Largest block the heap can still hand out, which mallinfo does not report and
+ * which is the number that separates "barely short" from "hopeless". Descending
+ * powers of two: at most a dozen malloc/free pairs, each returned immediately,
+ * so the probe reuses one block rather than leaving a mark. Deliberately NOT
+ * run every sample -- see heap_log's caller. */
+static unsigned heap_largest_block(void) {
+  for (unsigned sz = 32u << 20; sz >= 4096; sz >>= 1) {
+    void *p = malloc(sz);
+    if (p) { free(p); return sz; }
+  }
+  return 0;
+}
+
+/* heap_log plus the two figures that cost something to obtain. Kept off the 3s
+ * path because the probe allocates: cheap, but not free, and not something to
+ * do to a struggling heap two hundred times a run. */
+void heap_log_full(const char *why) {
+  heap_log(why);
+  unsigned big = heap_largest_block();
+  log_printf("[heap] %slargest block the heap can still serve: %u.%u MB (%u KB)",
+             why ? why : "", tenths_mb(big) / 10, tenths_mb(big) % 10, big / 1024u);
+  heap_log_big();
 }
 
 void heap_log(const char *why) {
@@ -80,13 +155,13 @@ void heap_log(const char *why) {
 static void heap_new_handler(void) {
   log_printf("[heap] ALLOCATION FAILED (last new through dynlib was %u bytes)",
              g_heap_last_new);
-  heap_log("at failure: ");
+  heap_log_full("at failure: ");
 
   unsigned got = audio_cache_purge();
   if (got) {
     log_printf("[heap] released %u.%u MB of decoded audio -- retrying",
                tenths_mb(got) / 10, tenths_mb(got) % 10);
-    heap_log("after purge: ");
+    heap_log_full("after purge: ");
     return;                       /* operator new loops and tries malloc again */
   }
 
@@ -99,5 +174,5 @@ static void heap_new_handler(void) {
 
 void heap_init(void) {
   set_new_handler(heap_new_handler);
-  heap_log("startup: ");
+  heap_log_full("startup: ");
 }

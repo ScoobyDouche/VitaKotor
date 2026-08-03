@@ -122,7 +122,13 @@ static void *watchdog_thread(void *arg) {
      * ticks on a fixed schedule. One line per 3s costs ~0.3ms and is what tells
      * us whether headroom drains steadily, steps down per area, or falls off a
      * cliff -- the three explanations need different fixes. */
-    heap_log(NULL);
+    {
+      /* Every tick for the cheap figures; every tenth for the ones that probe
+         the allocator, which is often enough to watch contiguity decay without
+         poking a struggling heap two hundred times a run. */
+      static unsigned tick = 0;
+      if (tick++ % 10 == 0) heap_log_full(NULL); else heap_log(NULL);
+    }
     SceUID thid = g_game_thid;
     if (thid < 0)
       continue;

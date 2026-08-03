@@ -9,8 +9,17 @@
 void heap_init(void);
 
 // Log one line of heap occupancy. `why` labels the line; NULL for the periodic
-// sample.
+// sample. Cheap: mallinfo only.
 void heap_log(const char *why);
+
+// The same, plus the largest block the heap can still serve and a census of
+// large allocations. Probes with malloc, so this is for the occasional sample
+// and for failures, not every tick.
+void heap_log_full(const char *why);
+
+// Record an allocation for the large-request census. Ignores anything under
+// 256 KB; callers need not filter.
+void heap_note_alloc(unsigned n);
 
 // Size of the most recent `new` the game made through our dynlib table, so the
 // handler can say whether the failing request was large or the heap was simply
