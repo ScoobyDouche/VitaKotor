@@ -112,10 +112,34 @@ static void heap_log_big(void) {
  * which is the number that separates "barely short" from "hopeless". Descending
  * powers of two: at most a dozen malloc/free pairs, each returned immediately,
  * so the probe reuses one block rather than leaving a mark. Deliberately NOT
- * run every sample -- see heap_log's caller. */
-static unsigned heap_largest_block(void) {
-  for (unsigned sz = 32u << 20; sz >= 4096; sz >>= 1) {
+ * run every sample -- see heap_log's caller.
+ *
+ * Two things this got wrong the first time, both visible in logs 143-144:
+ *
+ * 1. The whole function was compiled away. GCC's allocation DCE (on at -O2)
+ *    deletes a malloc/free pair whose result is never otherwise used, and then
+ *    folds the `if (p)` to taken -- so this reduced to `return 32u << 20` with
+ *    no call left in it. Every "largest block: 32.0 MB" line in both logs is a
+ *    compile-time constant, printed even at startup with a 0.0 MB arena, and
+ *    printed unchanged 0.5 ms after a 4 MB operator new had failed. The `asm`
+ *    barrier below makes `p` opaque, which is what stops the pairing.
+ *
+ * 2. Starting the ladder at 32 MB measures the wrong thing when the arena is
+ *    small. A request the free list cannot serve goes to sbrk, so a low arena
+ *    answers "32 MB" via fresh memory and says nothing about contiguity, while
+ *    briefly growing the arena for real -- and the arena ratchet is the thing
+ *    we are chasing. So cap the ladder at what is already free inside the
+ *    arena: above that, only sbrk could answer, and sbrk room is `headroom`,
+ *    which heap_log already reports. */
+static unsigned heap_largest_block(unsigned ceiling) {
+  unsigned start = 4096;
+  while (start < (32u << 20) && (start << 1) <= ceiling) start <<= 1;
+
+  for (unsigned sz = start; sz >= 4096; sz >>= 1) {
     void *p = malloc(sz);
+    /* Load-bearing: without it the compiler deletes the malloc/free pair and
+     * this function becomes a constant. See (1) above. */
+    __asm__ volatile("" : "+r"(p) : : "memory");
     if (p) { free(p); return sz; }
   }
   return 0;
@@ -126,9 +150,13 @@ static unsigned heap_largest_block(void) {
  * do to a struggling heap two hundred times a run. */
 void heap_log_full(const char *why) {
   heap_log(why);
-  unsigned big = heap_largest_block();
-  log_printf("[heap] %slargest block the heap can still serve: %u.%u MB (%u KB)",
-             why ? why : "", tenths_mb(big) / 10, tenths_mb(big) % 10, big / 1024u);
+  struct mallinfo mi = mallinfo();
+  unsigned freed = (unsigned)mi.fordblks;
+  unsigned big = heap_largest_block(freed);
+  log_printf("[heap] %slargest block the heap can still serve: %u.%u MB (%u KB) "
+             "-- of %u.%u MB free, probe ceiling %u KB",
+             why ? why : "", tenths_mb(big) / 10, tenths_mb(big) % 10, big / 1024u,
+             tenths_mb(freed) / 10, tenths_mb(freed) % 10, freed / 1024u);
   heap_log_big();
 }
 
@@ -141,11 +169,15 @@ void heap_log(const char *why) {
    * it. This is the only figure that says whether we are actually close. */
   unsigned headroom = (arena < HEAP_LIMIT_BYTES ? HEAP_LIMIT_BYTES - arena : 0) + freed;
   unsigned pcm = audio_cache_bytes();
+  /* keepcost is the top chunk: the free run at the end of the arena, and the
+   * only one sbrk can extend. It is the one contiguity figure mallinfo gives
+   * away for nothing, so it costs a field here rather than a probe. */
+  unsigned top = (unsigned)mi.keepcost;
 
-  log_printf("[heap] %s%u.%u MB used, %u.%u free in arena (%d blocks), "
+  log_printf("[heap] %s%u.%u MB used, %u.%u free in arena (%d blocks, top %u KB), "
              "arena %u.%u of %u MB -> headroom %u.%u MB; audio cache %u.%u MB",
              why ? why : "", tenths_mb(used) / 10, tenths_mb(used) % 10,
-             tenths_mb(freed) / 10, tenths_mb(freed) % 10, mi.ordblks,
+             tenths_mb(freed) / 10, tenths_mb(freed) % 10, mi.ordblks, top / 1024u,
              tenths_mb(arena) / 10, tenths_mb(arena) % 10,
              (unsigned)MEMORY_NEWLIB_MB,
              tenths_mb(headroom) / 10, tenths_mb(headroom) % 10,
