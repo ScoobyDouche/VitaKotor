@@ -29,6 +29,7 @@
 #include "gl_patch.h"
 #include "crash.h"
 #include "heap.h"
+#include "bigalloc.h"
 #include "log.h"
 
 #include <pthread.h>
@@ -2208,6 +2209,11 @@ int main(int argc, char *argv[]) {
   // exhaustion anywhere from here on is reported and survivable rather than an
   // uncaught bad_alloc (log140).
   heap_init();
+
+  // Same point in the sequence, for the same reason: from the first static ctor
+  // onwards every allocation at or above BIGALLOC_MIN_BYTES should be landing in
+  // the pool rather than carving up newlib's arena (log145).
+  bigalloc_init();
 
   // Stub Bink (companion-provided) so cutscenes are skipped for now.
   bink_patch(&port_mod);

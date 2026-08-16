@@ -270,3 +270,53 @@ Keep large allocations out of the general heap. Two populations feed it:
   allocated with the loader's own `malloc`, not through a shim. 389 cache misses
   in this run, each a 100 KB - 1.3 MB buffer held for a while and then freed —
   the exact shape that leaves medium holes.
+
+## The fix: `loader/bigalloc.c`
+
+Everything at or above 256 KB is served from segments of our own —
+`sceKernelAllocMemBlock`, up to 4 x 8 MB, taken on demand — instead of newlib's
+arena. Both populations above go through it: the game's via dynlib's shims, ours
+via `big_malloc` in `audio_mp3.c` and `audio_patch.c`.
+
+**Identifying our own pointers is the whole risk, and owning whole segments
+reduces it to a bounds test.** `free`, `operator delete` and `operator delete[]`
+ask `bigalloc_owns(p)` first; nothing reads a header until the range has already
+said the block is ours, so a pointer from any other allocator is never
+dereferenced. When the pool cannot serve a request it returns NULL, the caller
+falls back to `malloc`, and the same bounds test later routes that block back to
+`free` correctly. Degrading to exactly today's behaviour is always available.
+
+The allocator itself is a best-fit implicit list with boundary tags: 16-byte
+headers, 16-aligned payloads, splitting above a 64 KB remainder, coalescing both
+ways on free. The population is tiny by construction — 8 MB of >=256 KB blocks
+is a few dozen — so the walk is cheap and best fit is affordable, which matters
+because leaving the wrong-sized remainder behind is the exact failure this file
+exists to prevent.
+
+### Budgets moved, not added
+
+`MEMORY_NEWLIB_MB` 192 -> 160 and `MEMORY_VITAGL_THRESHOLD_MB` 16 -> 48. Both
+halves matter: vitaGL claims all free RAM at `vglInitExtended`, before the game
+runs, so shrinking newlib without raising vitaGL's leave-alone threshold would
+simply hand the 32 MB to vitaGL and the pool would find nothing to allocate.
+
+Peak `used` in log145 was 145.9 MB, so 160 is only affordable if the pool
+absorbs enough of it. That is the open question this build answers, and both
+answers are one constant away:
+
+- `[big] ... N fell back to malloc` climbing, pool live near 32/32 -> pool too
+  small, move the line.
+- newlib failing at a lower `used` than 145 MB -> the reduction was too deep,
+  move it back.
+
+### Verification
+
+`loader/bigalloc.c` compiles on the host with `-DBIGALLOC_HOST_TEST`, which
+swaps the segment source for `malloc`. 75 checks under ASan+UBSan: threshold,
+foreign pointers, payload integrity and alignment across 16 live blocks,
+coalescing (fill the pool, free three adjacent, ask for their sum), best fit
+leaving a larger hole intact, exhaustion and fallback, realloc in both
+directions and small-to-pool migration, and 4000 rounds of random churn checking
+every live block's byte pattern. ASan caught one real bug on the first run: the
+small-to-pool realloc path copied the *new* size out of the old block, fixed
+with `malloc_usable_size`.

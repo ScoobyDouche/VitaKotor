@@ -59,8 +59,32 @@
 // Heap / memory budgets (MB). 192 MB fits within the extended-memory partition
 // granted by ATTRIBUTE2=12 (see CMakeLists.txt). Requesting more (e.g. 256)
 // without that grant makes the CRT heap init fail -> crash in _sbrk_r before main.
-#define MEMORY_NEWLIB_MB          192
-#define MEMORY_VITAGL_THRESHOLD_MB 16
+#define MEMORY_NEWLIB_MB          160
+// RAM vitaGL must LEAVE UNCLAIMED. It takes everything else at vglInitExtended,
+// which runs before the game does, so anything we mean to allocate later has to
+// be inside this number or it will not be there. It was 16 MB when newlib held
+// 192; newlib now holds 160 and bigalloc wants up to 32 of the difference, so
+// this is 16 + 32. Leave the two in step: shrinking newlib without raising this
+// just hands the difference to vitaGL and the pool finds nothing.
+#define MEMORY_VITAGL_THRESHOLD_MB 48
+
+// Big-allocation pool (bigalloc.c). Everything at or above BIGALLOC_MIN_BYTES is
+// served from segments of our own instead of newlib's arena, because mixing
+// megabyte blocks with the game's thousands of small long-lived objects is what
+// shreds the heap: log145 watched the largest servable block halve every ~150 s
+// -- 32 MB down to 512 KB -- while 46 MB stayed free the whole time.
+//
+// The threshold is 256 KB, not 512 KB, because log142's fatal request was
+// 286 KB. Traffic at that size is light (1458 in a 34-minute session), so the
+// pool's best-fit walk costs nothing.
+//
+// This budget is TAKEN FROM newlib, not added: vitaGL claims everything except
+// MEMORY_VITAGL_THRESHOLD_MB, so there is nothing spare. 160 + 32 is the old
+// 192. Both halves are provisional -- the [big] log line reports peak live and
+// fallback count, which is what says whether to move the line.
+#define BIGALLOC_MIN_BYTES (256u * 1024u)
+#define BIGALLOC_SEG_MB    8
+#define BIGALLOC_MAX_SEGS  4
 
 // Multisampling. We shipped SCE_GXM_MULTISAMPLE_4X, which makes the GPU shade
 // and resolve 4x the fragments at 960x544 -- on a Vita that is a luxury, and it

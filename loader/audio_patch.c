@@ -62,6 +62,7 @@
 
 #include "audio_patch.h"
 #include "audio_mp3.h"
+#include "bigalloc.h"
 #include "sdl_patch.h"
 #include "log.h"
 
@@ -598,7 +599,7 @@ static int Sys_createSound(void *self, const char *name, unsigned mode,
       if (g_fs_close) g_fs_close(h, NULL);
       return FMOD_ERR_INVALID_PARAM;
     }
-    owned = malloc(want);
+    owned = big_malloc(want);
     if (!owned) { if (g_fs_close) g_fs_close(h, NULL); return FMOD_ERR_MEMORY; }
     if (ex_off && g_fs_seek) g_fs_seek(h, ex_off, NULL);
     unsigned got = 0;
@@ -616,7 +617,7 @@ static int Sys_createSound(void *self, const char *name, unsigned mode,
       if (g_missing < 32)
         log_printf("[snd] stream read EMPTY id=%.32s want=%u fsz=%u", name, want, fsz);
       g_missing++;
-      free(owned);
+      big_free(owned);
       return FMOD_ERR_FILE_NOTFOUND;
     }
     buf = owned;
@@ -630,10 +631,10 @@ static int Sys_createSound(void *self, const char *name, unsigned mode,
       if (g_missing < 32) log_printf("[snd] createSound MISS: %.96s", name);
       g_missing++;
       bad_add(name);
-      free(owned);
+      big_free(owned);
       return FMOD_ERR_FILE_NOTFOUND;
     }
-    if (ex_off >= flen) { bad_add(name); free(owned); return FMOD_ERR_INVALID_PARAM; }
+    if (ex_off >= flen) { bad_add(name); big_free(owned); return FMOD_ERR_INVALID_PARAM; }
     unsigned avail = flen - ex_off;
     len = (ex_len && ex_len <= avail) ? ex_len : avail;
     buf = (const char *)owned + ex_off;
@@ -649,7 +650,7 @@ static int Sys_createSound(void *self, const char *name, unsigned mode,
   PcmEntry *ent = cache_find(len, hkey);
   if (ent) { ent->refs++; ent->stamp = ++g_clock; }
   unlock();
-  if (ent) { g_cache_hits++; free(owned); goto have_pcm; }
+  if (ent) { g_cache_hits++; big_free(owned); goto have_pcm; }
   g_cache_miss++;
 
   /* A whole music track is ~15 MB of PCM. Two of them filled the heap, after
@@ -694,10 +695,10 @@ static int Sys_createSound(void *self, const char *name, unsigned mode,
     }
     g_missing++;
     if (!(mode & (FMOD_OPENMEMORY | FMOD_CREATESTREAM))) bad_add(name);
-    free(owned);
+    big_free(owned);
     return FMOD_ERR_FILE_NOTFOUND;
   }
-  free(owned);
+  big_free(owned);
 
   lock();
   ent = cache_insert(len, hkey, &pcm);

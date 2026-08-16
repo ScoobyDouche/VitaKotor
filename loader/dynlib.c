@@ -34,6 +34,7 @@
 #include "main.h"
 #include "config.h"
 #include "obb_index.h"
+#include "bigalloc.h"
 #include "loadscreen.h"
 
 // ---- generic stubs (category b) ------------------------------------------
@@ -199,6 +200,8 @@ volatile int g_mem_trace = 0;
 static volatile int g_mem_seq = 0;
 static void *(*real_Znwj)(size_t) = (void *(*)(size_t)) & _Znwj;
 static void *(*real_Znaj)(size_t) = (void *(*)(size_t)) & _Znaj;
+static void (*real_ZdlPv)(void *) = (void (*)(void *)) & _ZdlPv;
+static void (*real_ZdaPv)(void *) = (void (*)(void *)) & _ZdaPv;
 
 // Logging every allocation is ~20ms each and turns instant init into a crawl.
 // Throttle to a heartbeat (every 1024th) plus any unusually large request, so
@@ -642,13 +645,41 @@ static char *fgets_diag(char *buf, int n, FILE *f) {
 }
 
 
-static void *malloc_diag(size_t n) { MEM_TRACE("malloc", n); heap_note_alloc(n); return malloc(n); }
-static void *calloc_diag(size_t a, size_t b) { MEM_TRACE("calloc", a * b); heap_note_alloc(a * b); return calloc(a, b); }
-static void *realloc_diag(void *p, size_t n) { MEM_TRACE("realloc", n); heap_note_alloc(n); return realloc(p, n); }
+/* Every allocation the game makes comes through here, which is the one place
+ * that can route the big ones away from newlib's arena. big_malloc/big_free
+ * fall back to malloc/free below the threshold or when the pool is full, and
+ * big_free's bounds test is what keeps the two populations apart -- see
+ * bigalloc.c. The delete operators have to be wrapped for the same reason:
+ * libstdc++'s own _ZdlPv calls free(), which would hand a pool pointer to
+ * newlib. */
+static void *malloc_diag(size_t n) { MEM_TRACE("malloc", n); heap_note_alloc(n); return big_malloc(n); }
+static void *calloc_diag(size_t a, size_t b) {
+  MEM_TRACE("calloc", a * b); heap_note_alloc(a * b);
+  size_t n = a * b;
+  if (a && n / a != b) return NULL;                 /* overflow */
+  void *p = big_malloc(n);
+  if (p) memset(p, 0, n);
+  return p;
+}
+static void *realloc_diag(void *p, size_t n) { MEM_TRACE("realloc", n); heap_note_alloc(n); return big_realloc(p, n); }
+static void free_diag(void *p) { big_free(p); }
 /* Record the size so the new-handler can report what the failing request was;
  * a single huge allocation and a heap that is simply full need different fixes. */
-static void *Znwj_diag(size_t n) { MEM_TRACE("new", n); g_heap_last_new = n; heap_note_alloc(n); return real_Znwj(n); }
-static void *Znaj_diag(size_t n) { MEM_TRACE("new[]", n); g_heap_last_new = n; heap_note_alloc(n); return real_Znaj(n); }
+static void *Znwj_diag(size_t n) {
+  MEM_TRACE("new", n); g_heap_last_new = n; heap_note_alloc(n);
+  void *p = bigalloc(n);
+  /* On NULL fall through to the real operator new, which still runs the
+   * new-handler and still throws bad_alloc -- the pool must not change what
+   * failure looks like to the game. */
+  return p ? p : real_Znwj(n);
+}
+static void *Znaj_diag(size_t n) {
+  MEM_TRACE("new[]", n); g_heap_last_new = n; heap_note_alloc(n);
+  void *p = bigalloc(n);
+  return p ? p : real_Znaj(n);
+}
+static void ZdlPv_diag(void *p) { if (bigalloc_owns(p)) bigfree(p); else real_ZdlPv(p); }
+static void ZdaPv_diag(void *p) { if (bigalloc_owns(p)) bigfree(p); else real_ZdaPv(p); }
 
 // ---- libm gaps (absent from this newlib) ----------------------------------
 // Derive from available primitives; accuracy is ample for game math.
@@ -788,7 +819,7 @@ so_default_dynlib default_dynlib[] = {
 
   // ============ (a) C++ new/delete + runtime ============
   { "_Znwj", (uintptr_t)&Znwj_diag }, { "_Znaj", (uintptr_t)&Znaj_diag },
-  { "_ZdlPv", (uintptr_t)&_ZdlPv }, { "_ZdaPv", (uintptr_t)&_ZdaPv },
+  { "_ZdlPv", (uintptr_t)&ZdlPv_diag }, { "_ZdaPv", (uintptr_t)&ZdaPv_diag },
   { "__cxa_atexit", (uintptr_t)&__cxa_atexit }, { "__cxa_finalize", (uintptr_t)&__cxa_finalize },
   { "__cxa_guard_acquire", (uintptr_t)&__cxa_guard_acquire }, { "__cxa_guard_release", (uintptr_t)&__cxa_guard_release },
   { "__cxa_begin_catch", (uintptr_t)&__cxa_begin_catch }, { "__cxa_end_catch", (uintptr_t)&__cxa_end_catch },
@@ -838,7 +869,7 @@ so_default_dynlib default_dynlib[] = {
   { "feof", (uintptr_t)&feof_diag }, { "ferror", (uintptr_t)&ferror_diag }, { "setvbuf", (uintptr_t)&setvbuf_diag },
 
   // ============ (a) libc: stdlib.h ============
-  { "malloc", (uintptr_t)&malloc_diag }, { "free", (uintptr_t)&free }, { "calloc", (uintptr_t)&calloc_diag }, { "realloc", (uintptr_t)&realloc_diag },
+  { "malloc", (uintptr_t)&malloc_diag }, { "free", (uintptr_t)&free_diag }, { "calloc", (uintptr_t)&calloc_diag }, { "realloc", (uintptr_t)&realloc_diag },
   { "usleep", (uintptr_t)&usleep_diag },
   { "atoi", (uintptr_t)&atoi }, { "atol", (uintptr_t)&atol }, { "atof", (uintptr_t)&sfp_atof },
   { "strtol", (uintptr_t)&strtol }, { "strtoul", (uintptr_t)&strtoul }, { "strtod", (uintptr_t)&sfp_strtod },

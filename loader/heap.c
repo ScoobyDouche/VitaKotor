@@ -49,6 +49,7 @@
 
 #include "heap.h"
 #include "audio_patch.h"
+#include "bigalloc.h"
 #include "config.h"
 #include "log.h"
 
@@ -182,6 +183,9 @@ void heap_log(const char *why) {
              (unsigned)MEMORY_NEWLIB_MB,
              tenths_mb(headroom) / 10, tenths_mb(headroom) % 10,
              tenths_mb(pcm) / 10, tenths_mb(pcm) % 10);
+  /* The pool's own occupancy belongs next to this, not on its own schedule:
+   * the two numbers only mean anything read together. */
+  bigalloc_log(why);
 }
 
 static void heap_new_handler(void) {

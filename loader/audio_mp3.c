@@ -24,6 +24,7 @@
 
 #include "audio_mp3.h"
 #include "log.h"
+#include "bigalloc.h"
 
 #define MP3_MAX_SAMPLES 1152                 /* MPEG1 Layer III granule pair */
 #define MP3_MAX_PCM     (MP3_MAX_SAMPLES * 2 * 2)   /* stereo, 16-bit */
@@ -135,7 +136,7 @@ static int adpcm_ima_decode(const unsigned char *d, unsigned len, unsigned ch,
   if (tail > 4 * ch) frames += 1 + ((tail - 4 * ch) * 2) / ch;
   if (!frames) return 0;
 
-  int16_t *pcm = (int16_t *)malloc((size_t)frames * ch * sizeof(int16_t));
+  int16_t *pcm = (int16_t *)big_malloc((size_t)frames * ch * sizeof(int16_t));
   if (!pcm) { log_printf("[snd] ADPCM out of memory (%u frames)", frames); return 0; }
 
   int pred[2] = {0, 0}, idx[2] = {0, 0};
@@ -207,7 +208,7 @@ static int wav_try_pcm(const unsigned char *d, unsigned len, AudioPcm *out) {
 
       unsigned frames = csz / (ch * (bits / 8));
       if (!frames) return 0;
-      int16_t *pcm = (int16_t *)malloc((size_t)frames * ch * sizeof(int16_t));
+      int16_t *pcm = (int16_t *)big_malloc((size_t)frames * ch * sizeof(int16_t));
       if (!pcm) return 0;
 
       if (bits == 16) {
@@ -249,7 +250,7 @@ int audio_mp3_probe(const void *data, unsigned len, AudioPcm *out) {
   /* Real PCM: the exact answer is in the header, so no estimate needed. */
   AudioPcm tmp;
   if (wav_try_pcm(d, len, &tmp)) {
-    free(tmp.pcm);
+    big_free(tmp.pcm);
     tmp.pcm = NULL;
     *out = tmp;
     return 1;
@@ -323,7 +324,7 @@ int audio_mp3_decode(const void *data, unsigned len, AudioPcm *out) {
    * but this is a decode-once buffer and the slack is small. */
   unsigned est_frames = (len - (unsigned)off) / 96 + 8;   /* 96B = min L3 frame */
   unsigned cap = est_frames * MP3_MAX_SAMPLES * ch;
-  int16_t *pcm = (int16_t *)malloc((size_t)cap * sizeof(int16_t));
+  int16_t *pcm = (int16_t *)big_malloc((size_t)cap * sizeof(int16_t));
   int16_t  frame[MP3_MAX_SAMPLES * 2];
   if (!pcm) {
     /* Was silent, and that hurt: two 15 MB music decodes filled the heap, every
@@ -364,7 +365,7 @@ int audio_mp3_decode(const void *data, unsigned len, AudioPcm *out) {
   sceAudiodecDeleteDecoder(&ctrl);
 
   if (!total) {
-    free(pcm);
+    big_free(pcm);
     log_printf("[snd] decoded 0 samples (frames=%u errs=%u)", frames, errs);
     return 0;
   }
@@ -378,5 +379,5 @@ int audio_mp3_decode(const void *data, unsigned len, AudioPcm *out) {
 }
 
 void audio_pcm_free(AudioPcm *p) {
-  if (p && p->pcm) { free(p->pcm); p->pcm = NULL; }
+  if (p && p->pcm) { big_free(p->pcm); p->pcm = NULL; }
 }

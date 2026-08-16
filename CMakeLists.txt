@@ -44,6 +44,7 @@ add_executable(KOTOR
   loader/glsl_prep.c
   loader/crash.c
   loader/heap.c
+  loader/bigalloc.c
   loader/log.c
 )
 
