@@ -99,7 +99,12 @@ void input_touch_pump(void) {
   int n = sceTouchPeek(SCE_TOUCH_PORT_FRONT, &td, 1);
   int touching = (n >= 0 && td.reportNum > 0);
 
-  static int log_budget = 40;  // trace the first handful of transitions only
+  // log144 spent its whole budget in the first five minutes of a 31-minute
+  // session, and log143 -- where the chargen name screen would not advance --
+  // recorded no touch at all, leaving "the panel reported nothing" and "the
+  // user never touched it" indistinguishable. At 0.27 ms a line, 400 is still
+  // noise next to the GL trace, and taps are the one input we can prove.
+  static int log_budget = 400;
 
   if (touching) {
     float nx = ((float)td.report[0].x - s_min_x) / (s_max_x - s_min_x);
