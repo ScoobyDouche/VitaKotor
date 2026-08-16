@@ -82,8 +82,31 @@
 
 /* Streams decode whole: a 4-minute track at 32 kHz mono is ~15 MB of PCM. The
  * heap is 192 MB and shared with the game, so cap total decoded audio and refuse
- * politely past it rather than failing an allocation somewhere unrelated. */
+ * politely past it rather than failing an allocation somewhere unrelated.
+ *
+ * This is the HARD ceiling: past it a sound is refused. It is deliberately not
+ * the same number as what we retain for reuse -- see PCM_CACHE_KEEP. */
 #define PCM_BUDGET_BYTES (40u * 1024u * 1024u)
+/* Retention budget: how much decoded PCM we KEEP once nothing is playing it.
+ *
+ * log142 crashed at t=921 on a 2.5 MB allocation with the arena pinned at 190.6
+ * of 192 MB, and the arena is what kills us -- newlib grows it via sbrk whenever
+ * a request will not fit and never gives it back. It climbed in lockstep with
+ * this cache: arena 130 MB at t=68 with 4.5 MB cached, 190 MB at t=441 with
+ * 27.7 MB cached. Roughly 23 of those 60 MB were decoded audio we were holding
+ * on the chance of a re-request.
+ *
+ * That chance is not worth 27 MB of arena. The new-handler wiped the entire
+ * cache twice in the same run (25.0 MB at t=455, 21.0 MB at t=822) and the hit
+ * rate climbed straight through both purges -- 86% -> 88% -> 89%, finishing at
+ * 1777 hits / 211 misses with zero cache-full drops. Two total wipes cost
+ * nothing measurable, so a working set far smaller than 40 MB is clearly enough.
+ *
+ * Soft on purpose: cache_insert trims TOWARD this and never refuses because of
+ * it. Entries a live Sound still references cannot be evicted, and a burst of
+ * simultaneous sounds must not start dropping audio -- only PCM_BUDGET_BYTES
+ * above refuses. */
+#define PCM_CACHE_KEEP   (8u * 1024u * 1024u)
 /* Per-stream ceiling. A whole 88 s track at 44100 stereo is ~15 MB; anything
  * above this becomes timed silence rather than a multi-second stall plus an
  * allocation the heap cannot take. Short VO/ambient (~1.3 MB) is unaffected. */
@@ -193,8 +216,15 @@ static int cache_evict_one(void) {
 /* Takes ownership of *pcm on success (and frees nothing on failure). */
 static PcmEntry *cache_insert(unsigned len, uint32_t h, const AudioPcm *pcm) {
   unsigned bytes = pcm_bytes_of(pcm);
-  while (g_pcm_bytes + bytes > PCM_BUDGET_BYTES)
-    if (!cache_evict_one()) return NULL;
+  /* Trim retained PCM toward the keep budget, best effort: stop as soon as
+   * nothing more can go rather than failing. Referenced entries are unevictable
+   * and refusing on their account would drop a sound the game is asking to play
+   * right now, which is a worse bug than holding a few MB too long. */
+  while (g_pcm_bytes + bytes > PCM_CACHE_KEEP && cache_evict_one())
+    ;
+  /* The hard ceiling still refuses -- that is what stops one runaway decode from
+   * taking the heap with it. */
+  if (g_pcm_bytes + bytes > PCM_BUDGET_BYTES) return NULL;
 
   PcmEntry *slot = NULL;
   for (int i = 0; i < MAX_CACHE; i++)
