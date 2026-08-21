@@ -145,6 +145,70 @@ rewrite of the MODULE_INFO/THREAD_REG_INFO note parsing is enough.)
 and crashes in `_sbrk_r` before `main`. Keep the heap (192 MB) ≤ the granted
 partition.
 
+## Input mapping
+
+Three separate input paths reach the game, and only one of them is wired the way
+you would expect.
+
+**Front touch panel — the primary input.** The game is touch-driven: its menu
+and input loops act on `SDL_FINGERDOWN`/`MOTION`/`UP`, confirmed by disassembly
+(`MacPlayBinkGL`'s skip loop compares `event.type` to `0x700`). Vita SDL2
+produces no finger events from the panel in our configuration, so `input_patch.c`
+reads it with `sceTouchPeek` each frame and pushes proper events into SDL's
+queue. Coordinates are normalised against the panel's *active area* from
+`sceTouchGetPanelInfo` — normalising by the maximum alone assumes the area
+starts at zero and offsets every tap.
+
+**Rear touch panel — deliberately off.** It sits under your fingers while you
+hold the console, and Vita SDL2 turns any sampling port into finger events, so
+it fired taps into the game. `input_touch_init` stops sampling it; SDL's video
+init re-enables it, so `input_touch_pump` asserts it once more afterwards.
+
+**Physical buttons — arriving, but not obviously acting.** Vita SDL2 delivers
+the pad as a joystick. The indices below were established empirically by
+pressing each button in a known order and reading the log:
+
+| Index | Button | Index | Button |
+|---|---|---|---|
+| 0 | Triangle | 6 | D-pad down |
+| 1 | Circle | 7 | D-pad left |
+| 2 | Cross | 8 | D-pad up |
+| 3 | Square | 9 | D-pad right |
+| 4 | L | 10 | Select |
+| 5 | R | 11 | Start |
+
+Note this is **not** the generic SDL gamepad order Android would produce
+(`0=A 1=B 2=X 3=Y`). Any code that assumes the Android order will find the face
+buttons shuffled.
+
+What the game does with an index is unresolved. `SDL_main` looks the index up in
+`gamepadButtonById` — a `std::map<int, GamepadButton>` in `.bss` — and ORs the
+value into `pressedGamepadButtons`. That map has exactly one GOT reference in
+the whole binary, inside the very handler that reads it, and the lookup is
+`operator[]`: a miss inserts a node whose value is zero. So on a static reading
+every press ORs zero, and the map growing at runtime is the lookup's own doing,
+not evidence of a real table. Against that, the buttons do appear to act in
+game. The `[input] JOYBUTTON…` log line reports the mask and the map's node
+count beside each press so a hardware session can settle it:
+
+- mask stays zero while the node count climbs → the joystick path is dead, and
+  whatever answers the buttons reaches the engine some other way
+- mask moves → the map is populated after all, and the fix is a remap from the
+  Vita indices above to what the game expects
+
+Of the bitmask itself: it is a true bitmask (`ReplaceGamepadInputForCombo` does
+`and`/`bic`/`orr` on the whole word), the D-pad occupies `0x100`–`0x800` (the
+hat handler `bic`s `0xf00` before OR-ing), and `0x1000` is cleared on the
+app-background path.
+
+**Text entry — the Vita on-screen keyboard.** Editable fields ask the platform
+for a keyboard via `ASLPlat_ShowVirtualKeyboard`, which on Android is a tail
+call to `SDL_StartTextInput`. `ime_patch.c` overrides that import, drives
+`sceImeDialog`, and replays the result as `SDL_TEXTINPUT` events — the same path
+Android uses, so every field works rather than one screen. See the file header
+for why an inert `SDL_StartTextInput` left the character-name screen with no way
+forward.
+
 ## Layout
 
 ```

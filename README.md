@@ -35,7 +35,7 @@ Treat it as something to look at, not something to start a playthrough on.
 | Session length | **~10–20 min before an area transition crashes it** |
 | Audio | Effects and voice work; long music tracks are silent |
 | Cutscenes | Not played — the video codec is stubbed out |
-| Input | Physical controls, plus front touchscreen for menus |
+| Input | Touchscreen, plus some physical buttons — see [Controls](#controls) |
 | Saves | Work, stored on the Vita |
 
 `main` is usually ahead of the newest [release](../../releases); the issue list
@@ -112,6 +112,28 @@ Shaders and font metrics ship inside the VPK, so there is nothing else to copy.
 
 ---
 
+## Controls
+
+**The touchscreen is the main way you play.** KOTOR's mobile release was built
+for touch, and that has not changed here: you tap the screen to pick menu
+entries, move, attack, talk and use things. The front panel maps one-to-one onto
+the screen, so tap what you can see.
+
+The **rear touch panel is switched off on purpose** — it sits under your fingers
+while you hold the console and was firing taps into the game.
+
+The **physical buttons work for some actions**, and the game draws the button it
+wants on screen when it wants one. Which button that is changes with what you
+are doing — a prompt in combat and a prompt in a menu will not always ask for
+the same one. This is the game's own behaviour, not a remap: what the buttons do
+is inherited from the Android build and has not been reworked for the Vita's
+layout yet. If a prompt does not respond, the touchscreen always will.
+
+**Typing a name** — your character's, or a save's — opens the Vita's on-screen
+keyboard. Tap the name box to bring it up, type, and confirm. *(New; in `main`,
+not in a release yet. On v0.1.9 and earlier there is no way to enter a name at
+all, which leaves character creation with no way forward.)*
+
 ## Known issues
 
 ### Blocking
@@ -140,6 +162,10 @@ Shaders and font metrics ship inside the VPK, so there is nothing else to copy.
 
 ### Fixed in `main`, not yet in a release
 
+- **No way to name your character**, which left character creation with nothing
+  to press and no way on. The field asked the platform for a keyboard the Vita
+  never provided, so it could not receive a letter. It now opens the Vita's own
+  on-screen keyboard; the same fix covers save names.
 - **Sound thinning out and then disappearing entirely, voices included**, over a
   long session — and taking the game down with it. The engine was never told
   when a sound finished, so it never reused a voice or closed a music stream;
