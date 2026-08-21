@@ -18,21 +18,27 @@ with a from-scratch FMOD audio implementation over `sceAudiodec` and
 
 ## Status
 
-**Work in progress — not yet good enough to play through.**
+**Work in progress — playable in stretches, not yet a playthrough.**
 
 It boots, gets through character creation, and plays past the Endar Spire onto
 Taris. Combat, dialogue, inventory, containers and saves all work, and it looks
-and sounds like the game. But **it crashes when moving between areas after
-roughly 10–20 minutes of play**, every time, and that is a hard blocker on
-actually finishing anything. See [Known issues](#known-issues).
+and sounds like the game.
 
-Treat it as something to look at, not something to start a playthrough on.
+The area-transition crash that used to end every session at 10–20 minutes is
+**fixed** in this release: the longest test ran 44 minutes across several area
+loads with the heap still healthy at the end. What replaces it is milder but
+still real — after roughly 40 minutes the world geometry starts tearing into
+diagonal streaks and gets worse from there. Relaunching and loading your save
+came back clean. See [Known issues](#known-issues).
+
+So: worth playing now, in sessions, saving often. Not yet something to start a
+serious playthrough on.
 
 | | |
 |---|---|
 | Startup | ~2 min on first launch, then under a minute |
 | Frame rate | ~30–38 fps typical, dips into the low 20s in dense scenes |
-| Session length | **~10–20 min before an area transition crashes it** |
+| Session length | ~40 min before the picture degrades; no crash in 44 min of testing |
 | Audio | Effects and voice work; long music tracks are silent |
 | Cutscenes | Not played — the video codec is stubbed out |
 | Input | Touchscreen, plus some physical buttons — see [Controls](#controls) |
@@ -138,19 +144,25 @@ all, which leaves character creation with no way forward.)*
 
 ### Blocking
 
-- **Crashes when changing area, after 10–20 minutes of play.** The heap
-  fragments until a routine 1 MB allocation cannot find contiguous room —
-  there is plenty of memory free, just none of it in one piece — and the game
-  aborts. It looks like a freeze on the console because the crash handler stops
-  the app where it stands; `log.txt` will say `UNDEFINED_INSTRUCTION` and, on
-  builds newer than v0.1.9, print the heap state that caused it. **This is the
-  thing being worked on.** Save often; the crash costs you everything since the
-  last save.
+- **The world geometry tears apart after roughly 40 minutes.** Walls and floors
+  smear into diagonal streaks, getting worse over the following minute or two,
+  while the HUD and dialogue text keep drawing perfectly. It is not tied to any
+  particular area — it builds up with time played and is still there when you
+  walk somewhere else. Nothing crashes and your save is fine — relaunching and
+  loading the same save came back clean, though that has only been tried once.
+  **This is the thing being worked on.**
+
+  What is known so far: it is not a failed allocation (vitaGL reports none), and
+  the game's own heap is healthy at the time. Video memory does run dry a minute
+  into play and stay that way, which is measured but not yet shown to be the
+  cause.
 
 ### Rough edges
 
 - **Stutter in dense scenes.** Busy areas issue around 700 draw calls a frame
-  and the frame rate drops into the low 20s. A graphics-throughput limit.
+  and the frame rate drops into the low 20s. Video memory is also full for most
+  of a session, so textures loaded after the first minute are served from
+  ordinary RAM, which likely contributes.
 - **Long music tracks are silent.** Anything over about 90 seconds is replaced
   with correctly-timed silence, so pacing stays right but the score does not
   play. Shorter music and combat stings do. Voice and effects are unaffected.
@@ -160,17 +172,20 @@ all, which leaves character creation with no way forward.)*
   while holding the console and fired spurious taps.
 - **No trophies.**
 
-### Fixed in `main`, not yet in a release
+### Recently fixed
 
-- **No way to name your character**, which left character creation with nothing
-  to press and no way on. The field asked the platform for a keyboard the Vita
-  never provided, so it could not receive a letter. It now opens the Vita's own
-  on-screen keyboard; the same fix covers save names.
-- **Sound thinning out and then disappearing entirely, voices included**, over a
-  long session — and taking the game down with it. The engine was never told
-  when a sound finished, so it never reused a voice or closed a music stream;
-  the leak eventually exhausted both file handles and memory. If you are on
-  v0.1.9 or earlier this is the audio behaviour you will see.
+- **The area-transition crash** (v0.1.10). Large allocations now come from a
+  pool of their own instead of being mixed in with the game's thousands of small
+  long-lived objects, which is what shredded the heap. If you are on v0.1.9 or
+  earlier, this is the 10–20 minute crash you will hit.
+- **No way to name your character** (v0.1.10), which left character creation
+  with nothing to press and no way on. The field asked the platform for a
+  keyboard the Vita never provided, so it could not receive a letter. It now
+  opens the Vita's own on-screen keyboard; the same fix covers save names.
+- **Sound thinning out and then disappearing entirely, voices included**
+  (v0.1.10), over a long session — and taking the game down with it. The engine
+  was never told when a sound finished, so it never reused a voice or closed a
+  music stream; the leak eventually exhausted both file handles and memory.
 
 ## Troubleshooting
 
