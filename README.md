@@ -136,9 +136,9 @@ is inherited from the Android build and has not been reworked for the Vita's
 layout yet. If a prompt does not respond, the touchscreen always will.
 
 **Typing a name** — your character's, or a save's — opens the Vita's on-screen
-keyboard. Tap the name box to bring it up, type, and confirm. *(New; in `main`,
-not in a release yet. On v0.1.9 and earlier there is no way to enter a name at
-all, which leaves character creation with no way forward.)*
+keyboard. Tap the name box to bring it up, type, and confirm. *(New in v0.1.9.1.
+On v0.1.9 and earlier there is no way to enter a name at all, which leaves
+character creation with no way forward.)*
 
 ## Known issues
 
@@ -174,16 +174,16 @@ all, which leaves character creation with no way forward.)*
 
 ### Recently fixed
 
-- **The area-transition crash** (v0.1.10). Large allocations now come from a
+- **The area-transition crash** (v0.1.9.1). Large allocations now come from a
   pool of their own instead of being mixed in with the game's thousands of small
   long-lived objects, which is what shredded the heap. If you are on v0.1.9 or
   earlier, this is the 10–20 minute crash you will hit.
-- **No way to name your character** (v0.1.10), which left character creation
+- **No way to name your character** (v0.1.9.1), which left character creation
   with nothing to press and no way on. The field asked the platform for a
   keyboard the Vita never provided, so it could not receive a letter. It now
   opens the Vita's own on-screen keyboard; the same fix covers save names.
 - **Sound thinning out and then disappearing entirely, voices included**
-  (v0.1.10), over a long session — and taking the game down with it. The engine
+  (v0.1.9.1), over a long session — and taking the game down with it. The engine
   was never told when a sound finished, so it never reused a voice or closed a
   music stream; the leak eventually exhausted both file handles and memory.
 
