@@ -132,6 +132,21 @@ static void *watchdog_thread(void *arg) {
       static unsigned tick = 0;
       if (tick++ % 10 == 0) heap_log_full(NULL); else heap_log(NULL);
     }
+    /* vitaGL's own heaps, which we have never measured. They are fixed at
+     * vglInitExtended and hold every texture and vertex buffer the game
+     * uploads, so they are a second place to run out -- and vitaGL does not
+     * check its allocations, so exhaustion there is silent: the GPU reads
+     * whatever is at the pointer and the geometry smears, while the GUI (small,
+     * per-frame) keeps drawing correctly. log146 ended exactly like that after
+     * 44 minutes in one area with the newlib heap still healthy, which is what
+     * this line is here to confirm or rule out. */
+    log_printf("[vgl] free: vram %u/%u KB, ram %u/%u KB, phycont %u/%u KB",
+               (unsigned)(vglMemFree(VGL_MEM_VRAM) / 1024u),
+               (unsigned)(vglMemTotal(VGL_MEM_VRAM) / 1024u),
+               (unsigned)(vglMemFree(VGL_MEM_RAM) / 1024u),
+               (unsigned)(vglMemTotal(VGL_MEM_RAM) / 1024u),
+               (unsigned)(vglMemFree(VGL_MEM_SLOW) / 1024u),
+               (unsigned)(vglMemTotal(VGL_MEM_SLOW) / 1024u));
     SceUID thid = g_game_thid;
     if (thid < 0)
       continue;
