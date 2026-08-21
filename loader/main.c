@@ -27,6 +27,7 @@
 #include "fs_patch.h"
 #include "sdl_patch.h"
 #include "gl_patch.h"
+#include "ime_patch.h"
 #include "crash.h"
 #include "heap.h"
 #include "bigalloc.h"
@@ -100,6 +101,7 @@ static int load_module(so_module *mod, const char *path, uintptr_t addr) {
   so_resolve(mod, (so_default_dynlib *)fs_get_dynlib(), fs_dynlib_size, 1);
   so_resolve(mod, (so_default_dynlib *)sdl_get_dynlib(), sdl_dynlib_size, 1);
   so_resolve(mod, (so_default_dynlib *)gl_get_dynlib(), gl_dynlib_size, 1);
+  so_resolve(mod, (so_default_dynlib *)ime_get_dynlib(), ime_dynlib_size, 1);
   so_flush_caches(mod);
   return 0;
 }

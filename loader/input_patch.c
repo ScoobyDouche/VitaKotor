@@ -24,6 +24,7 @@
 #include <SDL2/SDL.h>
 #include <string.h>
 
+#include "ime_patch.h"
 #include "input_patch.h"
 #include "log.h"
 
@@ -94,6 +95,19 @@ void input_touch_pump(void) {
 
   if (!s_ready)
     return;
+
+  /* While the on-screen keyboard is up, the panel belongs to it: the taps are
+   * aimed at its keys, and forwarding them would also press whatever GUI
+   * control sits underneath. Release any finger the game still thinks is down
+   * -- a DOWN with no matching UP leaves controls stuck in their pressed
+   * state -- then stay quiet until the dialog closes. */
+  if (ime_dialog_active()) {
+    if (s_finger_down) {
+      push_finger(SDL_FINGERUP, s_last_x, s_last_y);
+      s_finger_down = 0;
+    }
+    return;
+  }
 
   SceTouchData td;
   int n = sceTouchPeek(SCE_TOUCH_PORT_FRONT, &td, 1);

@@ -40,6 +40,7 @@ add_executable(KOTOR
   loader/fs_patch.c
   loader/sdl_patch.c
   loader/input_patch.c
+  loader/ime_patch.c
   loader/gl_patch.c
   loader/glsl_prep.c
   loader/crash.c

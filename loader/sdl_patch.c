@@ -23,6 +23,7 @@
 #include "dynlib.h"   // g_game_threads registry (watchdog sweeps it)
 #include "fs_patch.h"
 #include "gl_patch.h"
+#include "ime_patch.h"
 #include "input_patch.h"
 #include "so_util.h"
 #include "log.h"
@@ -58,9 +59,13 @@ static SDL_GLContext SDL_GL_CreateContext_hook(SDL_Window *w) {
 }
 static void SDL_GL_SwapWindow_hook(SDL_Window *w) {
   (void)w;
-  vglSwapBuffers(GL_FALSE);
+  // The on-screen keyboard is a system common dialog: it is composited into the
+  // back buffer by vglSwapBuffers, and only when we ask for it. Passing GL_TRUE
+  // unconditionally would cost a sceCommonDialogUpdate every frame of the game.
+  vglSwapBuffers(ime_dialog_active() ? GL_TRUE : GL_FALSE);
   gl_patch_on_swap();  // periodic per-frame draw summary (see gl_patch.c)
   input_touch_pump();  // inject Vita front-touch as SDL finger events
+  ime_pump();          // collect what the on-screen keyboard produced
 }
 
 // The game thread hangs in a sleep-poll loop (watchdog: WAITING, no kernel
