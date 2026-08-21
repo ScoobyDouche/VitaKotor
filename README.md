@@ -187,6 +187,14 @@ character creation with no way forward.)*
   was never told when a sound finished, so it never reused a voice or closed a
   music stream; the leak eventually exhausted both file handles and memory.
 
+### Fixed in `main`, not yet in a release
+
+- **Voice lines silent during in-game cutscenes.** The MP3 decoder sized its
+  output buffer by assuming every frame was the smallest one the format allows,
+  which asked for 2.25x what a voice line actually needs — a 13-second line
+  wanted 1.8 MB when the heap could offer 1 MB, so it failed and the game played
+  silence over the scene. It now sizes from the stream's own bitrate.
+
 ## Troubleshooting
 
 Everything is logged to **`ux0:data/kotor/log.txt`**, including full CPU fault

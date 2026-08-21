@@ -293,6 +293,7 @@ int audio_mp3_decode(const void *data, unsigned len, AudioPcm *out) {
   }
 
   unsigned ver  = (d[off + 1] >> 3) & 3;
+  unsigned bri  = (d[off + 2] >> 4) & 0xF;
   unsigned sri  = (d[off + 2] >> 2) & 3;
   unsigned cmod = (d[off + 3] >> 6) & 3;
   unsigned ch   = (cmod == 3) ? 1 : 2;       /* 3 = single channel */
@@ -319,11 +320,30 @@ int audio_mp3_decode(const void *data, unsigned len, AudioPcm *out) {
     return 0;
   }
 
-  /* Upper bound on output: every frame yields at most MP3_MAX_SAMPLES frames of
-   * `ch` samples. Estimating from the stream length and bitrate would be tighter
-   * but this is a decode-once buffer and the slack is small. */
+  /* Size the buffer from the stream's OWN bitrate, not from the assumption that
+   * every frame is the 96-byte Layer III minimum. The slack in that assumption is
+   * not small: KOTOR's voice lines are 48 kbps mono, so their frames are 216
+   * bytes and the old bound asked for 2.25x what the clip needs. log148 shows
+   * what that costs -- a 13.2 s line wanted 1881 KB when the heap could serve
+   * 1024 KB, so it failed and the game played 13 seconds of silence over the
+   * cutscene. The 828 KB it actually needed would have fit.
+   *
+   * bytes*8/kbps == ms is the same CBR identity the silence path above already
+   * relies on, and log148 confirms it exactly: 79488 bytes at 48 kbps gives the
+   * 13248 ms the game itself reported. Slack is 12.5% plus a whole frame, to
+   * absorb mild VBR; the hard bound still caps it, and the decode loop below
+   * stops at `cap` rather than running past it. */
   unsigned est_frames = (len - (unsigned)off) / 96 + 8;   /* 96B = min L3 frame */
   unsigned cap = est_frames * MP3_MAX_SAMPLES * ch;
+  {
+    unsigned kbps = (ver == 3) ? br_mpeg1[bri] : br_mpeg2[bri];
+    if (kbps) {
+      uint64_t ms = (uint64_t)(len - (unsigned)off) * 8u / kbps;
+      uint64_t ns = ms * rate / 1000u;
+      uint64_t tight = ns * ch + (ns * ch) / 8u + MP3_MAX_SAMPLES * ch;
+      if (tight < cap) cap = (unsigned)tight;
+    }
+  }
   int16_t *pcm = (int16_t *)big_malloc((size_t)cap * sizeof(int16_t));
   int16_t  frame[MP3_MAX_SAMPLES * 2];
   if (!pcm) {
@@ -363,6 +383,15 @@ int audio_mp3_decode(const void *data, unsigned len, AudioPcm *out) {
   }
 
   sceAudiodecDeleteDecoder(&ctrl);
+
+  /* Stopping because the buffer filled rather than because the stream ended
+   * means the bitrate-based estimate above was short -- a VBR file, most
+   * likely. The clip is clipped, not corrupted, but it should not be silent
+   * about it: this is the one way the tighter estimate can go wrong. */
+  if (pos + 4 <= len && total + MP3_MAX_SAMPLES * ch > cap)
+    log_printf("[snd] decode hit the buffer estimate: %u KB held %u ms, %u of %u "
+               "bytes left undecoded", (unsigned)(cap * sizeof(int16_t) / 1024),
+               (unsigned)((uint64_t)(total / ch) * 1000u / rate), len - pos, len);
 
   if (!total) {
     big_free(pcm);
