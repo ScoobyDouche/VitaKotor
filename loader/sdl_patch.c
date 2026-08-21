@@ -148,6 +148,20 @@ static void SDL_Delay_hook(Uint32 ms) {
 static struct { unsigned type; unsigned n; } g_evt[EVT_SLOTS];
 static unsigned g_evt_used = 0, g_evt_total = 0;
 
+/* Set by sdl_gamepad_probe_init from main, once libKOTOR is resolved. Volatile:
+ * the game writes these from its own event loop and we only ever read them. */
+static const volatile uint32_t *g_pad_pressed = NULL;
+static const volatile uint32_t *g_pad_this_frame = NULL;
+static const volatile uint32_t *g_pad_map = NULL;   // __tree: begin@0 root@4 size@8
+
+void sdl_gamepad_probe_init(uintptr_t pressed, uintptr_t this_frame, uintptr_t map) {
+  g_pad_pressed    = (const volatile uint32_t *)pressed;
+  g_pad_this_frame = (const volatile uint32_t *)this_frame;
+  g_pad_map        = (const volatile uint32_t *)map;
+  log_printf("[input] gamepad probe: pressed=%p thisFrame=%p map=%p",
+             (void *)pressed, (void *)this_frame, (void *)map);
+}
+
 static void log_event(const char *via, const SDL_Event *e) {
   unsigned t = (unsigned)e->type, i;
   for (i = 0; i < g_evt_used; i++)
@@ -201,12 +215,26 @@ static void log_event(const char *via, const SDL_Event *e) {
   //   0 triangle  1 circle  2 cross  3 square  4 L  5 R
   //   6 dpad-down 7 dpad-left 8 dpad-up 9 dpad-right  10 select  11 start
   // Budgeted -- this is a bring-up probe, not steady-state logging.
+  // 120 was spent on menu mashing in the first five minutes of log145, so the
+  // presses that matter -- the ones during combat, where the on-screen prompt
+  // asks for a different button than the menus do -- fell outside the budget.
   static unsigned btn_n = 0, hat_n = 0;
-  if ((t == SDL_JOYBUTTONDOWN || t == SDL_JOYBUTTONUP) && btn_n < 120) {
+  if ((t == SDL_JOYBUTTONDOWN || t == SDL_JOYBUTTONUP) && btn_n < 400) {
     btn_n++;
-    log_printf("[input] JOYBUTTON%s which=%d button=%u  [#%u]",
+    // The mask is read BEFORE the game handles this event, so it reflects the
+    // previous one -- which is what we want: a DOWN followed by a nonzero mask
+    // on the next line is a press that landed. libKOTOR's handler ORs
+    // gamepadButtonById[index] into pressedGamepadButtons; if that mask stays 0
+    // across every press, the joystick path is dead and whatever is responding
+    // to the buttons in-game reaches the engine some other way. mapSize rising
+    // with no mask change is the signature of the map being grown by the
+    // lookup itself (operator[] inserts a zero) rather than populated.
+    log_printf("[input] JOYBUTTON%s which=%d button=%u  pressed=0x%x thisFrame=0x%x mapSize=%u  [#%u]",
                t == SDL_JOYBUTTONDOWN ? "DOWN" : "UP",
-               (int)e->jbutton.which, (unsigned)e->jbutton.button, btn_n);
+               (int)e->jbutton.which, (unsigned)e->jbutton.button,
+               g_pad_pressed ? (unsigned)*g_pad_pressed : 0u,
+               g_pad_this_frame ? (unsigned)*g_pad_this_frame : 0u,
+               g_pad_map ? (unsigned)g_pad_map[2] : 0u, btn_n);
   } else if (t == SDL_JOYHATMOTION && hat_n < 40) {
     hat_n++;
     log_printf("[input] JOYHAT which=%d hat=%u value=0x%x  [#%u]",

@@ -33,4 +33,12 @@ void *sdl_load_file(const char *name, unsigned int *out_len);
 // g_mainObb and g_patchObb; a NULL disables the fallback rather than faulting.
 void sdl_obb_fallback_init(uintptr_t rwfromfile, uintptr_t mainobb, uintptr_t patchobb);
 
+// Point the gamepad probe at libKOTOR's own button state so the JOYBUTTON log
+// line can report what the press actually did. `pressed` and `this_frame` are
+// pressedGamepadButtons / pressedGamepadButtonsThisFrame; `map` is
+// gamepadButtonById (a libc++ __tree: begin@0, root@4, size@8). Any of them may
+// be 0, in which case that figure is simply omitted. Call once after libKOTOR
+// is resolved.
+void sdl_gamepad_probe_init(uintptr_t pressed, uintptr_t this_frame, uintptr_t map);
+
 #endif

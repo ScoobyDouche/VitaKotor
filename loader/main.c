@@ -1886,6 +1886,12 @@ static void install_sound_probe(void) {
 static void install_load_probe(void) {
   g_appmgr_ptr = (void *)so_symbol(&kotor_mod, "g_pAppManager");
   log_printf("[load] g_pAppManager @ %p", g_appmgr_ptr);
+  // Let the JOYBUTTON log line report what libKOTOR did with the press. All
+  // three are plain .bss globals in libKOTOR; a missing one just drops that
+  // figure from the line.
+  sdl_gamepad_probe_init(so_symbol(&kotor_mod, "pressedGamepadButtons"),
+                         so_symbol(&kotor_mod, "pressedGamepadButtonsThisFrame"),
+                         so_symbol(&kotor_mod, "gamepadButtonById"));
   hook_named("_ZN21CServerExoAppInternal8MainLoopEv",
              (uintptr_t)&MainLoop_probe, (void **)&MainLoop_orig,
              "CServerExoAppInternal::MainLoop");
