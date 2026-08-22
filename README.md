@@ -65,6 +65,29 @@ below says which fixes have not been released yet.
 The Android release: the `.apk` and both `.obb` expansion files. An `.apk` is
 just a zip — open it with any archive tool to get at the libraries inside.
 
+**Which build?** Look inside `lib/armeabi-v7a/` in the APK. If it contains
+`libfmod.so`, it will work. If it contains `libfmodex.so` and
+`libgnustl_shared.so` instead, it will not — that is a much older build, and the
+loader will say so and stop rather than crash.
+
+Known-good, verified by comparing every symbol the loader binds: **1.0.10**
+(`versionCode` 53) and **1.0.9 build 54**, which ship byte-identical native
+libraries, and **1.0.7 / 1.0.71**, which need five extra compiler-runtime
+symbols the loader now provides. Between them that covers every build seen so
+far except the `libfmodex` one, which needs an entire second audio backend and
+an older C++ runtime — 87 symbols short, not on the cards for now.
+
+If a library does ask for something the loader hasn't got, the log names it:
+
+```
+[so] libKOTOR.so: unresolved import  __aeabi_dsub
+[CRASH] ux0:data/kotor/libKOTOR.so wants 1 symbol this build does not provide
+```
+
+That is worth reporting — a handful of names is usually a handful of lines of
+fix. It replaces what used to happen, which was a `PREFETCH_ABORT` two seconds
+into boot at an address that meant nothing.
+
 ---
 
 ## Installation
@@ -212,6 +235,7 @@ a bug report.
 |---|---|
 | Black screen, no error | `libshacccg.suprx` missing from `ur0:data/` |
 | Crashes immediately at launch | `kubridge.skprx` not installed |
+| Stops early, log lists `unresolved import` | Unsupported APK build — see [Requirements](#requirements) |
 | Hangs at the loading spinner | An `.obb` is missing, misnamed, or still copying |
 | Freezes on an area transition | The known memory bug above — not your install |
 | Textures look wrong | Set `GL_FILTER_REDUNDANT_BINDS 0` in `loader/config.h` and rebuild |
