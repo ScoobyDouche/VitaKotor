@@ -405,6 +405,27 @@ static Snd *snd_alloc(void) {
  * oldest FINISHED voice, else the oldest playing one. */
 static unsigned g_chan_stamp = 0, g_steals = 0, g_steals_live = 0;
 static unsigned g_ends_rescued = 0, g_ends_lost = 0;
+/* log154's ratchet: playSound outran END delivery by 28 at t=134 and 163 at
+ * t=949, monotonically, and the deficit never once fell. At t=854 the pool
+ * pinned at 45 of 45 used with ~10 playing, and playSound collapsed from ~6/s
+ * to ~0.4/s while createSound held its full rate -- the game kept building
+ * sounds and stopped playing them, so its own voice bookkeeping is wedged.
+ *
+ * chan_alloc cannot fail (it steals), and the only other way out of playSound
+ * is !snd_valid, so we are not refusing the game: it stopped asking. The one
+ * uncounted path that can wedge a CExoSoundSource is right below in
+ * Snd_release, which clears `playing`, `end_pending` and `cb` together on
+ * every channel still holding the released Sound. A voice killed there while
+ * still playing never raised END at all, and HandleChannelEnd is the only
+ * writer of ChannelInfo+0x1c.
+ *
+ * Whether that is the leak depends on something we cannot see from here --
+ * whether the game's ReleaseSound resets ChannelInfo itself, the way
+ * StopChannel does. Firing END for a voice it has already reset would be a
+ * duplicate, and HandleChannelEnd's other branch is the loop restart, so
+ * count first and only then decide whether to re-home these. If the killed
+ * total tracks the deficit, this is it. */
+static unsigned g_rel_calls = 0, g_rel_kill_live = 0, g_rel_kill_pend = 0;
 
 /* Stealing a voice must not silently swallow an END it still owes.
  *
@@ -786,10 +807,13 @@ have_pcm:;
                  "%u KB PCM held, %u decode fail, voices reused %u/%u (done/live), "
                  "%u END sent over %u updates, %u playSound, "
                  "%u END on steal / %u lost, "
+                 "%u release killed %u live / %u pending, "
                  "chans %d used / %d playing / %d endPending of %d",
                  n, g_cache_hits, g_cache_miss, g_pcm_bytes / 1024, g_missing,
                  g_steals, g_steals_live, g_ends_fired, g_updates, g_played,
-                 g_ends_rescued, g_ends_lost, nused, nplaying, npend, g_nchannels);
+                 g_ends_rescued, g_ends_lost,
+                 g_rel_calls, g_rel_kill_live, g_rel_kill_pend,
+                 nused, nplaying, npend, g_nchannels);
   }
 
   lock();
@@ -858,8 +882,11 @@ static int Snd_release(void *self) {
   if (!snd_valid(self)) return FMOD_ERR_INVALID_PARAM;
   Snd *s = (Snd *)self;
   lock();
+  g_rel_calls++;
   for (int i = 0; i < g_nchannels; i++)
     if (g_chan[i].used && g_chan[i].snd == s) {
+      if (g_chan[i].playing)     g_rel_kill_live++;   /* died with no END at all */
+      if (g_chan[i].end_pending) g_rel_kill_pend++;   /* END built, never sent */
       g_chan[i].playing = 0; g_chan[i].used = 0;
       g_chan[i].end_pending = 0; g_chan[i].cb = NULL;   /* the source is gone */
     }
