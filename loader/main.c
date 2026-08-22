@@ -698,6 +698,55 @@ static unsigned g_flush_n = 0, g_flush_nonempty = 0;
 static int32_t g_flush_max_used = 0;
 static unsigned g_sw_n = 0, g_sw_gate_obj = 0, g_sw_gate_w = 0, g_sw_gate_h = 0, g_sw_pass = 0;
 
+/* Which widgets actually went through ScaleExtentForResolution.
+ *
+ * Two theories about the oversized minimap and the fog panel have now died on
+ * hardware -- the extent counters (log155: 1200 loaded, 2047 scaled) and the
+ * NPOT pad content (log156: resampled 81 times, boxes unchanged). The counter
+ * comparison was never evidence in the first place: ExtentLoad and ScaleExtent
+ * are tallies over DIFFERENT objects, one widget can be scaled repeatedly, and
+ * SetExtent installs extents that ExtentLoad never saw. A total tells you
+ * nothing about whether THIS widget was scaled.
+ *
+ * So record the identity, not the count. Every widget that passes through
+ * ScaleExtent goes in this set; any large image reports, once, whether its own
+ * pointer is in it. An element left at authored size inside a frame scaled by
+ * 0.7083 is 1.41x too big for that frame, which is precisely how both the
+ * minimap and the fog panel overflow. If the offending widget comes back
+ * scaled=NO, that is the bug and the fix is to scale it. If it comes back
+ * scaled=YES, the extent path is exonerated for good and the cause is in the
+ * draw itself. */
+#define GUI_PTRSET_SLOTS 1024              /* power of two; open addressing */
+typedef struct { uint32_t slot[GUI_PTRSET_SLOTS]; unsigned n, overflow; } GuiPtrSet;
+static GuiPtrSet g_gui_scaled;             /* widgets ScaleExtent has touched */
+static GuiPtrSet g_gui_reported;           /* big images already logged once */
+
+static unsigned gui_ptr_hash(uint32_t p) { return ((p >> 2) * 2654435761u) & (GUI_PTRSET_SLOTS - 1); }
+
+/* Returns 1 if p was ALREADY present. Insert-and-test in one pass so the draw
+ * path can use it directly as a once-only gate. */
+static int gui_ptrset_add(GuiPtrSet *s, uint32_t p) {
+  if (!p) return 1;
+  unsigned h = gui_ptr_hash(p);
+  for (unsigned i = 0; i < GUI_PTRSET_SLOTS; i++) {
+    unsigned k = (h + i) & (GUI_PTRSET_SLOTS - 1);
+    if (s->slot[k] == p) return 1;
+    if (!s->slot[k]) { s->slot[k] = p; s->n++; return 0; }
+  }
+  s->overflow++;                            /* full: report rather than lie */
+  return 1;
+}
+static int gui_ptrset_has(const GuiPtrSet *s, uint32_t p) {
+  unsigned h = gui_ptr_hash(p);
+  for (unsigned i = 0; i < GUI_PTRSET_SLOTS; i++) {
+    unsigned k = (h + i) & (GUI_PTRSET_SLOTS - 1);
+    if (s->slot[k] == p) return 1;
+    if (!s->slot[k]) return 0;
+  }
+  return 0;
+}
+static unsigned g_bigimg_logged = 0;
+
 static void SWImgDraw_probe(void *self, uint32_t f) {
   const uint32_t *o = (const uint32_t *)self;
   uint32_t img = o[9];  // +0x24
@@ -707,6 +756,20 @@ static void SWImgDraw_probe(void *self, uint32_t f) {
   else if (!w)  g_sw_gate_w++;
   else if (!h)  g_sw_gate_h++;
   else          g_sw_pass++;
+  /* The boxes are big. Report each large image once, with the one fact that
+   * separates the two remaining theories. Capped, and the cap is printed --
+   * a capped counter read as a finding has cost this port two hardware runs. */
+  if (img && (int)w >= 200 && (int)h >= 200 && g_bigimg_logged < 200) {
+    uint32_t sp = (uint32_t)(uintptr_t)self;
+    if (!gui_ptrset_add(&g_gui_reported, sp)) {
+      g_bigimg_logged++;
+      log_printf("[gui] big image #%u self=0x%08x img=0x%08x w=%d h=%d scaled=%s"
+                 "  (scaled set %u entries, %u overflowed)",
+                 g_bigimg_logged, sp, (unsigned)img, (int)w, (int)h,
+                 gui_ptrset_has(&g_gui_scaled, sp) ? "YES" : "NO",
+                 g_gui_scaled.n, g_gui_scaled.overflow);
+    }
+  }
   if ((g_sw_n++ % 2400) == 0) {
     log_printf("[gui] SWImage::Draw n=%u gates objnull=%u w0=%u h0=%u PASS=%u "
                "(last img=0x%08x w=%d h=%d)",
@@ -988,6 +1051,7 @@ static void (*ScaleExt_orig)(void *self, uint32_t fscale) = NULL;
 static void ScaleExt_probe(void *self, uint32_t fscale) {
   const int32_t *e = (const int32_t *)((const char *)self + 8);
   int32_t b[4] = {e[0], e[1], e[2], e[3]};
+  gui_ptrset_add(&g_gui_scaled, (uint32_t)(uintptr_t)self);
   ScaleExt_orig(self, fscale);
   /* Cadence matched to ExtentLoad's on purpose. At a flat cap of 48 this went
    * quiet at t=145s while ExtentLoad ran on to #2400, and comparing the two
@@ -1000,8 +1064,9 @@ static void ScaleExt_probe(void *self, uint32_t fscale) {
    * unscaled, T=567 falls off a 544-tall screen and lands on the buttons. */
   if (g_sx_n < 64 || (g_sx_n % 240) == 0) {
     float sc; memcpy(&sc, &fscale, 4);
-    log_printf("[gui] ScaleExtent #%u {L=%d T=%d W=%d H=%d} x%.4f -> {L=%d T=%d W=%d H=%d}",
-               g_sx_n, (int)b[0], (int)b[1], (int)b[2], (int)b[3], sc,
+    log_printf("[gui] ScaleExtent #%u self=0x%08x {L=%d T=%d W=%d H=%d} x%.4f -> {L=%d T=%d W=%d H=%d}",
+               g_sx_n, (unsigned)(uintptr_t)self,
+               (int)b[0], (int)b[1], (int)b[2], (int)b[3], sc,
                (int)e[0], (int)e[1], (int)e[2], (int)e[3]);
   }
   g_sx_n++;
