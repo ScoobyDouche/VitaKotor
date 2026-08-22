@@ -31,6 +31,17 @@ void obbzip_close(ObbZip *z);
  * and writes its length to *size_out; NULL if absent or not STORED. */
 void *obbzip_read(ObbZip *z, const char *name, unsigned *size_out);
 
+/* Locate an entry's bytes without reading them: the absolute offset of its data
+ * within the archive file, and its length. Lets a caller pull a handful of
+ * scattered records out of a large member -- dialog.tlk is 5.4 MB and we want
+ * about 128 short strings from it -- instead of loading the whole thing. 1 on
+ * success, 0 if absent or not STORED. */
+int obbzip_locate(ObbZip *z, const char *name, unsigned long long *off, unsigned *size);
+
+/* Read `len` bytes from an absolute offset in the archive file. Pair with
+ * obbzip_locate(). 1 on success. */
+int obbzip_pread(ObbZip *z, unsigned long long off, void *dst, unsigned len);
+
 /* Count entries whose name starts with `prefix` and ends with `suffix`. With
  * `pick` in [0, count), the pick'th such name is copied into `out` instead.
  * Pass pick < 0 to only count. Lets a caller choose at random from a family of

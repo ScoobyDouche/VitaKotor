@@ -101,45 +101,61 @@ static int cd_valid(const ObbZip *z, unsigned off) {
   return off + 46 <= z->cd_size && rd32(z->cd + off) == SIG_CDIR;
 }
 
-void *obbzip_read(ObbZip *z, const char *name, unsigned *size_out) {
-  if (!z || !name) return NULL;
+int obbzip_locate(ObbZip *z, const char *name, unsigned long long *off,
+                  unsigned *size) {
+  if (!z || !name) return 0;
   unsigned want = (unsigned)strlen(name);
 
-  unsigned off = 0;
-  while (cd_valid(z, off)) {
-    unsigned nlen = rd16(z->cd + off + 28);
-    if (off + 46 + nlen > z->cd_size) break;
+  unsigned pos = 0;
+  while (cd_valid(z, pos)) {
+    unsigned nlen = rd16(z->cd + pos + 28);
+    if (pos + 46 + nlen > z->cd_size) break;
 
-    if (nlen == want && memcmp(z->cd + off + 46, name, want) == 0) {
-      unsigned method = rd16(z->cd + off + 10);
-      unsigned usize  = rd32(z->cd + off + 24);
-      unsigned lho    = rd32(z->cd + off + 42);
+    if (nlen == want && memcmp(z->cd + pos + 46, name, want) == 0) {
+      unsigned method = rd16(z->cd + pos + 10);
+      unsigned usize  = rd32(z->cd + pos + 24);
+      unsigned lho    = rd32(z->cd + pos + 42);
       if (method != 0) {
         log_printf("[obbzip] %s is method %u, not STORED -- skipped", name, method);
-        return NULL;
+        return 0;
       }
-      if (usize == 0 || usize > MAX_ENTRY) return NULL;
+      if (usize == 0) return 0;
 
       /* The local header repeats the name and carries its own extra field,
        * whose length routinely differs from the central directory's. The data
        * offset can only be computed from the local copy. */
       unsigned char lh[30];
-      if (!read_at(z->fd, lho, lh, sizeof lh) || rd32(lh) != SIG_LOCAL) return NULL;
-      unsigned long long data =
-          (unsigned long long)lho + 30 + rd16(lh + 26) + rd16(lh + 28);
-
-      void *out = malloc(usize);
-      if (!out) return NULL;
-      if (!read_at(z->fd, data, out, usize)) { free(out); return NULL; }
-      if (size_out) *size_out = usize;
-      return out;
+      if (!read_at(z->fd, lho, lh, sizeof lh) || rd32(lh) != SIG_LOCAL) return 0;
+      if (off) *off = (unsigned long long)lho + 30 + rd16(lh + 26) + rd16(lh + 28);
+      if (size) *size = usize;
+      return 1;
     }
 
-    unsigned next = cd_next(z, off);
-    if (next <= off) break;
-    off = next;
+    unsigned next = cd_next(z, pos);
+    if (next <= pos) break;
+    pos = next;
   }
-  return NULL;
+  return 0;
+}
+
+int obbzip_pread(ObbZip *z, unsigned long long off, void *dst, unsigned len) {
+  return z ? read_at(z->fd, off, dst, len) : 0;
+}
+
+void *obbzip_read(ObbZip *z, const char *name, unsigned *size_out) {
+  unsigned long long off = 0;
+  unsigned usize = 0;
+  if (!obbzip_locate(z, name, &off, &usize)) return NULL;
+  if (usize > MAX_ENTRY) {
+    log_printf("[obbzip] %s is %u bytes, over the %u cap", name, usize, MAX_ENTRY);
+    return NULL;
+  }
+
+  void *out = malloc(usize);
+  if (!out) return NULL;
+  if (!read_at(z->fd, off, out, usize)) { free(out); return NULL; }
+  if (size_out) *size_out = usize;
+  return out;
 }
 
 int obbzip_match(ObbZip *z, const char *prefix, const char *suffix,

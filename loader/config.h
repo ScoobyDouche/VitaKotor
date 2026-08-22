@@ -154,6 +154,33 @@
 #define ART_BAR_Y                 297
 #define ART_BAR_H                 23
 
+// The rest of the screen, also in art pixels. loadscreen.gui's extents were the
+// starting point but its horizontal figures do not survive the stretch (see the
+// bar above), so these were set by composing the real assets against a capture
+// of the game's own screen until they matched.
+//
+// The logo is width-anchored and sits on ART_LOGO_BOTTOM, which is just clear of
+// the picture inset the art starts at row 164. Its file carries wide
+// transparent margins, so the drawn quad uses the opaque bounding box.
+#define ART_LOGO_W                300
+#define ART_LOGO_BOTTOM           156
+#define ART_LOAD_CX               517   // "LOADING", centred (LBL_LOADING)
+#define ART_LOAD_Y                326
+#define ART_HINT_CX               513   // the rotating line (LBL_HINT)
+#define ART_HINT_Y                352
+#define ART_HINT_W                590   // narrower than LBL_HINT's 748: matches
+                                        // where the game's own screen wraps
+
+// Seconds each line stays up. The screen freezes when the game takes over, at
+// about 18s of a warm boot, so this is what decides how many are ever seen.
+#define LOADSCREEN_HINT_SECONDS   6
+
+// Assets read at boot. The .txi ships in the VPK for the game's own use; the
+// atlas and the logo come out of patch.obb.
+#define FONT_TXI_PATH             "app0:fonts/dialogfont16x16b.txi"
+#define FONT_TGA_ENTRY            "override/dialogfont16x16b.tga"
+#define LOGO_TGA_ENTRY            "override/and_main_logo.tga"
+
 // How many times to dump the game's GL state after it takes over. The art can
 // only draw while the loader owns GL outright; once the game starts issuing GL
 // the loadscreen stops for good (see loadscreen.h). These probes record what

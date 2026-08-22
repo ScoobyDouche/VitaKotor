@@ -35,6 +35,8 @@ add_executable(KOTOR
   loader/loadscreen.c
   loader/obbzip.c
   loader/tga.c
+  loader/hints.c
+  loader/font.c
   loader/jni_patch.c
   loader/audio_patch.c
   loader/audio_mp3.c
