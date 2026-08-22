@@ -70,6 +70,15 @@ just a zip — open it with any archive tool to get at the libraries inside.
 `libgnustl_shared.so` instead, it will not — that is a much older build, and the
 loader will say so and stop rather than crash.
 
+If you have the repository checked out, you can ask instead of guessing:
+
+```
+python3 tools/check_apk.py yourfile.apk
+```
+
+It reads the libraries out of the APK and reports what, if anything, the loader
+cannot provide for them. Standard-library Python, no toolchain, any OS.
+
 Known-good, verified by comparing every symbol the loader binds: **1.0.10**
 (`versionCode` 53) and **1.0.9 build 54**, which ship byte-identical native
 libraries, and **1.0.7 / 1.0.71**, which need five extra compiler-runtime
