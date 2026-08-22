@@ -25,20 +25,19 @@ Taris. Combat, dialogue, inventory, containers and saves all work, and it looks
 and sounds like the game.
 
 The area-transition crash that used to end every session at 10–20 minutes is
-**fixed** in this release: the longest test ran 44 minutes across several area
-loads with the heap still healthy at the end. What replaces it is milder but
-still real — after roughly 40 minutes the world geometry starts tearing into
-diagonal streaks and gets worse from there. Relaunching and loading your save
-came back clean. See [Known issues](#known-issues).
+**fixed**: sessions now run past 50 minutes with the heap still healthy at the
+end. Two intermittent problems remain — input going unresponsive, and the world
+geometry tearing — but each has been seen only once in about four hours, and the
+longest session so far was clean throughout. See [Known issues](#known-issues).
 
-So: worth playing now, in sessions, saving often. Not yet something to start a
-serious playthrough on.
+So: worth playing now, saving regularly. Not yet something to start a serious
+playthrough on.
 
 | | |
 |---|---|
 | Startup | ~2 min on first launch, then under a minute |
 | Frame rate | ~30–38 fps typical, dips into the low 20s in dense scenes |
-| Session length | ~40 min before the picture degrades; no crash in 44 min of testing |
+| Session length | 52 min tested clean; two intermittent faults seen once each |
 | Audio | Effects and voice work; long music tracks are silent |
 | Cutscenes | Not played — the video codec is stubbed out |
 | Input | Touchscreen, plus some physical buttons — see [Controls](#controls) |
@@ -142,20 +141,30 @@ character creation with no way forward.)*
 
 ## Known issues
 
-### Blocking
+### Intermittent
 
-- **The world geometry tears apart after roughly 40 minutes.** Walls and floors
-  smear into diagonal streaks, getting worse over the following minute or two,
-  while the HUD and dialogue text keep drawing perfectly. It is not tied to any
-  particular area — it builds up with time played and is still there when you
-  walk somewhere else. Nothing crashes and your save is fine — relaunching and
-  loading the same save came back clean, though that has only been tried once.
-  **This is the thing being worked on.**
+Both of these have been seen exactly once, in about four hours of play, and
+neither has been reproduced since. They are listed because you may hit them, not
+because they are reliable. Save regularly and neither costs you much.
 
-  What is known so far: it is not a failed allocation (vitaGL reports none), and
-  the game's own heap is healthy at the time. Video memory does run dry a minute
-  into play and stay that way, which is measured but not yet shown to be the
-  cause.
+- **Input can stop responding.** Seen once, around 50 minutes in: the camera
+  stick and the touchscreen both stopped doing anything, while the game carried
+  on running and drawing at full speed. Quitting to the LiveArea and relaunching
+  clears it. What is known: the game was still being handed input at the time and
+  simply stopped acting on it, so this is a game-state problem rather than a
+  frozen console. **This is the thing being worked on.**
+
+- **World geometry can tear into diagonal streaks.** Seen once at about 44
+  minutes: walls and floors smear, getting worse over the following minute or
+  two, while the HUD and dialogue text keep drawing perfectly. It followed the
+  player between areas rather than being tied to one. A later 52-minute session
+  was completely clean, so whatever triggers it is not just time played.
+  Relaunching and loading the same save came back clean. Nothing crashes.
+
+  What is known: it is not a failed allocation (vitaGL reports none), and the
+  game's own heap is healthy at the time. Video memory does run dry a minute
+  into play and stay that way, but that is true of sessions with no tearing at
+  all, so it is not sufficient on its own.
 
 ### Rough edges
 
