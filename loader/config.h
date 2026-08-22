@@ -248,6 +248,16 @@
 // Set to 0 if lighting or skinning ever looks stale, to rule this out.
 #define GL_FILTER_REDUNDANT_PROGS 1
 
+// Pad NPOT texture widths to a multiple of 8 on upload, replicating the last
+// column. Added to prove the background-shear theory, and it did -- but it
+// leaves the texture wider than the game believes, so a quad sampling u across
+// [0,1] also covers the pad and the image lands slightly the wrong size. Every
+// pad in log152 was GUI-sized (90x70, 238x98, 435x66, 740x74, 756x106, 934x92),
+// which makes it a live suspect for the minimap overflowing its frame and the
+// fog box in the character screens. Set to 0 to test that; the background shear
+// comes back while it is off. The real fix is strided texture init in vitaGL.
+#define GL_NPOT_WIDTH_PAD 1
+
 // Skinning bisect: force the ubershader's `#define USE_SKIN 1` to 0 in
 // glShaderSource, bypassing kotor.vert's dynamic uniform-array read
 // (u_boneMatrices[indices.x]) while leaving everything else identical.

@@ -596,28 +596,46 @@ static void glActiveTexture_e(GLenum t) {
  *
  * Remember which ids were uploaded as cubes and say so, loudly, when one is
  * deleted or turns up bound as GL_TEXTURE_2D. Either line names the bug. */
-#define CUBE_IDS 8
-static GLuint   g_cube_ids[CUBE_IDS];
-static unsigned g_cube_n = 0;
+/* Track what each texture id CURRENTLY is, not what it once was.
+ *
+ * The first version of this kept a list of ids that had ever been uploaded as a
+ * cube and never forgot them, so once id 32 was recycled every later mention of
+ * 32 fired again -- log152 has 50 such lines and only the first pair means
+ * anything. Recycling an id is legal GL and by itself proves nothing.
+ *
+ * What would be a real fault is a MISMATCH: the game binding GL_TEXTURE_CUBE_MAP
+ * to an id whose most recent upload was 2D. That is the one that puts a flat
+ * image behind u_texture2Sampler and smears a character in reflections. So keep
+ * one byte per id, set it on upload, clear it on delete, and only shout when a
+ * bind disagrees with it. */
+#define TEXKIND_MAX  4096
+#define TEXKIND_NONE 0
+#define TEXKIND_2D   1
+#define TEXKIND_CUBE 2
+static uint8_t  g_tex_kind[TEXKIND_MAX];
 static GLuint   g_cur_cubetex = 0;
 
-static int cube_id_known(GLuint t) {
-  for (unsigned i = 0; i < g_cube_n; i++) if (g_cube_ids[i] == t) return 1;
-  return 0;
+static void tex_kind_set(GLuint t, uint8_t k) {
+  if (t && t < TEXKIND_MAX) {
+    if (g_tex_kind[t] && g_tex_kind[t] != k)
+      log_printf("[GL] texture %u changes kind %s -> %s", (unsigned)t,
+                 g_tex_kind[t] == TEXKIND_CUBE ? "CUBE" : "2D",
+                 k == TEXKIND_CUBE ? "CUBE" : "2D");
+    g_tex_kind[t] = k;
+  }
 }
-static void cube_id_note(GLuint t) {
-  if (!t || cube_id_known(t) || g_cube_n >= CUBE_IDS) return;
-  g_cube_ids[g_cube_n++] = t;
-  log_printf("[GL] cube texture id=%u registered (%u known)", (unsigned)t, g_cube_n);
+static uint8_t tex_kind_get(GLuint t) {
+  return (t && t < TEXKIND_MAX) ? g_tex_kind[t] : TEXKIND_NONE;
 }
 
 static void glDeleteTextures_e(GLsizei n, const GLuint *tex) {
   /* ids are recycled, so any cached binding may now mean a different texture */
   if (tex)
-    for (GLsizei i = 0; i < n; i++)
-      if (cube_id_known(tex[i]))
-        log_printf("[GL] *** CUBE TEXTURE %u DELETED -- envmap id is now free to "
-                   "be recycled as a 2D texture", (unsigned)tex[i]);
+    for (GLsizei i = 0; i < n; i++) {
+      if (tex_kind_get(tex[i]) == TEXKIND_CUBE)
+        log_printf("[GL] cube texture %u deleted", (unsigned)tex[i]);
+      if (tex[i] && tex[i] < TEXKIND_MAX) g_tex_kind[tex[i]] = TEXKIND_NONE;
+    }
   memset(g_bound2d, 0, sizeof g_bound2d);
   glDeleteTextures(n, tex);
 }
@@ -626,13 +644,21 @@ static void glGenTextures_e(GLsizei n, GLuint *t) { GLLOG("glGenTextures(%d)", (
 static void glBindTexture_e(GLenum tg, GLuint t) {
   GLLOG("glBindTexture(0x%x,%u)", (unsigned)tg, (unsigned)t);
   g_texbind_win++;
-  if (tg == GL_TEXTURE_CUBE_MAP) g_cur_cubetex = t;
-  else if (tg == GL_TEXTURE_2D && cube_id_known(t)) {
-    static unsigned warned = 0;
-    if (warned < 8)
-      log_printf("[GL] *** id %u was uploaded as a CUBE and is now being bound as "
-                 "GL_TEXTURE_2D -- the envmap id has been recycled", (unsigned)t);
-    warned++;
+  if (tg == GL_TEXTURE_CUBE_MAP) {
+    g_cur_cubetex = t;
+    if (tex_kind_get(t) == TEXKIND_2D) {          /* THE fault, if it happens */
+      static unsigned w1 = 0;
+      if (w1 < 16)
+        log_printf("[GL] *** MISMATCH: binding CUBE_MAP to id %u whose last upload "
+                   "was 2D -- the envmap is sampling a flat texture", (unsigned)t);
+      w1++;
+    }
+  } else if (tg == GL_TEXTURE_2D && tex_kind_get(t) == TEXKIND_CUBE) {
+    static unsigned w2 = 0;
+    if (w2 < 16)
+      log_printf("[GL] *** MISMATCH: binding 2D to id %u whose last upload was a "
+                 "CUBE", (unsigned)t);
+    w2++;
   }
 #if GL_FILTER_REDUNDANT_BINDS
   if (tg == GL_TEXTURE_2D) {
@@ -739,7 +765,7 @@ static void glTexImage2D_e(GLenum tg, GLint l, GLint ifmt, GLsizei w, GLsizei h,
   // arrive at all -- and how many of the six.
   if (tg >= GL_TEXTURE_CUBE_MAP_POSITIVE_X && tg <= GL_TEXTURE_CUBE_MAP_NEGATIVE_Z) {
     static unsigned nc = 0, faces = 0;
-    cube_id_note(g_cur_cubetex);
+    tex_kind_set(g_cur_cubetex, TEXKIND_CUBE);
     faces |= 1u << (tg - GL_TEXTURE_CUBE_MAP_POSITIVE_X);
     /* Only level 0 past the first cap: log151 spent all 48 lines on ONE cube's
      * mip chain and went blind afterwards, so a re-upload after an area change
@@ -757,6 +783,7 @@ static void glTexImage2D_e(GLenum tg, GLint l, GLint ifmt, GLsizei w, GLsizei h,
   // Square power-of-two base levels are the font atlases; naming the texture id
   // here is what lets the text-draw trace say whether a glyph quad used one.
   if (l == 0) {
+    tex_kind_set(g_cur_tex, TEXKIND_2D);
     tex_note_size(g_cur_tex, (int)w, (int)h);
     if (w == h && (w == 256 || w == 512 || w == 1024))
       log_printf("[GL] atlas candidate: tex=%u %dx%d fmt=0x%x", g_cur_tex, (int)w, (int)h, (unsigned)f);
@@ -779,6 +806,14 @@ static void glTexImage2D_e(GLenum tg, GLint l, GLint ifmt, GLsizei w, GLsizei h,
   // Cost is one staging buffer per NPOT upload; these are a handful of
   // backgrounds, not a per-frame path.
   int bpp = (f == GL_RGBA) ? 4 : (f == GL_RGB) ? 3 : 0;
+  /* The pad makes the texture WIDER than the game asked for, and a quad that
+   * samples u across [0,1] then covers the replicated columns too -- so every
+   * padded GUI image is drawn slightly the wrong size. The oversized minimap and
+   * the fog box in the character screens are both candidates: log152 pads
+   * 90x70, 238x98, 435x66, 740x74, 756x106 and 934x92, all GUI-sized.
+   * Set GL_NPOT_WIDTH_PAD to 0 to test that, at the cost of the background shear
+   * this was added to prove. The real fix is strided texture init in vitaGL. */
+#if GL_NPOT_WIDTH_PAD
   if (px && bpp && l == 0 && w > 0 && h > 0 && (w & 7)) {
     int aw = (w + 7) & ~7;
     unsigned char *pad = (unsigned char *)malloc((size_t)aw * h * bpp);
@@ -797,6 +832,7 @@ static void glTexImage2D_e(GLenum tg, GLint l, GLint ifmt, GLsizei w, GLsizei h,
       return;
     }
   }
+#endif
   // Storage-only allocation (data == NULL) is the FBO colour attachment; pad its
   // width to match the renderbuffer above so the two stay dimension-consistent.
   if (!px && l == 0) {
