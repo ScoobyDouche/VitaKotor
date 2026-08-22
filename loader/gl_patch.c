@@ -399,6 +399,18 @@ static void tex_note_draw(unsigned tex) {
  * next tuning step is chosen from data rather than guessed. */
 static unsigned g_draw_client_win = 0, g_draw_vbo_win = 0;
 static unsigned g_prog_win = 0, g_texbind_win = 0, g_bufdata_win = 0;
+/* Attribute-offset high-water mark, for the geometry corruption. The exploding
+ * characters were SceGxmVertexAttribute::offset being a uint16_t -- any VBO
+ * offset >= 64 KB truncated mod 65536 and the GPU fetched each attribute from a
+ * different vertex of the same buffer, drawing a recognisable model with long
+ * spikes. That is fixed in this tree's vitaGL and the fix is confirmed present
+ * in the linked library, but the photos of the late-session corruption show
+ * spikes rather than the diagonal smear the README describes, so watch the
+ * boundary instead of assuming it. If corruption arrives in the same window
+ * maxAttrOff first passes 64 KB, that is the answer; if offsets never approach
+ * it, the whole family is ruled out and the search moves to texture eviction. */
+static uintptr_t g_vap_max_off = 0;
+static unsigned  g_vap_over64k = 0;
 static unsigned g_bind_skipped_win = 0;   /* redundant binds we suppressed */
 static unsigned g_nontex2d_binds = 0;     /* cube/3D binds -- the envmap path */
 static GLuint   g_cur_arraybuf = 0;      /* last glBindBuffer(GL_ARRAY_BUFFER) */
@@ -629,6 +641,8 @@ static void glVertexAttribPointer_e(GLuint index, GLint size, GLenum type, GLboo
                (unsigned)index, (int)size, (unsigned)type, (int)normalized,
                (int)stride, (unsigned)(uintptr_t)pointer);
   }
+  if ((uintptr_t)pointer > g_vap_max_off) g_vap_max_off = (uintptr_t)pointer;
+  if ((uintptr_t)pointer > 0xFFFFu) g_vap_over64k++;
   glVertexAttribPointer(index, size, type, normalized, stride, pointer);
 }
 
