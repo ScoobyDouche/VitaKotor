@@ -806,27 +806,50 @@ static void glTexImage2D_e(GLenum tg, GLint l, GLint ifmt, GLsizei w, GLsizei h,
   // Cost is one staging buffer per NPOT upload; these are a handful of
   // backgrounds, not a per-frame path.
   int bpp = (f == GL_RGBA) ? 4 : (f == GL_RGB) ? 3 : 0;
-  /* The pad makes the texture WIDER than the game asked for, and a quad that
-   * samples u across [0,1] then covers the replicated columns too -- so every
-   * padded GUI image is drawn slightly the wrong size. The oversized minimap and
-   * the fog box in the character screens are both candidates: log152 pads
-   * 90x70, 238x98, 435x66, 740x74, 756x106 and 934x92, all GUI-sized.
-   * Set GL_NPOT_WIDTH_PAD to 0 to test that, at the cost of the background shear
-   * this was added to prove. The real fix is strided texture init in vitaGL. */
+  /* The pad makes the texture WIDER than the game asked for, and the game still
+   * samples u across [0,1] -- so whatever sits in the pad columns is drawn as
+   * part of the picture. Replicating the last column was fine for the 860x478
+   * background this was written for (0.5% of one edge column) and ruinous for
+   * everything small: log155 pads 2x2 -> 8x2 and 4x4 -> 8x4, where the real
+   * image ends up squeezed into the left quarter and the remaining
+   * three quarters are one flat colour. A soft gradient becomes a hard-edged
+   * rectangle, which is exactly what the minimap frame and the fog panel on the
+   * character and new-game screens look like.
+   *
+   * Resample the row onto the padded width instead of extending it. u in [0,1]
+   * then spans the whole picture again at any size, subrect texcoords keep
+   * pointing at the same texels, and vitaGL still gets the 8-aligned width its
+   * stride assumes. The only cost is a horizontal resample of at most seven
+   * columns' worth of ratio -- 0.5% on the background, exact-in-effect on the
+   * tiny gradients, and no hard edge anywhere.
+   *
+   * Kept separate from the RENDER TARGET padding below, which is the actual fix
+   * for the diagonal background shear and is not gated by this flag. */
 #if GL_NPOT_WIDTH_PAD
   if (px && bpp && l == 0 && w > 0 && h > 0 && (w & 7)) {
     int aw = (w + 7) & ~7;
     unsigned char *pad = (unsigned char *)malloc((size_t)aw * h * bpp);
     if (pad) {
       const unsigned char *src = (const unsigned char *)px;
+      /* 16.16 fixed point, sampling at column centres so the edges stay put. */
+      const int step = (int)(((int64_t)w << 16) / aw);
       for (int y = 0; y < h; y++) {
         unsigned char *drow = pad + (size_t)y * aw * bpp;
         const unsigned char *srow = src + (size_t)y * w * bpp;
-        memcpy(drow, srow, (size_t)w * bpp);
-        for (int x = w; x < aw; x++)              // replicate last column
-          memcpy(drow + (size_t)x * bpp, srow + (size_t)(w - 1) * bpp, bpp);
+        int pos = step / 2 - 32768;
+        for (int x = 0; x < aw; x++, pos += step) {
+          int p  = pos < 0 ? 0 : pos;
+          int x0 = p >> 16, fr = p & 0xFFFF;
+          if (x0 >= w - 1) { x0 = w - 1; fr = 0; }
+          int x1 = (x0 + 1 < w) ? x0 + 1 : x0;
+          const unsigned char *a = srow + (size_t)x0 * bpp;
+          const unsigned char *c = srow + (size_t)x1 * bpp;
+          unsigned char *d = drow + (size_t)x * bpp;
+          for (int k = 0; k < bpp; k++)
+            d[k] = (unsigned char)((a[k] * (65536 - fr) + c[k] * fr) >> 16);
+        }
       }
-      log_printf("[GL] NPOT pad: %dx%d -> %dx%d (bpp=%d)", (int)w, (int)h, aw, (int)h, bpp);
+      log_printf("[GL] NPOT resample: %dx%d -> %dx%d (bpp=%d)", (int)w, (int)h, aw, (int)h, bpp);
       glTexImage2D(tg, l, ifmt, aw, h, b, f, ty, pad);
       free(pad);
       return;
