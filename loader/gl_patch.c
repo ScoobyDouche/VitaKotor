@@ -396,6 +396,7 @@ static void tex_note_draw(unsigned tex) {
 static unsigned g_draw_client_win = 0, g_draw_vbo_win = 0;
 static unsigned g_prog_win = 0, g_texbind_win = 0, g_bufdata_win = 0;
 static unsigned g_bind_skipped_win = 0;   /* redundant binds we suppressed */
+static unsigned g_nontex2d_binds = 0;     /* cube/3D binds -- the envmap path */
 static GLuint   g_cur_arraybuf = 0;      /* last glBindBuffer(GL_ARRAY_BUFFER) */
 
 static inline void draw_note_source(void) {
@@ -437,10 +438,11 @@ void gl_patch_on_swap(void) {
       o += snprintf(ab + o, sizeof(ab) - o, "%ux%u=%u ", g_bk_w[k], g_bk_h[k], g_bk_n_draws[k]);
     if (o) log_printf("[GL]   draws by texture size (lifetime): %s", ab);
     log_printf("[GL]   per-window: clientArrayDraws=%u vboDraws=%u  texBinds=%u "
-               "(skipped %u = %u%%) progSwitches=%u bufferUploads=%u",
+               "(skipped %u = %u%%) progSwitches=%u bufferUploads=%u "
+               "nonTex2DBinds=%u",
                g_draw_client_win, g_draw_vbo_win, g_texbind_win, g_bind_skipped_win,
                g_texbind_win ? (g_bind_skipped_win * 100 / g_texbind_win) : 0,
-               g_prog_win, g_bufdata_win);
+               g_prog_win, g_bufdata_win, g_nontex2d_binds);
     g_bind_skipped_win = 0;
     g_arrays_win = g_elements_win = g_clears_win = 0;
     g_draw_client_win = g_draw_vbo_win = 0;
@@ -538,6 +540,15 @@ static void glDisable_e(GLenum cap) { GLLOG("glDisable(0x%x)", (unsigned)cap); g
  *   - GL_TEXTURE_2D only; every other target passes straight through
  *   - the whole shadow is dropped on glDeleteTextures, because ids get recycled
  *     and a stale entry would silently draw with the wrong texture
+ *   - and binding ANY other target to a unit clears that unit's entry. Desktop
+ *     GL keeps one binding per target per unit, so a cube bind would leave the
+ *     2D binding intact and skipping the next 2D bind would be correct -- but
+ *     GXM has a single texture per sampler slot and vitaGL is not obliged to
+ *     model GL's per-target state. The shadow must not assume it does: kotor.vert
+ *     samples u_texture2Sampler as a real GL_SAMPLER_CUBE for the environment
+ *     map, so exactly the shiny-armour materials bind a cube to a unit that
+ *     otherwise carries a 2D texture. Forgetting the entry costs one redundant
+ *     bind on the rare cube path and cannot draw the wrong texture.
  * Set GL_FILTER_REDUNDANT_BINDS to 0 in config.h to rule this out. */
 #define GL_MAX_TEXUNITS 8
 static unsigned g_active_unit = 0;
@@ -564,6 +575,9 @@ static void glBindTexture_e(GLenum tg, GLuint t) {
   if (tg == GL_TEXTURE_2D) {
     if (g_bound2d[g_active_unit] == t) { g_bind_skipped_win++; g_cur_tex = t; return; }
     g_bound2d[g_active_unit] = t;
+  } else {
+    g_bound2d[g_active_unit] = 0;        /* unit may no longer hold that 2D texture */
+    g_nontex2d_binds++;
   }
 #endif
   if (tg == GL_TEXTURE_2D) g_cur_tex = t;  // mirrored for the text-draw trace
@@ -647,6 +661,24 @@ static GLsizei gl_rt_align_w(GLsizei w) { return (w > 0 && (w & 7)) ? ((w + 7) &
 
 static void glTexImage2D_e(GLenum tg, GLint l, GLint ifmt, GLsizei w, GLsizei h, GLint b, GLenum f, GLenum ty, const void *px) {
   GLLOG("glTexImage2D(0x%x, l=%d, %dx%d, fmt=0x%x)", (unsigned)tg, l, (int)w, (int)h, (unsigned)f);
+  // The environment map is a real cube: kotor.vert declares u_texture2Sampler as
+  // GL_SAMPLER_CUBE and the shiny-armour material is the USE_CUBEMAP variant.
+  // Nothing in any log so far shows a single cube face being uploaded, so before
+  // theorising about why armour renders flat white, record whether the faces
+  // arrive at all -- and how many of the six.
+  if (tg >= GL_TEXTURE_CUBE_MAP_POSITIVE_X && tg <= GL_TEXTURE_CUBE_MAP_NEGATIVE_Z) {
+    static unsigned nc = 0, faces = 0;
+    faces |= 1u << (tg - GL_TEXTURE_CUBE_MAP_POSITIVE_X);
+    if (nc < 48)
+      log_printf("[GL] cube face %u: l=%d %dx%d ifmt=0x%x fmt=0x%x data=%s "
+                 "(faces seen 0x%02x)",
+                 (unsigned)(tg - GL_TEXTURE_CUBE_MAP_POSITIVE_X), l, (int)w, (int)h,
+                 (unsigned)ifmt, (unsigned)f, px ? "yes" : "NULL", faces);
+    nc++;
+    glTexImage2D(tg, l, ifmt, w, h, b, f, ty, px);
+    return;                        // none of the 2D heuristics below apply
+  }
+  if (tg != GL_TEXTURE_2D) { glTexImage2D(tg, l, ifmt, w, h, b, f, ty, px); return; }
   // Square power-of-two base levels are the font atlases; naming the texture id
   // here is what lets the text-draw trace say whether a glyph quad used one.
   if (l == 0) {
