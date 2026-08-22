@@ -349,10 +349,87 @@ int so_resolve(so_module *mod, so_default_dynlib *default_dynlib, int size_defau
   return 0;
 }
 
+// Every .init_array entry has to land inside the module we just mapped. A value
+// outside it means so_relocate never fixed up this library's relative
+// relocations -- which is what happens when the .so packs them in a format the
+// loop above does not read (Android APS2, RELR), since we would then find
+// .rel.dyn present, relocate nothing relative, and notice nothing wrong.
+//
+// Calling the entry anyway jumps to a raw link-time offset: PREFETCH_ABORT with
+// a tiny PC, two seconds into boot, nothing in the log to say why. That is the
+// reported signature of an Amazon Underground / <=1.0.9 APK (PC = 0x00025b28).
+// Check first and say so instead. Two compares per constructor, ~28 in total.
+// Imports nothing bound. so_resolve runs once per dynlib table -- seven passes
+// per module -- so it cannot warn as it goes: a symbol unbound in pass 1 may
+// well bind in pass 5. Once every table has been offered, walk the relocations
+// again and see what is still holding its link-time value.
+//
+// This is the failure an unsupported APK actually produces. The library asks
+// for something this loader has never had to provide, the slot keeps whatever
+// the linker left in it, and the first call through it lands at an address that
+// looks like nothing: PC = 0x00025b28 in the report that prompted this, two
+// seconds into boot, with no way back to a name. Naming the symbol turns that
+// into a five-line fix in dynlib.c.
+//
+// The test is just the address range. Everything we bind is either in the eboot
+// or in a module we mapped, all above 0x80000000; a link-time value is small.
+// Weak symbols are skipped -- they are allowed to stay null.
+int so_unresolved(so_module *mod) {
+  const char *name = mod->soname ? mod->soname : "?";
+  int seen[24], num_seen = 0, count = 0;
+
+  for (int i = 0; i < mod->num_reldyn + mod->num_relplt; i++) {
+    Elf32_Rel *rel = i < mod->num_reldyn ? &mod->reldyn[i]
+                                         : &mod->relplt[i - mod->num_reldyn];
+    int type = ELF32_R_TYPE(rel->r_info);
+    if (type != R_ARM_JUMP_SLOT && type != R_ARM_GLOB_DAT && type != R_ARM_ABS32)
+      continue;
+
+    int idx = ELF32_R_SYM(rel->r_info);
+    Elf32_Sym *sym = &mod->dynsym[idx];
+    if (sym->st_shndx != SHN_UNDEF)
+      continue;
+    if (ELF32_ST_BIND(sym->st_info) == STB_WEAK)
+      continue;
+    if (*(uintptr_t *)(mod->text_base + rel->r_offset) >= 0x80000000)
+      continue;
+
+    int dup = 0;
+    for (int j = 0; j < num_seen; j++)
+      if (seen[j] == idx) { dup = 1; break; }
+    if (dup)
+      continue;
+    if (num_seen < (int)(sizeof(seen) / sizeof(seen[0])))
+      seen[num_seen++] = idx;
+
+    count++;
+    if (count <= 20)
+      log_printf("[so] %s: unresolved import  %s", name, mod->dynstr + sym->st_name);
+  }
+
+  if (count > 20)
+    log_printf("[so] %s: ...and %d more", name, count - 20);
+  return count;
+}
+
 void so_initialize(so_module *mod) {
+  const char *name = mod->soname ? mod->soname : "?";
+  uintptr_t lo = mod->text_base;
+  uintptr_t hi = mod->data_base ? mod->data_base + mod->data_size
+                                : mod->text_base + mod->text_size;
+
   for (int i = 0; i < mod->num_init_array; i++) {
-    if (mod->init_array[i])
-      mod->init_array[i]();
+    uintptr_t fn = (uintptr_t)mod->init_array[i];
+    if (!fn)
+      continue;
+    if (fn < lo || fn >= hi) {
+      log_printf("[so] %s: constructor %d/%d = 0x%08x, outside 0x%08x-0x%08x",
+                 name, i, mod->num_init_array, (unsigned)fn, (unsigned)lo,
+                 (unsigned)hi);
+      fatal_error("%s: relocations were not applied -- unsupported APK build.\n"
+                  "Needs KOTOR 1.0.10 (versionCode 53). See the README.", name);
+    }
+    mod->init_array[i]();
   }
 }
 

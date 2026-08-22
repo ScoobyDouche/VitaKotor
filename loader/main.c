@@ -102,6 +102,17 @@ static int load_module(so_module *mod, const char *path, uintptr_t addr) {
   so_resolve(mod, (so_default_dynlib *)sdl_get_dynlib(), sdl_dynlib_size, 1);
   so_resolve(mod, (so_default_dynlib *)gl_get_dynlib(), gl_dynlib_size, 1);
   so_resolve(mod, (so_default_dynlib *)ime_get_dynlib(), ime_dynlib_size, 1);
+
+  // Every table has now been offered. Anything still unbound will fault at a
+  // meaningless address the moment it is called -- name it here instead, since
+  // that is what an APK build we do not support looks like from the outside.
+  int missing = so_unresolved(mod);
+  if (missing > 0)
+    fatal_error("%s wants %d symbol%s this build does not provide -- the names "
+                "are in log.txt just above.\nThis is normally an unsupported "
+                "APK. See the README for which build to use.",
+                path, missing, missing == 1 ? "" : "s");
+
   so_flush_caches(mod);
   return 0;
 }
