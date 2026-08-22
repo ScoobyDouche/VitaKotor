@@ -175,6 +175,7 @@ static uint64_t sfp_strtod(const char *s, char **end)      { return d2u(strtod(s
 
 // ---- compiler / C++ runtime symbols (resolved from libgcc / libstdc++) ----
 extern void *__aeabi_d2ulz, *__aeabi_idiv, *__aeabi_idivmod, *__aeabi_l2d, *__aeabi_l2f;
+extern void *__aeabi_dsub, *__aeabi_ui2d;  // 1.0.7-era builds only
 extern void *__aeabi_ldivmod, *__aeabi_uidiv, *__aeabi_uidivmod, *__aeabi_ul2d, *__aeabi_ul2f, *__aeabi_uldivmod;
 extern void *_Znwj, *_Znaj, *_ZdlPv, *_ZdaPv;
 extern void *__cxa_atexit, *__cxa_finalize, *__cxa_guard_acquire, *__cxa_guard_release;
@@ -188,6 +189,7 @@ extern void *_ZTVN10__cxxabiv121__vmi_class_type_infoE;
 // std::exception/bad_cast dtors + typeinfos (present in this libstdc++)
 extern void *_ZNSt8bad_castD1Ev, *_ZNSt9exceptionD2Ev;
 extern void *_ZTIi, *_ZTISt8bad_cast, *_ZTISt9exception;
+extern void *_ZNSt9bad_allocD1Ev, *_ZTISt9bad_alloc;  // 1.0.7-era builds only
 
 // ---- allocation tracing (diagnostic) --------------------------------------
 // Armed (by gl_patch.c) only once init()'s final GL cap-query runs, so we don't
@@ -834,6 +836,8 @@ so_default_dynlib default_dynlib[] = {
 
   // ============ (a) __aeabi helpers ============
   { "__aeabi_d2ulz", (uintptr_t)&__aeabi_d2ulz },
+  // Only 1.0.7-era libKOTOR imports these two; 1.0.9/b54 inlines the work.
+  { "__aeabi_dsub", (uintptr_t)&__aeabi_dsub }, { "__aeabi_ui2d", (uintptr_t)&__aeabi_ui2d },
   { "__aeabi_idiv", (uintptr_t)&__aeabi_idiv }, { "__aeabi_idivmod", (uintptr_t)&__aeabi_idivmod },
   { "__aeabi_l2d", (uintptr_t)&__aeabi_l2d }, { "__aeabi_l2f", (uintptr_t)&__aeabi_l2f },
   { "__aeabi_ldivmod", (uintptr_t)&__aeabi_ldivmod },
@@ -982,6 +986,11 @@ so_default_dynlib default_dynlib[] = {
   { "_ZTIi", (uintptr_t)&_ZTIi }, { "_ZTISt8bad_cast", (uintptr_t)&_ZTISt8bad_cast }, { "_ZTISt9exception", (uintptr_t)&_ZTISt9exception },
   // exception_ptr internals absent from this libsupc++ -> bring-up stubs
   { "_ZNSt8bad_castC1Ev", (uintptr_t)&bad_cast_ctor_stub },
+  // std::bad_alloc: only 1.0.7-era builds import it. Ctor is inline in this
+  // libstdc++ (same as bad_cast above), so it gets the same do-nothing stub.
+  { "_ZNSt9bad_allocC1Ev", (uintptr_t)&bad_cast_ctor_stub },
+  { "_ZNSt9bad_allocD1Ev", (uintptr_t)&_ZNSt9bad_allocD1Ev },
+  { "_ZTISt9bad_alloc", (uintptr_t)&_ZTISt9bad_alloc },
   { "__cxa_current_primary_exception", (uintptr_t)&__cxa_current_primary_exception_stub },
   { "__cxa_decrement_exception_refcount", (uintptr_t)&__cxa_decrement_exception_refcount_stub },
   { "__cxa_increment_exception_refcount", (uintptr_t)&__cxa_increment_exception_refcount_stub },
