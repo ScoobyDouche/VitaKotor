@@ -455,12 +455,13 @@ void gl_patch_on_swap(void) {
     if (o) log_printf("[GL]   draws by texture size (lifetime): %s", ab);
     log_printf("[GL]   per-window: clientArrayDraws=%u vboDraws=%u  texBinds=%u "
                "(skipped %u = %u%%) progSwitches=%u (skipped %u = %u%%) "
-               "bufferUploads=%u nonTex2DBinds=%u",
+               "bufferUploads=%u nonTex2DBinds=%u maxAttrOff=0x%x over64k=%u",
                g_draw_client_win, g_draw_vbo_win, g_texbind_win, g_bind_skipped_win,
                g_texbind_win ? (g_bind_skipped_win * 100 / g_texbind_win) : 0,
                g_prog_win, g_prog_skipped_win,
                g_prog_win ? (g_prog_skipped_win * 100 / g_prog_win) : 0,
-               g_bufdata_win, g_nontex2d_binds);
+               g_bufdata_win, g_nontex2d_binds,
+               (unsigned)g_vap_max_off, g_vap_over64k);
     g_bind_skipped_win = g_prog_skipped_win = 0;
     g_arrays_win = g_elements_win = g_clears_win = 0;
     g_draw_client_win = g_draw_vbo_win = 0;
