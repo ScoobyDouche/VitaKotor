@@ -26,9 +26,13 @@ and sounds like the game.
 
 The area-transition crash that used to end every session at 10–20 minutes is
 **fixed**: sessions now run past 50 minutes with the heap still healthy at the
-end. Two intermittent problems remain — input going unresponsive, and the world
-geometry tearing — but each has been seen only once in about four hours, and the
-longest session so far was clean throughout. See [Known issues](#known-issues).
+end. What remains is cosmetic or recoverable rather than fatal — sound thinning
+out over a long session, the world geometry occasionally tearing, and input
+going unresponsive once in about five hours. Nothing crashes and no save has
+been lost. See [Known issues](#known-issues).
+
+The wait before the main menu is now dressed in the game's own loading art, with
+a hint to read while it works *(new in v0.1.10)*.
 
 So: worth playing now, saving regularly. Not yet something to start a serious
 playthrough on.
@@ -37,7 +41,7 @@ playthrough on.
 |---|---|
 | Startup | ~2 min on first launch, then under a minute |
 | Frame rate | ~30–38 fps typical, dips into the low 20s in dense scenes |
-| Session length | 52 min tested clean; two intermittent faults seen once each |
+| Session length | 59 min tested; nothing fatal, but sound thins out past ~40 |
 | Audio | Effects and voice work; long music tracks are silent |
 | Cutscenes | Not played — the video codec is stubbed out |
 | Input | Touchscreen, plus some physical buttons — see [Controls](#controls) |
@@ -143,31 +147,43 @@ character creation with no way forward.)*
 
 ### Intermittent
 
-Both of these have been seen exactly once, in about four hours of play, and
-neither has been reproduced since. They are listed because you may hit them, not
-because they are reliable. Save regularly and neither costs you much.
+None of these is reliable enough to reproduce on demand, and none of them costs
+you a save. They are listed because you may hit them. Save regularly.
 
 - **Input can stop responding.** Seen once, around 50 minutes in: the camera
   stick and the touchscreen both stopped doing anything, while the game carried
   on running and drawing at full speed. Quitting to the LiveArea and relaunching
   clears it. What is known: the game was still being handed input at the time and
   simply stopped acting on it, so this is a game-state problem rather than a
-  frozen console. **This is the thing being worked on.**
+  frozen console.
 
-- **World geometry can tear into diagonal streaks.** Seen once at about 44
-  minutes: walls and floors smear, getting worse over the following minute or
-  two, while the HUD and dialogue text keep drawing perfectly. It followed the
-  player between areas rather than being tied to one. A later 52-minute session
-  was completely clean, so whatever triggers it is not just time played.
-  Relaunching and loading the same save came back clean. Nothing crashes.
+- **World geometry can tear into diagonal streaks.** Seen twice — once at about
+  44 minutes, and again at 37 minutes on Taris: walls and floors smear, getting
+  worse over the following minute or two, while the HUD and dialogue text keep
+  drawing perfectly. It followed the player between areas rather than being tied
+  to one. A 52-minute session in between was completely clean, so whatever
+  triggers it is not just time played. Relaunching and loading the same save came
+  back clean. Nothing crashes.
 
   What is known: it is not a failed allocation (vitaGL reports none), and the
   game's own heap is healthy at the time. Video memory does run dry a minute
   into play and stay that way, but that is true of sessions with no tearing at
   all, so it is not sufficient on its own.
 
+- **Sound thins out over a long session.** Seen at 40 minutes and worse by 59:
+  spoken lines and effects gradually stop playing, while the game itself runs on
+  normally. Relaunching clears it and your save is safe. This is what is left of
+  the fault v0.1.9.1 fixed the fatal half of: the engine learns a sound has
+  finished from a single callback, and over a long session it stops hearing about
+  some of them, after which those sources never speak again. **This is the thing
+  being worked on.**
+
 ### Rough edges
 
+- **Some armour renders flat white instead of shiny,** going reflective only
+  under certain lighting — Sith armour is the clearest example. The shine is an
+  environment map, sampled through a cube texture that the port is not binding
+  reliably.
 - **Stutter in dense scenes.** Busy areas issue around 700 draw calls a frame
   and the frame rate drops into the low 20s. Video memory is also full for most
   of a session, so textures loaded after the first minute are served from
@@ -197,10 +213,11 @@ because they are reliable. Save regularly and neither costs you much.
   with nothing to press and no way on. The field asked the platform for a
   keyboard the Vita never provided, so it could not receive a letter. It now
   opens the Vita's own on-screen keyboard; the same fix covers save names.
-- **Sound thinning out and then disappearing entirely, voices included**
-  (v0.1.9.1), over a long session — and taking the game down with it. The engine
-  was never told when a sound finished, so it never reused a voice or closed a
-  music stream; the leak eventually exhausted both file handles and memory.
+- **Sound taking the game down with it** (v0.1.9.1). The engine was never told
+  when a sound finished, so it never reused a voice or closed a music stream;
+  the leak exhausted both file handles and memory and ended the session. That
+  crash is gone. Sound still thins out over a long session, though — see
+  [Known issues](#known-issues).
 
 ## Troubleshooting
 
