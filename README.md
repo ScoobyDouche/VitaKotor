@@ -183,6 +183,12 @@ because they are reliable. Save regularly and neither costs you much.
 
 ### Recently fixed
 
+- **Voice lines silent during in-game cutscenes** (v0.1.9.2). The MP3 decoder
+  sized its output buffer by assuming every frame was the smallest one the
+  format allows, which asked for 2.25x what a voice line actually needs — a
+  13-second line wanted 1.8 MB when the heap could offer 1 MB, so it failed and
+  the game played silence over the scene. It now sizes from the stream's own
+  bitrate.
 - **The area-transition crash** (v0.1.9.1). Large allocations now come from a
   pool of their own instead of being mixed in with the game's thousands of small
   long-lived objects, which is what shredded the heap. If you are on v0.1.9 or
@@ -195,14 +201,6 @@ because they are reliable. Save regularly and neither costs you much.
   (v0.1.9.1), over a long session — and taking the game down with it. The engine
   was never told when a sound finished, so it never reused a voice or closed a
   music stream; the leak eventually exhausted both file handles and memory.
-
-### Fixed in `main`, not yet in a release
-
-- **Voice lines silent during in-game cutscenes.** The MP3 decoder sized its
-  output buffer by assuming every frame was the smallest one the format allows,
-  which asked for 2.25x what a voice line actually needs — a 13-second line
-  wanted 1.8 MB when the heap could offer 1 MB, so it failed and the game played
-  silence over the scene. It now sizes from the stream's own bitrate.
 
 ## Troubleshooting
 
