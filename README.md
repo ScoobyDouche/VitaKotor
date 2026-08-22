@@ -40,6 +40,7 @@ playthrough on.
 | | |
 |---|---|
 | Startup | ~2 min on first launch, then under a minute |
+| Area loads | 0.4–0.8 s |
 | Frame rate | ~30–38 fps typical, dips into the low 20s in dense scenes |
 | Session length | 59 min tested; nothing fatal, but sound thins out past ~40 |
 | Audio | Effects and voice work; long music tracks are silent |
@@ -184,6 +185,11 @@ you a save. They are listed because you may hit them. Save regularly.
   under certain lighting — Sith armour is the clearest example. The shine is an
   environment map, sampled through a cube texture that the port is not binding
   reliably.
+- **The Undercity runs at 5–8 fps.** Measured against 30–40 fps in the areas
+  above it. It draws roughly three and a half times as many objects per frame as
+  the streets of Taris — about 480 draw calls a frame against 140 — and frame
+  time scales with that almost exactly, so the port is spending its time issuing
+  draws rather than the console being out of its depth. Playable, not pleasant.
 - **Stutter in dense scenes.** Busy areas issue around 700 draw calls a frame
   and the frame rate drops into the low 20s. Video memory is also full for most
   of a session, so textures loaded after the first minute are served from
@@ -230,7 +236,6 @@ a bug report.
 | Black screen, no error | `libshacccg.suprx` missing from `ur0:data/` |
 | Crashes immediately at launch | `kubridge.skprx` not installed |
 | Hangs at the loading spinner | An `.obb` is missing, misnamed, or still copying |
-| Freezes on an area transition | The known memory bug above — not your install |
 | Textures look wrong | Set `GL_FILTER_REDUNDANT_BINDS 0` in `loader/config.h` and rebuild |
 
 A "freeze" is usually not a freeze: the crash handler parks the app in place so
