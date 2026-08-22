@@ -580,8 +580,44 @@ static void glActiveTexture_e(GLenum t) {
   glActiveTexture(t);
 }
 
+/* Cube-texture lifetime, for the armour.
+ *
+ * log151 settled that the envmap itself is fine: all six faces arrive with full
+ * mip chains at t=25s (faces seen 0x3f) and the cube is bound ~19k times across
+ * the session. Yet the armour is correct at boot, correct in the Upper City, and
+ * wrong again after returning to the Lower City -- so what breaks is tied to an
+ * AREA TRANSITION, and the cube is only ever uploaded that one time.
+ *
+ * The obvious way that goes wrong: an area unload deletes textures, the cube's
+ * id is freed, and a later glGenTextures hands the SAME id back for an ordinary
+ * 2D texture. The game keeps sampling u_texture2Sampler through that id and gets
+ * whatever 2D image now owns it -- which is exactly "smeared with a reflection
+ * of the room". Nothing in GL complains, because the id is perfectly valid.
+ *
+ * Remember which ids were uploaded as cubes and say so, loudly, when one is
+ * deleted or turns up bound as GL_TEXTURE_2D. Either line names the bug. */
+#define CUBE_IDS 8
+static GLuint   g_cube_ids[CUBE_IDS];
+static unsigned g_cube_n = 0;
+static GLuint   g_cur_cubetex = 0;
+
+static int cube_id_known(GLuint t) {
+  for (unsigned i = 0; i < g_cube_n; i++) if (g_cube_ids[i] == t) return 1;
+  return 0;
+}
+static void cube_id_note(GLuint t) {
+  if (!t || cube_id_known(t) || g_cube_n >= CUBE_IDS) return;
+  g_cube_ids[g_cube_n++] = t;
+  log_printf("[GL] cube texture id=%u registered (%u known)", (unsigned)t, g_cube_n);
+}
+
 static void glDeleteTextures_e(GLsizei n, const GLuint *tex) {
   /* ids are recycled, so any cached binding may now mean a different texture */
+  if (tex)
+    for (GLsizei i = 0; i < n; i++)
+      if (cube_id_known(tex[i]))
+        log_printf("[GL] *** CUBE TEXTURE %u DELETED -- envmap id is now free to "
+                   "be recycled as a 2D texture", (unsigned)tex[i]);
   memset(g_bound2d, 0, sizeof g_bound2d);
   glDeleteTextures(n, tex);
 }
@@ -590,6 +626,14 @@ static void glGenTextures_e(GLsizei n, GLuint *t) { GLLOG("glGenTextures(%d)", (
 static void glBindTexture_e(GLenum tg, GLuint t) {
   GLLOG("glBindTexture(0x%x,%u)", (unsigned)tg, (unsigned)t);
   g_texbind_win++;
+  if (tg == GL_TEXTURE_CUBE_MAP) g_cur_cubetex = t;
+  else if (tg == GL_TEXTURE_2D && cube_id_known(t)) {
+    static unsigned warned = 0;
+    if (warned < 8)
+      log_printf("[GL] *** id %u was uploaded as a CUBE and is now being bound as "
+                 "GL_TEXTURE_2D -- the envmap id has been recycled", (unsigned)t);
+    warned++;
+  }
 #if GL_FILTER_REDUNDANT_BINDS
   if (tg == GL_TEXTURE_2D) {
     if (g_bound2d[g_active_unit] == t) { g_bind_skipped_win++; g_cur_tex = t; return; }
@@ -642,8 +686,14 @@ static void glVertexAttribPointer_e(GLuint index, GLint size, GLenum type, GLboo
                (unsigned)index, (int)size, (unsigned)type, (int)normalized,
                (int)stride, (unsigned)(uintptr_t)pointer);
   }
-  if ((uintptr_t)pointer > g_vap_max_off) g_vap_max_off = (uintptr_t)pointer;
-  if ((uintptr_t)pointer > 0xFFFFu) g_vap_over64k++;
+  /* Only meaningful when a VBO is bound: with no buffer, `pointer` is a real
+   * client address and comparing it to 0xFFFF is nonsense. log151 reported
+   * maxAttrOff=0x985daa2c -- an address inside libKOTOR -- and counted 2.35M
+   * "over 64 KB", which measured nothing at all. */
+  if (g_cur_arraybuf) {
+    if ((uintptr_t)pointer > g_vap_max_off) g_vap_max_off = (uintptr_t)pointer;
+    if ((uintptr_t)pointer > 0xFFFFu) g_vap_over64k++;
+  }
   glVertexAttribPointer(index, size, type, normalized, stride, pointer);
 }
 
@@ -689,8 +739,12 @@ static void glTexImage2D_e(GLenum tg, GLint l, GLint ifmt, GLsizei w, GLsizei h,
   // arrive at all -- and how many of the six.
   if (tg >= GL_TEXTURE_CUBE_MAP_POSITIVE_X && tg <= GL_TEXTURE_CUBE_MAP_NEGATIVE_Z) {
     static unsigned nc = 0, faces = 0;
+    cube_id_note(g_cur_cubetex);
     faces |= 1u << (tg - GL_TEXTURE_CUBE_MAP_POSITIVE_X);
-    if (nc < 48)
+    /* Only level 0 past the first cap: log151 spent all 48 lines on ONE cube's
+     * mip chain and went blind afterwards, so a re-upload after an area change
+     * -- the thing actually in question -- could not have been seen. */
+    if (nc < 48 || (l == 0 && nc < 4096))
       log_printf("[GL] cube face %u: l=%d %dx%d ifmt=0x%x fmt=0x%x data=%s "
                  "(faces seen 0x%02x)",
                  (unsigned)(tg - GL_TEXTURE_CUBE_MAP_POSITIVE_X), l, (int)w, (int)h,

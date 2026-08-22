@@ -240,6 +240,11 @@
 // glUseProgram does no GXM work but marks every uniform dirty, so a redundant
 // one costs a full uniform re-upload (u_boneMatrices[51] included) on the next
 // draw. The Undercity makes ~43 of these a frame across ten programs total.
+// MEASURED 0% IN log151: the game alternates programs genuinely and essentially
+// never re-selects the current one, so this saves nothing in practice. Kept
+// because it is one comparison and correct, not because it earned its place --
+// the real cost is that ~2700 GENUINE switches per window each force a full
+// uniform re-upload, and that cannot be filtered away from here.
 // Set to 0 if lighting or skinning ever looks stale, to rule this out.
 #define GL_FILTER_REDUNDANT_PROGS 1
 
