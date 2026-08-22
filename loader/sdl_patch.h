@@ -41,4 +41,7 @@ void sdl_obb_fallback_init(uintptr_t rwfromfile, uintptr_t mainobb, uintptr_t pa
 // is resolved.
 void sdl_gamepad_probe_init(uintptr_t pressed, uintptr_t this_frame, uintptr_t map);
 
+// The game's current held-button mask, for periodic sampling. 0 if unavailable.
+unsigned sdl_gamepad_mask(void);
+
 #endif

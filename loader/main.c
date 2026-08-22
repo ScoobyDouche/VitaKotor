@@ -140,6 +140,20 @@ static void *watchdog_thread(void *arg) {
      * per-frame) keeps drawing correctly. log146 ended exactly like that after
      * 44 minutes in one area with the newlib heap still healthy, which is what
      * this line is here to confirm or rule out. */
+    /* Held-button mask, reported only when it moves. A bit that stays set with
+     * nothing held is a missed release, and the game will act as though that
+     * button is held forever -- so the interesting event is a transition that
+     * never comes back to 0, and printing every tick would bury it. */
+    {
+      static unsigned last_mask = 0;
+      static int mask_seen = 0;
+      unsigned m = sdl_gamepad_mask();
+      if (!mask_seen || m != last_mask) {
+        log_printf("[input] held-button mask: 0x%x -> 0x%x", last_mask, m);
+        last_mask = m;
+        mask_seen = 1;
+      }
+    }
     log_printf("[vgl] free: vram %u/%u KB, ram %u/%u KB, phycont %u/%u KB",
                (unsigned)(vglMemFree(VGL_MEM_VRAM) / 1024u),
                (unsigned)(vglMemTotal(VGL_MEM_VRAM) / 1024u),

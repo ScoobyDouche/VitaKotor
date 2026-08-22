@@ -154,6 +154,17 @@ static const volatile uint32_t *g_pad_pressed = NULL;
 static const volatile uint32_t *g_pad_this_frame = NULL;
 static const volatile uint32_t *g_pad_map = NULL;   // __tree: begin@0 root@4 size@8
 
+/* The button mask, sampled on a schedule rather than only when a button moves.
+ * A press latches a bit and the matching release clears it; if a release is ever
+ * missed the bit stays set and the game believes that button is held down
+ * forever, which is one way input can go dead while everything else keeps
+ * running. Button logging is budgeted and goes blind mid-session, so a latched
+ * bit was invisible exactly when it mattered -- log149 lost input at t~3000 with
+ * the last mask reading at t=2965. Costs one read on a thread that already ticks. */
+unsigned sdl_gamepad_mask(void) {
+  return g_pad_pressed ? (unsigned)*g_pad_pressed : 0u;
+}
+
 void sdl_gamepad_probe_init(uintptr_t pressed, uintptr_t this_frame, uintptr_t map) {
   g_pad_pressed    = (const volatile uint32_t *)pressed;
   g_pad_this_frame = (const volatile uint32_t *)this_frame;
@@ -215,11 +226,12 @@ static void log_event(const char *via, const SDL_Event *e) {
   //   0 triangle  1 circle  2 cross  3 square  4 L  5 R
   //   6 dpad-down 7 dpad-left 8 dpad-up 9 dpad-right  10 select  11 start
   // Budgeted -- this is a bring-up probe, not steady-state logging.
-  // 120 was spent on menu mashing in the first five minutes of log145, so the
-  // presses that matter -- the ones during combat, where the on-screen prompt
-  // asks for a different button than the menus do -- fell outside the budget.
+  // The budget keeps going blind before the interesting part: 120 was spent on
+  // menu mashing in log145, and 400 ran out at t=2965 in log149 -- minutes before
+  // input died. At 0.27 ms a line this is noise next to the GL trace, so raise it
+  // far enough that a whole session fits.
   static unsigned btn_n = 0, hat_n = 0;
-  if ((t == SDL_JOYBUTTONDOWN || t == SDL_JOYBUTTONUP) && btn_n < 400) {
+  if ((t == SDL_JOYBUTTONDOWN || t == SDL_JOYBUTTONUP) && btn_n < 4000) {
     btn_n++;
     // The mask is read BEFORE the game handles this event, so it reflects the
     // previous one -- which is what we want: a DOWN followed by a nonzero mask
