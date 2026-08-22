@@ -79,6 +79,13 @@
  * log what is actually requested. Mixing cost is per PLAYING channel, so a large
  * pool is nearly free. */
 #define MAX_CHANNELS 96
+/* The tail of g_chan is not playable: it is where a voice about to be stolen
+ * parks its undelivered END so System::update can still hand it to the game.
+ * See chan_retire. Reserving it inside g_chan (rather than a separate array)
+ * keeps chan_valid -- and therefore getUserData/isPlaying, which the game calls
+ * from inside HandleChannelEnd -- working on a retired voice for free. */
+#define RETIRE_SLOTS      32
+#define MAX_PLAY_CHANNELS (MAX_CHANNELS - RETIRE_SLOTS)
 #define MAX_SOUNDS   128
 
 /* Streams decode whole: a 4-minute track at 32 kHz mono is ~15 MB of PCM. The
@@ -397,6 +404,44 @@ static Snd *snd_alloc(void) {
  * real FMOD does under voice pressure: take a free slot, else steal the
  * oldest FINISHED voice, else the oldest playing one. */
 static unsigned g_chan_stamp = 0, g_steals = 0, g_steals_live = 0;
+static unsigned g_ends_rescued = 0, g_ends_lost = 0;
+
+/* Stealing a voice must not silently swallow an END it still owes.
+ *
+ * KOTOR never polls FMOD to learn that a sound finished: FModAudioSystem reads
+ * ChannelInfo+0x1c, and the only writer of that flag is HandleChannelEnd, off
+ * the END callback. A voice that has finished but has not been drained by
+ * System::update yet is still holding `end_pending`; memsetting it on steal
+ * destroys the one notification its owner will ever get, and that
+ * CExoSoundSource is then wedged in "still playing" for the rest of the session.
+ *
+ * Park the callback and userdata in a reserved slot instead and let
+ * System::update deliver it from the game's own thread as usual. The slot lives
+ * inside g_chan, so getUserData -- which the game calls from inside
+ * HandleChannelEnd -- still resolves the ORIGINAL owner.
+ *
+ * Deliberately narrow: only a still-pending END is re-homed. Sending one for a
+ * voice that has ALREADY been drained would be a SECOND END for that source,
+ * and HandleChannelEnd's other branch is the loop restart -- a duplicate there
+ * brings back ambience the game believes it already has. Whether this window is
+ * wide enough to explain log4's decay is what `END on steal / lost` is there to
+ * answer; see the note on g_played in the stats line. */
+static void chan_retire(Chan *c) {
+  if (!c->used || !c->end_pending || !c->cb) return;   /* nothing owed to anyone */
+  for (int i = MAX_PLAY_CHANNELS; i < MAX_CHANNELS; i++) {
+    Chan *r = &g_chan[i];
+    if (r->used) continue;
+    memset(r, 0, sizeof *r);
+    r->used        = 1;
+    r->playing     = 0;
+    r->cb          = c->cb;
+    r->userdata    = c->userdata;
+    r->end_pending = 1;
+    g_ends_rescued++;
+    return;
+  }
+  g_ends_lost++;                              /* ring full: same old silent loss */
+}
 
 static Chan *chan_take(Chan *c) {
   memset(c, 0, sizeof *c);
@@ -413,8 +458,8 @@ static Chan *chan_alloc(void) {
     if (!c->playing) { if (!oldest_done || c->stamp < oldest_done->stamp) oldest_done = c; }
     else             { if (!oldest_live || c->stamp < oldest_live->stamp) oldest_live = c; }
   }
-  if (oldest_done) { g_steals++;      return chan_take(oldest_done); }
-  if (oldest_live) { g_steals_live++; return chan_take(oldest_live); }
+  if (oldest_done) { g_steals++;      chan_retire(oldest_done); return chan_take(oldest_done); }
+  if (oldest_live) { g_steals_live++; chan_retire(oldest_live); return chan_take(oldest_live); }
   return NULL;
 }
 /* The game hands these pointers back to us; validate they are ours before use so
@@ -448,11 +493,11 @@ static int Sys_Create(void **out) {
 
 static int Sys_init(void *self, int maxch, unsigned flags, void *extra) {
   (void)self; (void)flags; (void)extra;
-  g_nchannels = (maxch > 0 && maxch < MAX_CHANNELS) ? maxch : MAX_CHANNELS;
-  if (maxch > MAX_CHANNELS)
+  g_nchannels = (maxch > 0 && maxch < MAX_PLAY_CHANNELS) ? maxch : MAX_PLAY_CHANNELS;
+  if (maxch > MAX_PLAY_CHANNELS)
     log_printf("[snd] WARNING: game asked for %d channels, pool is %d -- "
                "getChannel will fail past the end and abort InitChannels",
-               maxch, MAX_CHANNELS);
+               maxch, g_nchannels);
   log_printf("[snd] System::init maxchannels=%d (pool %d)", maxch, g_nchannels);
   audio_start();
   return FMOD_OK;
@@ -474,7 +519,10 @@ static int Sys_update(void *self) {
   g_updates++;
   if (draining) return FMOD_OK;         /* HandleChannelEnd -> playSound -> ... */
   draining = 1;
-  for (int i = 0; i < g_nchannels; i++) {
+  /* Playable voices first, then the retirement ring -- a slot there exists only
+   * to carry one END and is freed the moment it is delivered. */
+  for (int i = 0; i < MAX_CHANNELS; i++) {
+    if (i >= g_nchannels && i < MAX_PLAY_CHANNELS) continue;   /* never allocated */
     Chan *c = &g_chan[i];
     lock();
     chan_cb cb = c->cb;
@@ -484,6 +532,7 @@ static int Sys_update(void *self) {
     if (fire) {                          /* never under the lock */
       g_ends_fired++;
       cb(c, FMOD_CHANNELCONTROL_CHANNEL, FMOD_CHANNELCONTROL_CALLBACK_END, NULL, NULL);
+      if (i >= MAX_PLAY_CHANNELS) { lock(); c->used = 0; c->cb = NULL; unlock(); }
     }
   }
   draining = 0;
@@ -718,12 +767,29 @@ have_pcm:;
    * working cache from a broken key. */
   {
     static unsigned n = 0;
+    /* g_played is the discriminator log4 lacked. Its END rate fell from ~127 per
+     * 128 createSound to 0 while createSound itself kept climbing, and both
+     * steal counters froze -- which is either "the game stopped calling
+     * playSound" or "sounds are played but never finish", and nothing logged
+     * could tell the two apart. A live channel census settles it alongside. */
+    int nused = 0, nplaying = 0, npend = 0;
+    lock();
+    for (int i = 0; i < MAX_CHANNELS; i++) {
+      if (!g_chan[i].used) continue;
+      nused++;
+      if (g_chan[i].playing)     nplaying++;
+      if (g_chan[i].end_pending) npend++;
+    }
+    unlock();
     if ((++n & 127) == 0)
       log_printf("[snd] stats: %u createSound, cache %u hit / %u miss, "
                  "%u KB PCM held, %u decode fail, voices reused %u/%u (done/live), "
-                 "%u END sent over %u updates",
+                 "%u END sent over %u updates, %u playSound, "
+                 "%u END on steal / %u lost, "
+                 "chans %d used / %d playing / %d endPending of %d",
                  n, g_cache_hits, g_cache_miss, g_pcm_bytes / 1024, g_missing,
-                 g_steals, g_steals_live, g_ends_fired, g_updates);
+                 g_steals, g_steals_live, g_ends_fired, g_updates, g_played,
+                 g_ends_rescued, g_ends_lost, nused, nplaying, npend, g_nchannels);
   }
 
   lock();
