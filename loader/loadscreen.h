@@ -17,7 +17,29 @@
  * near the end is honest; one that sits full is not.
  *
  * Drawn from whichever thread called loadscreen_begin(), never a helper thread:
- * issuing GL from a second thread caused an earlier hang in this port. */
+ * issuing GL from a second thread caused an earlier hang in this port.
+ *
+ * With LOADSCREEN_ART the bar is dressed in the game's own loading-screen art:
+ * a load_*.tga read straight out of patch.obb (a STORED zip entry, so no need
+ * to wait for the mount) with the bar drawn into the groove the art already
+ * has. Every step of that can fail back to the plain bar.
+ *
+ * The art draws ONLY while the loader owns GL outright. loadscreen_tick() is
+ * reached from the GLLOG macro, which sits at the top of every hooked GL
+ * function -- so it runs INSIDE the game's own GL calls, between its
+ * glBindBuffer and its glDrawElements. Scissor+clear survives that; a textured
+ * quad does not. vitaGL's glVertexPointer stores whatever array buffer is
+ * currently bound alongside the pointer it is given, so with a game VBO bound
+ * our stack address becomes an offset into that VBO and the GPU fetches
+ * geometry from a wrong address. On hardware that wedged GXM at 25.1s and
+ * needed a hard power cycle; the screen had already gone black at ~22.5s, when
+ * the game created its first framebuffer objects.
+ *
+ * So loadscreen_note_gl() freezes everything the moment the game issues any GL
+ * of its own. The last swapped frame stays on screen -- a still loading screen,
+ * which is the right picture with a stopped bar -- and from then on the tick
+ * only records what the game had bound, for whoever tries to keep drawing for
+ * the whole boot later. */
 
 #ifndef __LOADSCREEN_H__
 #define __LOADSCREEN_H__
@@ -36,5 +58,10 @@ void loadscreen_end(void);
 
 /* 1 between begin and end. Lets the GL layer avoid work while we own the screen. */
 int loadscreen_active(void);
+
+/* The game has issued a GL call of its own. Called from GLLOG in place of
+ * loadscreen_tick(): it freezes the screen the first time, then samples the
+ * game's GL bindings a bounded number of times. Never draws. */
+void loadscreen_note_gl(void);
 
 #endif

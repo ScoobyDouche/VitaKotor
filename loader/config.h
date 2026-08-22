@@ -127,6 +127,41 @@
 #define LOADSCREEN_DEFAULT_WARM_S 70    // first-ever run with a built .idx cache
 #define LOADSCREEN_DEFAULT_COLD_S 135   // first-ever run, building the cache
 
+// Dress the boot screen in the game's own loading-screen art instead of a bare
+// bar. The background comes from a load_*.tga inside patch.obb, which is a
+// plain STORED zip entry and so readable before mount_obbs() runs. Set to 0 to
+// go back to the untextured bar: the art path touches GL state (a texture, the
+// fixed-function matrices) that the scissor-and-clear bar never did, so it is
+// the first thing to rule out if a boot regresses.
+#define LOADSCREEN_ART            1
+
+// Bar geometry in the ART's own pixels, not loadscreen.gui's.
+//
+// The first attempt used PB_PROGRESS's extent from loadscreen.gui (LEFT 380,
+// WIDTH 262 in its 1024x768 space) and sat visibly too wide. The groove the bar
+// belongs in is painted into the load_*.tga itself, and measuring the two
+// bright edge posts across all 97 of them puts it at x 437..586 -- 149 wide,
+// not 262. Same centre, which is why it looked close but overhung by about 30
+// pixels each side. Since we stretch the art over the whole framebuffer, the
+// bar has to be anchored to the art, or the two cannot stay registered.
+//
+// Vertically the two sources agree, so this keeps loadscreen.gui's TOP 446 and
+// HEIGHT 35 converted into art rows (x512/768).
+#define ART_W                     1024
+#define ART_H                     512
+#define ART_BAR_X                 437
+#define ART_BAR_W                 149
+#define ART_BAR_Y                 297
+#define ART_BAR_H                 23
+
+// How many times to dump the game's GL state after it takes over. The art can
+// only draw while the loader owns GL outright; once the game starts issuing GL
+// the loadscreen stops for good (see loadscreen.h). These probes record what
+// was bound at that point, so a future attempt to keep drawing for the whole
+// boot starts from measurements rather than guesses.
+#define LOADSCREEN_PROBE_MAX      24
+#define LOADSCREEN_PROBE_MS       2000
+
 // Per-call GL trace budget. Every traced call is one sceIoWrite to the memory
 // card, and log125/126 measured what that costs: gaps after a log line sit at a
 // flat ~8-11ms floor regardless of WHICH line it was, and the two slowest gaps

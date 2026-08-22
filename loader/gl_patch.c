@@ -524,7 +524,7 @@ static void glGetFloatv_t(GLenum pname, GLfloat *params) {
     else if (_s == GL_TRACE_LIMIT) \
       log_printf("[GL] per-call GL trace silenced after %d calls (steady state; " \
                  "frame/shader/link/crash logs continue)", GL_TRACE_LIMIT); \
-    loadscreen_tick(); \
+    loadscreen_note_gl(); \
   } while (0)
 static void glEnable_e(GLenum cap) { GLLOG("glEnable(0x%x)", (unsigned)cap); glEnable(cap); }
 static void glDisable_e(GLenum cap) { GLLOG("glDisable(0x%x)", (unsigned)cap); glDisable(cap); }
