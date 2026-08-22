@@ -236,6 +236,13 @@
 // Set to 0 if textures ever look wrong, to rule this out.
 #define GL_FILTER_REDUNDANT_BINDS 1
 
+// Skip glUseProgram calls that re-select the program already current. vitaGL's
+// glUseProgram does no GXM work but marks every uniform dirty, so a redundant
+// one costs a full uniform re-upload (u_boneMatrices[51] included) on the next
+// draw. The Undercity makes ~43 of these a frame across ten programs total.
+// Set to 0 if lighting or skinning ever looks stale, to rule this out.
+#define GL_FILTER_REDUNDANT_PROGS 1
+
 // Skinning bisect: force the ubershader's `#define USE_SKIN 1` to 0 in
 // glShaderSource, bypassing kotor.vert's dynamic uniform-array read
 // (u_boneMatrices[indices.x]) while leaving everything else identical.

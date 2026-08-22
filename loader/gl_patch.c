@@ -289,11 +289,15 @@ static void glReleaseShaderCompiler_t(void) {
              "every later shader compile fail silently; shark_online=%d)",
              (int)is_shark_online);
 }
+static GLuint   g_cur_prog = 0;           /* redundant program-switch shadow */
+static unsigned g_prog_skipped_win = 0;
+
 static void glLinkProgram_t(GLuint p) {
   extern GLboolean is_shark_online;
   log_printf("[GL] glLinkProgram(%u) ... shark_online=%d", (unsigned)p,
              (int)is_shark_online);
   glLinkProgram(p);
+  g_cur_prog = 0;             /* relinking can change what this id draws with */
   GLint ok = 0;
   glGetProgramiv(p, GL_LINK_STATUS, &ok);
   if (!ok) {
@@ -438,12 +442,14 @@ void gl_patch_on_swap(void) {
       o += snprintf(ab + o, sizeof(ab) - o, "%ux%u=%u ", g_bk_w[k], g_bk_h[k], g_bk_n_draws[k]);
     if (o) log_printf("[GL]   draws by texture size (lifetime): %s", ab);
     log_printf("[GL]   per-window: clientArrayDraws=%u vboDraws=%u  texBinds=%u "
-               "(skipped %u = %u%%) progSwitches=%u bufferUploads=%u "
-               "nonTex2DBinds=%u",
+               "(skipped %u = %u%%) progSwitches=%u (skipped %u = %u%%) "
+               "bufferUploads=%u nonTex2DBinds=%u",
                g_draw_client_win, g_draw_vbo_win, g_texbind_win, g_bind_skipped_win,
                g_texbind_win ? (g_bind_skipped_win * 100 / g_texbind_win) : 0,
-               g_prog_win, g_bufdata_win, g_nontex2d_binds);
-    g_bind_skipped_win = 0;
+               g_prog_win, g_prog_skipped_win,
+               g_prog_win ? (g_prog_skipped_win * 100 / g_prog_win) : 0,
+               g_bufdata_win, g_nontex2d_binds);
+    g_bind_skipped_win = g_prog_skipped_win = 0;
     g_arrays_win = g_elements_win = g_clears_win = 0;
     g_draw_client_win = g_draw_vbo_win = 0;
     g_texbind_win = g_prog_win = g_bufdata_win = 0;
@@ -771,7 +777,40 @@ static void glBindBuffer_e(GLenum tg, GLuint b) {
 }
 static void glBufferData_e(GLenum tg, GLsizeiptr sz, const void *d, GLenum u) { GLLOG("glBufferData(0x%x, %d bytes)", (unsigned)tg, (int)sz); g_bufdata_win++; glBufferData(tg, sz, d, u); }
 static GLuint glCreateProgram_e(void) { GLLOG("glCreateProgram()"); GLuint p = glCreateProgram(); log_printf("[GL]  -> program %u", (unsigned)p); return p; }
-static void glUseProgram_e(GLuint p) { GLLOG("glUseProgram(%u)", (unsigned)p); g_prog_win++; glUseProgram(p); }
+/* Redundant program-switch filter.
+ *
+ * The Undercity issues ~480 draws and ~43 glUseProgram calls a frame at 5-8 fps,
+ * against 140 draws at 30-40 fps in the streets above, and there are only ten
+ * programs in the whole session -- so most of those switches re-select the
+ * program that is already current.
+ *
+ * That is not free here the way it is on desktop GL. vitaGL's glUseProgram does
+ * no GXM work at all; it sets cur_program and then marks EVERY uniform dirty
+ * (dirty_vert_unifs = 0xFFFF, dirty_frag_unifs = 0xFFFFFFFF, custom_shaders.c
+ * ~2462). The next draw therefore re-uploads the program's entire uniform set,
+ * u_boneMatrices[51] and u_lightData[15] included, for a call that changed
+ * nothing.
+ *
+ * Skipping it is safe, and checked against vitaGL rather than assumed:
+ *   - uniforms are per-program state and persist across a re-select, so not
+ *     re-marking them dirty cannot lose a value;
+ *   - glUniform* flags its own slot via flag_dirty_vert_unif, so writes are
+ *     still tracked while the filter is active;
+ *   - gxm.c ~796 re-dirties everything at each frame end regardless ("just to be
+ *     safe"), so the per-frame invalidation never depended on this call.
+ * The shadow is dropped whenever a program is linked or deleted, since either
+ * can change what an id means.
+ * Set GL_FILTER_REDUNDANT_PROGS to 0 in config.h to rule this out. */
+static void glUseProgram_e(GLuint p) {
+  GLLOG("glUseProgram(%u)", (unsigned)p);
+  g_prog_win++;
+#if GL_FILTER_REDUNDANT_PROGS
+  if (p && p == g_cur_prog) { g_prog_skipped_win++; return; }
+  g_cur_prog = p;
+#endif
+  glUseProgram(p);
+}
+static void glDeleteProgram_e(GLuint p) { g_cur_prog = 0; glDeleteProgram(p); }
 static void glScissor_e(GLint x, GLint y, GLsizei w, GLsizei h) { GLLOG("glScissor(%d,%d,%d,%d)", x, y, (int)w, (int)h); glScissor(x, y, w, h); }
 static void glClearStencil_e(GLint s) { GLLOG("glClearStencil(%d)", s); glClearStencil(s); }
 static GLenum glGetError_e(void) { GLenum e = glGetError(); GLLOG("glGetError() -> 0x%x", (unsigned)e); return e; }
@@ -874,7 +913,7 @@ static const so_default_dynlib gl_dynlib[] = {
   { "glCopyTexSubImage2D",               (uintptr_t)&glCopyTexSubImage2D },
   { "glDeleteBuffers",                   (uintptr_t)&glDeleteBuffers },
   { "glDeleteFramebuffers",              (uintptr_t)&glDeleteFramebuffers },
-  { "glDeleteProgram",                   (uintptr_t)&glDeleteProgram },
+  { "glDeleteProgram",                   (uintptr_t)&glDeleteProgram_e },
   { "glDeleteRenderbuffers",             (uintptr_t)&glDeleteRenderbuffers },
   { "glDeleteShader",                    (uintptr_t)&glDeleteShader },
   { "glDeleteTextures",                  (uintptr_t)&glDeleteTextures_e },
