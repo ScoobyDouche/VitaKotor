@@ -817,6 +817,7 @@ static void SetExtent_probe(void *self, const void *ext) {
 // word still holding the sentinel was never written -- restore the caller's
 // original bytes there so the game sees exactly what it would have seen.
 #define EXT_SENTINEL 0x5A5A5A5A
+static unsigned g_sx_n = 0;      /* ScaleExtent calls, read by the totals line */
 static int (*ExtLoad_orig)(void *self, void *gff, void *st) = NULL;
 static unsigned g_xl_n = 0, g_xl_skipped = 0, g_xl_w0 = 0;
 
@@ -839,6 +840,9 @@ static int ExtLoad_probe(void *self, void *gff, void *st) {
                "skipped=%u w0=%u",
                g_xl_n, rc, (int)e[0], (int)e[1], (int)e[2], (int)e[3],
                unwritten, g_xl_skipped, g_xl_w0);
+  if ((g_xl_n % 240) == 0)
+    log_printf("[gui] extent totals: %u loaded, %u scaled  (a gap here is real, "
+               "both counters are lifetime)", g_xl_n, g_sx_n);
   g_xl_n++;
   return rc;
 }
@@ -980,13 +984,21 @@ static void *LoadModel_probe(void *self, const void *resref, unsigned part) {
 // actually activate it -- measurement, not arithmetic guesswork.
 // CSWGuiObject keeps its extent at this+0x08 (SetExtent/ScaleExtent both use it).
 static void (*ScaleExt_orig)(void *self, uint32_t fscale) = NULL;
-static unsigned g_sx_n = 0;
 
 static void ScaleExt_probe(void *self, uint32_t fscale) {
   const int32_t *e = (const int32_t *)((const char *)self + 8);
   int32_t b[4] = {e[0], e[1], e[2], e[3]};
   ScaleExt_orig(self, fscale);
-  if (g_sx_n < 48) {
+  /* Cadence matched to ExtentLoad's on purpose. At a flat cap of 48 this went
+   * quiet at t=145s while ExtentLoad ran on to #2400, and comparing the two
+   * logged counts then "showed" 25 extents that were never scaled -- an
+   * artifact of the cap, not a finding. Whether some extents really do skip
+   * ScaleExtentForResolution is still open, and it matters: an element left at
+   * authored size inside a frame scaled to 0.7083 is 1.41x too big for it,
+   * which is what the minimap, the fog box and the save list all look like.
+   * The save rows load as {L=471 T=358..567 W=300 H=30} in a 768-tall layout;
+   * unscaled, T=567 falls off a 544-tall screen and lands on the buttons. */
+  if (g_sx_n < 64 || (g_sx_n % 240) == 0) {
     float sc; memcpy(&sc, &fscale, 4);
     log_printf("[gui] ScaleExtent #%u {L=%d T=%d W=%d H=%d} x%.4f -> {L=%d T=%d W=%d H=%d}",
                g_sx_n, (int)b[0], (int)b[1], (int)b[2], (int)b[3], sc,
