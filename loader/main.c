@@ -690,6 +690,7 @@ static void install_aurresget_hook(void) {
 // Floats arrive in core registers (softfp caller), hence uint32_t params. Both
 // hooked prologues are 8 clean bytes (push/add r7/str.w) with no PC-relative loads.
 static void log_screen_globals(const char *when);  // defined with the probes below
+static void gui_autoscale_if_needed(void *self, int w, int h);  // defined with ScaleExt below
 
 static void (*SWImgDraw_orig)(void *self, uint32_t f) = NULL;
 static void (*FlushBuf_orig)(void *self, uint32_t f) = NULL;
@@ -745,7 +746,7 @@ static int gui_ptrset_has(const GuiPtrSet *s, uint32_t p) {
   }
   return 0;
 }
-static unsigned g_bigimg_logged = 0;
+static unsigned g_bigimg_logged = 0, g_autoscaled = 0;
 
 static void SWImgDraw_probe(void *self, uint32_t f) {
   const uint32_t *o = (const uint32_t *)self;
@@ -769,6 +770,7 @@ static void SWImgDraw_probe(void *self, uint32_t f) {
                  gui_ptrset_has(&g_gui_scaled, sp) ? "YES" : "NO",
                  g_gui_scaled.n, g_gui_scaled.overflow);
     }
+    gui_autoscale_if_needed(self, (int)w, (int)h);
   }
   if ((g_sw_n++ % 2400) == 0) {
     log_printf("[gui] SWImage::Draw n=%u gates objnull=%u w0=%u h0=%u PASS=%u "
@@ -1070,6 +1072,35 @@ static void ScaleExt_probe(void *self, uint32_t fscale) {
                (int)e[0], (int)e[1], (int)e[2], (int)e[3]);
   }
   g_sx_n++;
+}
+
+/* Hand a never-scaled image the resolution scale the game applies to every
+ * other widget. See GUI_AUTOSCALE_UNSCALED_IMAGES in config.h for why this is
+ * restricted to large, sub-screen-height images: the pillarbox wings come
+ * through at exactly the screen height already in device pixels, and a blanket
+ * rescale would wreck every widget that is already correct.
+ *
+ * Calls the original through the trampoline, so it does not re-enter the probe;
+ * the widget is added to the scaled set first so it can never be scaled twice
+ * however many times it is drawn. */
+static void gui_autoscale_if_needed(void *self, int w, int h) {
+#if GUI_AUTOSCALE_UNSCALED_IMAGES
+  if (!ScaleExt_orig || !g_scr_h) return;
+  int sh = (int)*g_scr_h;
+  if (sh <= 0 || h >= sh) return;            /* already device-space */
+  if (w < 200 || h < 200) return;            /* only the elements log157 flagged */
+  uint32_t sp = (uint32_t)(uintptr_t)self;
+  if (gui_ptrset_add(&g_gui_scaled, sp)) return;   /* already scaled, or seen */
+  float sc = (float)sh / 768.0f;             /* the factor the game uses itself */
+  uint32_t bits; memcpy(&bits, &sc, 4);
+  ScaleExt_orig(self, bits);
+  if (g_autoscaled < 64)
+    log_printf("[gui] autoscaled self=0x%08x %dx%d by x%.4f "
+               "(never went through ScaleExtentForResolution)", sp, w, h, sc);
+  g_autoscaled++;
+#else
+  (void)self; (void)w; (void)h;
+#endif
 }
 
 // log68 read the failing block's contents and they are UNWRITTEN: the bytes are

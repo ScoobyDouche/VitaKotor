@@ -282,3 +282,23 @@
 #define SKIN_INDEX_ROUND_FIX 0
 
 #endif
+
+// Scale GUI images that never went through ScaleExtentForResolution.
+//
+// log157 asked, per widget, whether it had been scaled, and every image at or
+// above 200x200 came back NO -- while 138 other widgets in the same screen had
+// been scaled normally. Two of the three are the pillarbox wings, which arrive
+// at exactly the screen height (217x544 at x=-100 and x=843) and are already in
+// device pixels; shrinking those would be wrong, so anything at or above the
+// screen height is left alone. The third is a 238x238 image that is neither a
+// texture size nor a device-space number, and 238 x 0.7083 is 169: an element
+// left at authored size inside a frame the game scaled by 544/768 is 1.41x too
+// big for it, which is exactly how far the minimap overflows its frame.
+//
+// So call the game's own ScaleExtentForResolution on those, once, with the
+// factor it uses itself. Deliberately narrow -- only images at least 200x200,
+// only ones below the screen height, only ones we have never seen scaled --
+// because a blanket rescale would wreck every widget that is already correct.
+// Set to 0 to restore the untouched extents.
+#define GUI_AUTOSCALE_UNSCALED_IMAGES 1
+
