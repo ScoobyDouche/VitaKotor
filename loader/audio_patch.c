@@ -788,6 +788,7 @@ static int chan_valid(const void *p) { return p >= (void *)g_chan && p < (void *
 #define FMOD_ERR_MEMORY         9
 #define FMOD_TIMEUNIT_MS   0x00000001
 #define FMOD_TIMEUNIT_PCM  0x00000002
+#define FMOD_LOOP_NORMAL   0x00000002
 #define FMOD_CREATESTREAM  0x00000080
 #define FMOD_OPENMEMORY    0x00000800
 #define FMOD_2D            0x00000008
@@ -1030,13 +1031,49 @@ static int Sys_createSound(void *self, const char *name, unsigned mode,
     if (audio_mp3_probe(buf, len, &est)) {
       unsigned need = est.nsamples * est.channels * 2u;
       if (need > STREAM_PCM_MAX || g_pcm_bytes + need > PCM_BUDGET_BYTES) {
+#if AUDIO_STREAM_LONG_ASSETS
+        /* Too big to hold decoded, so stream it: the compressed bytes plus a
+         * ring instead of the whole waveform, and no decode stall on start.
+         * Requires `owned` -- the decoder reads the elementary stream in place
+         * for the life of the handle, so we must be the ones who allocated it.
+         * FMOD_OPENMEMORY sounds are short effects already in memory and never
+         * reach this branch. */
+        if (owned) {
+          AudioPcm fmt;
+          Stream *st = stream_open(owned, buf, len, &fmt,
+                                   (mode & FMOD_LOOP_NORMAL) != 0);
+          if (st) {
+            lock();
+            Snd *ss = snd_alloc();
+            unlock();
+            if (!ss) {
+              stream_close(st);            /* takes `owned` with it */
+              return FMOD_ERR_INVALID_PARAM;
+            }
+            ss->is3d = (mode & FMOD_3D) ? 1 : 0;
+            ss->ent  = NULL;
+            ss->st   = st;
+            ss->pcm  = fmt;                /* fmt.pcm is NULL */
+            *out = ss;
+            log_printf("[snd] createSound STREAMING \"%.64s\" -> %u ms %uHz %uch "
+                       "(es %u KB, ring %u KB; whole decode would have been %u KB)",
+                       what, fmt.ms, fmt.rate, fmt.channels, len / 1024,
+                       (unsigned)((RING_FRAMES * fmt.channels * 2u) / 1024u),
+                       need / 1024);
+            g_created++;
+            return FMOD_OK;                /* `owned` now belongs to st */
+          }
+        }
+#endif
+        /* Could not stream it -- fall back to timed silence, which at least
+         * keeps the game's pacing and stops the retry loop. */
         pcm = est;                                  /* est.pcm is already NULL */
         ok = silent = 1;
         if (g_overbudget < 12)
-          log_printf("[snd] stream too large: id=%.32s would need %u KB "
-                     "(cap %u KB, in use %u KB) -- playing %u ms of SILENCE",
+          log_printf("[snd] stream too large and NOT streamable: id=%.32s needs %u KB "
+                     "(cap %u KB, in use %u KB, owned=%d) -- playing %u ms of SILENCE",
                      name, need / 1024, STREAM_PCM_MAX / 1024,
-                     g_pcm_bytes / 1024, est.ms);
+                     g_pcm_bytes / 1024, owned ? 1 : 0, est.ms);
         g_overbudget++;
       }
     }
