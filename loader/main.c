@@ -746,7 +746,10 @@ static int gui_ptrset_has(const GuiPtrSet *s, uint32_t p) {
   }
   return 0;
 }
-static unsigned g_bigimg_logged = 0, g_autoscaled = 0;
+static unsigned g_bigimg_logged = 0;
+#if GUI_AUTOSCALE_UNSCALED_IMAGES
+static unsigned g_autoscaled = 0;
+#endif
 
 static void SWImgDraw_probe(void *self, uint32_t f) {
   const uint32_t *o = (const uint32_t *)self;

@@ -335,3 +335,24 @@
 // Set to 1 if positional audio comes out mirrored.
 #define AUDIO_3D_RIGHTHANDED 0
 
+// Upload textures as 16-bit instead of 32-bit.
+//
+// The live-texture census (log161) is emphatic that nothing leaks: 1,014,190 KB
+// uploaded against 920,002 KB released over 28 minutes, balancing to the byte.
+// The problem is that the working set does not FIT -- it peaks at 102,639 KB
+// against the Vita's fixed 96 MB of CDRAM -- so vitaGL evicts and re-uploads
+// continuously, runs at a few hundred KB free, and the picture starts tearing.
+// VRAM cannot be raised to meet it; MEMORY_VITAGL_THRESHOLD_MB governs system
+// RAM, not CDRAM. The only lever is making the textures smaller.
+//
+// RGBA8 -> RGBA4444 and RGB8 -> RGB565 halves the footprint to roughly 51 MB,
+// which fits with room to spare. Ordered 4x4 Bayer dithering keeps the banding
+// down; without it, gradients and skies posterise badly at 4 bits a channel.
+//
+// Render targets and cube maps are left alone: an FBO's attachment format is
+// not ours to change, and the environment map is 64x64x6 and not worth the
+// risk. Textures we convert are remembered per id so glTexSubImage2D can
+// match, since a byte-typed sub-upload into a 4444 texture would corrupt it.
+// Set to 0 to go back to full-precision uploads.
+#define GL_TEX16_CONVERT 1
+

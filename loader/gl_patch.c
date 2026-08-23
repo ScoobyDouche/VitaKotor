@@ -423,6 +423,15 @@ static uint64_t g_tex_live = 0, g_tex_peak = 0; /* bytes currently uploaded */
 static uint64_t g_tex_up = 0, g_tex_down = 0;   /* lifetime added / released */
 static unsigned g_tex_n_live = 0, g_tex_untracked = 0;
 
+/* 16-bit conversion state; up here because the stats line and the delete hook
+ * both read it. The packer itself lives with the upload path further down. */
+#define TEX16_NONE 0
+#define TEX16_4444 1
+#define TEX16_565  2
+static uint8_t  g_tex16[TEXKIND_MAX];
+static unsigned g_tex16_n = 0;
+static uint64_t g_tex16_saved = 0;          /* bytes NOT spent, lifetime */
+
 static GLuint   g_cur_arraybuf = 0;      /* last glBindBuffer(GL_ARRAY_BUFFER) */
 
 static inline void draw_note_source(void) {
@@ -467,7 +476,8 @@ void gl_patch_on_swap(void) {
                "(skipped %u = %u%%) progSwitches=%u (skipped %u = %u%%) "
                "bufferUploads=%u nonTex2DBinds=%u maxAttrOff=0x%x over64k=%u\n"
                "[GL]   textures live: %u KB in %u ids (peak %u KB); "
-               "lifetime %u KB up / %u KB released, %u untracked ids",
+               "lifetime %u KB up / %u KB released, %u untracked ids; "
+               "16-bit: %u ids, %u KB saved",
                g_draw_client_win, g_draw_vbo_win, g_texbind_win, g_bind_skipped_win,
                g_texbind_win ? (g_bind_skipped_win * 100 / g_texbind_win) : 0,
                g_prog_win, g_prog_skipped_win,
@@ -475,7 +485,8 @@ void gl_patch_on_swap(void) {
                g_bufdata_win, g_nontex2d_binds,
                (unsigned)g_vap_max_off, g_vap_over64k,
                (unsigned)(g_tex_live >> 10), g_tex_n_live, (unsigned)(g_tex_peak >> 10),
-               (unsigned)(g_tex_up >> 10), (unsigned)(g_tex_down >> 10), g_tex_untracked);
+               (unsigned)(g_tex_up >> 10), (unsigned)(g_tex_down >> 10), g_tex_untracked,
+               g_tex16_n, (unsigned)(g_tex16_saved >> 10));
     g_bind_skipped_win = g_prog_skipped_win = 0;
     g_arrays_win = g_elements_win = g_clears_win = 0;
     g_draw_client_win = g_draw_vbo_win = 0;
@@ -649,12 +660,13 @@ static uint8_t  g_tex_kind[TEXKIND_MAX];
  * the mip levels that follow add onto it. Padded widths are charged at what is
  * really allocated, not what the game asked for. */
 
-static void tex_charge(GLuint t, GLenum target, GLint level, GLsizei w, GLsizei h, GLenum fmt) {
+static unsigned fmt_bpp(GLenum f) { return (f == GL_RGBA) ? 4u : (f == GL_RGB) ? 3u : 2u; }
+
+static void tex_charge(GLuint t, GLenum target, GLint level, GLsizei w, GLsizei h, unsigned bpp) {
   if (!t || t >= TEXKIND_MAX) { g_tex_untracked++; return; }
   /* A cube uploads six faces at the same id and level; only a 2D base level
    * means "this id now holds a different image". */
   if (target != GL_TEXTURE_2D) level = 1;
-  unsigned bpp = (fmt == GL_RGBA) ? 4u : (fmt == GL_RGB) ? 3u : 2u;
   uint32_t add = (uint32_t)((w > 0 ? w : 0)) * (uint32_t)((h > 0 ? h : 0)) * bpp;
   if (level == 0) {                       /* new base image: drop the old tally */
     if (g_tex_bytes[t]) { g_tex_live -= g_tex_bytes[t]; g_tex_down += g_tex_bytes[t]; }
@@ -697,6 +709,10 @@ static void glDeleteTextures_e(GLsizei n, const GLuint *tex) {
         log_printf("[GL] cube texture %u deleted", (unsigned)tex[i]);
       if (tex[i] && tex[i] < TEXKIND_MAX) g_tex_kind[tex[i]] = TEXKIND_NONE;
       tex_release(tex[i]);
+      if (tex[i] < TEXKIND_MAX && g_tex16[tex[i]] != TEX16_NONE) {
+        g_tex16[tex[i]] = TEX16_NONE;      /* ids recycle; do not inherit a format */
+        if (g_tex16_n) g_tex16_n--;
+      }
     }
   memset(g_bound2d, 0, sizeof g_bound2d);
   glDeleteTextures(n, tex);
@@ -818,6 +834,74 @@ static GLint glGetUniformLocation_e(GLuint prog, const GLchar *name) {
 
 static GLsizei gl_rt_align_w(GLsizei w) { return (w > 0 && (w & 7)) ? ((w + 7) & ~7) : w; }
 
+/* ---- 16-bit texture conversion --------------------------------------------
+ * See GL_TEX16_CONVERT in config.h. Halves the texture working set so it fits
+ * the Vita's fixed 96 MB of CDRAM instead of thrashing against it.
+ *
+ * Ordered 4x4 Bayer dithering is not decoration: at four bits a channel a plain
+ * truncation posterises every gradient into visible steps, and a sky or a
+ * saber glow is nothing but gradient. Dithering trades those steps for noise
+ * the eye ignores at this screen size.
+ *
+ * Which ids were converted is remembered, because glTexSubImage2D goes straight
+ * through to vitaGL: a byte-typed sub-upload into a 4444 texture would be read
+ * as though it were already 4444, and corrupt it. */
+
+static const uint8_t k_bayer4[16] = { 0, 8, 2,10, 12, 4,14, 6,  3,11, 1, 9, 15, 7,13, 5 };
+
+/* Writes w*h uint16 into dst. src is tightly packed 8-bit RGB(A). */
+static void tex16_pack(uint16_t *dst, const unsigned char *src, int w, int h, int kind) {
+  for (int y = 0; y < h; y++) {
+    const unsigned char *sp = src + (size_t)y * w * (kind == TEX16_4444 ? 4 : 3);
+    uint16_t *d = dst + (size_t)y * w;
+    for (int x = 0; x < w; x++) {
+      unsigned dth = k_bayer4[((y & 3) << 2) | (x & 3)];
+      if (kind == TEX16_4444) {
+        unsigned r4 = (sp[0] + dth) >> 4; if (r4 > 15) r4 = 15;
+        unsigned g4 = (sp[1] + dth) >> 4; if (g4 > 15) g4 = 15;
+        unsigned b4 = (sp[2] + dth) >> 4; if (b4 > 15) b4 = 15;
+        unsigned a4 = (sp[3] + dth) >> 4; if (a4 > 15) a4 = 15;
+        d[x] = (uint16_t)((r4 << 12) | (g4 << 8) | (b4 << 4) | a4);
+        sp += 4;
+      } else {
+        unsigned r5 = (sp[0] + (dth >> 1)) >> 3; if (r5 > 31) r5 = 31;
+        unsigned g6 = (sp[1] + (dth >> 2)) >> 2; if (g6 > 63) g6 = 63;
+        unsigned b5 = (sp[2] + (dth >> 1)) >> 3; if (b5 > 31) b5 = 31;
+        d[x] = (uint16_t)((r5 << 11) | (g6 << 5) | b5);
+        sp += 3;
+      }
+    }
+  }
+}
+
+/* The one 2D upload path: convert when we can, charge what was really spent,
+ * hand it to vitaGL. Always uploads exactly once. */
+static void tex_upload2d(GLenum tg, GLint l, GLint ifmt, GLsizei w, GLsizei h,
+                         GLint b, GLenum f, GLenum ty, const void *px) {
+#if GL_TEX16_CONVERT
+  int kind = (f == GL_RGBA) ? TEX16_4444 : (f == GL_RGB) ? TEX16_565 : TEX16_NONE;
+  if (px && kind != TEX16_NONE && ty == GL_UNSIGNED_BYTE && w > 0 && h > 0) {
+    uint16_t *cv = (uint16_t *)malloc((size_t)w * h * 2);
+    if (cv) {
+      tex16_pack(cv, (const unsigned char *)px, w, h, kind);
+      GLenum ty16 = (kind == TEX16_4444) ? GL_UNSIGNED_SHORT_4_4_4_4
+                                         : GL_UNSIGNED_SHORT_5_6_5;
+      if (g_cur_tex && g_cur_tex < TEXKIND_MAX && l == 0) {
+        if (g_tex16[g_cur_tex] == TEX16_NONE) g_tex16_n++;
+        g_tex16[g_cur_tex] = (uint8_t)kind;
+      }
+      g_tex16_saved += (uint64_t)w * h * (fmt_bpp(f) - 2u);
+      tex_charge(g_cur_tex, tg, l, w, h, 2u);
+      glTexImage2D(tg, l, ifmt, w, h, b, f, ty16, cv);
+      free(cv);
+      return;
+    }
+  }
+#endif
+  tex_charge(g_cur_tex, tg, l, w, h, fmt_bpp(f));
+  glTexImage2D(tg, l, ifmt, w, h, b, f, ty, px);
+}
+
 static void glTexImage2D_e(GLenum tg, GLint l, GLint ifmt, GLsizei w, GLsizei h, GLint b, GLenum f, GLenum ty, const void *px) {
   GLLOG("glTexImage2D(0x%x, l=%d, %dx%d, fmt=0x%x)", (unsigned)tg, l, (int)w, (int)h, (unsigned)f);
   // The environment map is a real cube: kotor.vert declares u_texture2Sampler as
@@ -838,11 +922,11 @@ static void glTexImage2D_e(GLenum tg, GLint l, GLint ifmt, GLsizei w, GLsizei h,
                  (unsigned)(tg - GL_TEXTURE_CUBE_MAP_POSITIVE_X), l, (int)w, (int)h,
                  (unsigned)ifmt, (unsigned)f, px ? "yes" : "NULL", faces);
     nc++;
-    tex_charge(g_cur_cubetex, tg, l, w, h, f);   /* cubes bind their own id */
+    tex_charge(g_cur_cubetex, tg, l, w, h, fmt_bpp(f));   /* cubes bind their own id */
     glTexImage2D(tg, l, ifmt, w, h, b, f, ty, px);
     return;                        // none of the 2D heuristics below apply
   }
-  if (tg != GL_TEXTURE_2D) { tex_charge(g_cur_tex, tg, l, w, h, f);
+  if (tg != GL_TEXTURE_2D) { tex_charge(g_cur_tex, tg, l, w, h, fmt_bpp(f));
                              glTexImage2D(tg, l, ifmt, w, h, b, f, ty, px); return; }
   // Square power-of-two base levels are the font atlases; naming the texture id
   // here is what lets the text-draw trace say whether a glyph quad used one.
@@ -914,8 +998,7 @@ static void glTexImage2D_e(GLenum tg, GLint l, GLint ifmt, GLsizei w, GLsizei h,
         }
       }
       log_printf("[GL] NPOT resample: %dx%d -> %dx%d (bpp=%d)", (int)w, (int)h, aw, (int)h, bpp);
-      tex_charge(g_cur_tex, tg, l, aw, h, f);
-      glTexImage2D(tg, l, ifmt, aw, h, b, f, ty, pad);
+      tex_upload2d(tg, l, ifmt, aw, h, b, f, ty, pad);
       free(pad);
       return;
     }
@@ -927,12 +1010,33 @@ static void glTexImage2D_e(GLenum tg, GLint l, GLint ifmt, GLsizei w, GLsizei h,
     GLsizei aw = gl_rt_align_w(w);
     if (aw != w)
       log_printf("[GL] RT pad: color tex %dx%d -> %dx%d", (int)w, (int)h, (int)aw, (int)h);
-    tex_charge(g_cur_tex, tg, l, aw, h, f);
+    tex_charge(g_cur_tex, tg, l, aw, h, fmt_bpp(f));
     glTexImage2D(tg, l, ifmt, aw, h, b, f, ty, px);
     return;
   }
-  tex_charge(g_cur_tex, tg, l, w, h, f);
-  glTexImage2D(tg, l, ifmt, w, h, b, f, ty, px);
+  tex_upload2d(tg, l, ifmt, w, h, b, f, ty, px);
+}
+/* Must convert exactly as the base upload did, or vitaGL reads byte data as
+ * 16-bit and the texture turns to noise. */
+static void glTexSubImage2D_e(GLenum tg, GLint l, GLint xo, GLint yo, GLsizei w, GLsizei h,
+                              GLenum f, GLenum ty, const void *px) {
+  GLLOG("glTexSubImage2D(0x%x, l=%d, %dx%d)", (unsigned)tg, l, (int)w, (int)h);
+#if GL_TEX16_CONVERT
+  uint8_t kind = (g_cur_tex && g_cur_tex < TEXKIND_MAX) ? g_tex16[g_cur_tex] : TEX16_NONE;
+  if (px && kind != TEX16_NONE && ty == GL_UNSIGNED_BYTE && w > 0 && h > 0 &&
+      ((kind == TEX16_4444 && f == GL_RGBA) || (kind == TEX16_565 && f == GL_RGB))) {
+    uint16_t *cv = (uint16_t *)malloc((size_t)w * h * 2);
+    if (cv) {
+      tex16_pack(cv, (const unsigned char *)px, w, h, kind);
+      glTexSubImage2D(tg, l, xo, yo, w, h, f,
+                      (kind == TEX16_4444) ? GL_UNSIGNED_SHORT_4_4_4_4
+                                           : GL_UNSIGNED_SHORT_5_6_5, cv);
+      free(cv);
+      return;
+    }
+  }
+#endif
+  glTexSubImage2D(tg, l, xo, yo, w, h, f, ty, px);
 }
 static void glTexParameteri_e(GLenum tg, GLenum p, GLint v) { GLLOG("glTexParameteri(0x%x,0x%x,%d)", (unsigned)tg, (unsigned)p, v); glTexParameteri(tg, p, v); }
 static void glGenFramebuffers_e(GLsizei n, GLuint *f) { GLLOG("glGenFramebuffers(%d)", (int)n); glGenFramebuffers(n, f); }
@@ -1147,7 +1251,7 @@ static const so_default_dynlib gl_dynlib[] = {
   { "glStencilOp",                       (uintptr_t)&glStencilOp },
   { "glStencilOpSeparate",               (uintptr_t)&glStencilOpSeparate },
   { "glTexParameteriv",                  (uintptr_t)&glTexParameteriv },
-  { "glTexSubImage2D",                   (uintptr_t)&glTexSubImage2D },
+  { "glTexSubImage2D",                   (uintptr_t)&glTexSubImage2D_e },
   { "glUniform1fv",                      (uintptr_t)&glUniform1fv },
   { "glUniform1i",                       (uintptr_t)&glUniform1i },
   { "glUniform1iv",                      (uintptr_t)&glUniform1iv },
