@@ -152,6 +152,10 @@ typedef struct {
    * the stream for its channel and rewinds; any other channel gets silence
    * rather than wedging the one that is actually audible. */
   void     *reader;
+  /* Set by playSound, acted on by the audio thread. The restart has to happen
+   * where the decoding happens: rewinding the decoder from the game thread
+   * would be reaching into state the audio thread is using without the lock. */
+  int       restart;
 } Stream;
 
 /* ---- decoded-PCM cache ----------------------------------------------------
@@ -303,6 +307,16 @@ static void cache_release(PcmEntry *e) {
 static int      g_stream_decoders = 0;
 static unsigned g_streams_open = 0;        /* lifetime count, for the log */
 static unsigned g_stream_underruns = 0;    /* mixer wanted a frame we lacked */
+/* Streams whose Sound has been released, waiting for the audio thread to close
+ * them. Decoding happens OUTSIDE the mixer lock -- see mix_grain -- so the game
+ * thread must not free a decoder the audio thread may be inside. It hands the
+ * stream over here instead and the audio thread closes it between grains. */
+static Stream  *g_stream_retire[MAX_SOUNDS];
+static int      g_stream_retire_n = 0;
+/* How long the audio thread spends decoding, and how much of that is inside the
+ * lock. Decoding under the lock is what put the game thread to sleep waiting on
+ * createSound: measure it rather than trust that moving it out was enough. */
+static unsigned g_feed_us_max = 0, g_feed_us_tot = 0, g_feed_n = 0;
 
 /* The ring's decoder end. Looping is honoured but the game passes LOOP_OFF and
  * drives its own music playlist -- looping here would mean a track could never
@@ -546,60 +560,98 @@ static int16_t g_out[OUT_GRAIN * OUT_CH];
 static void mix_grain(void) {
   memset(g_acc, 0, sizeof g_acc);
 
-  lock();
+  /* ---- decode phase, deliberately OUTSIDE the lock ------------------------
+   * This used to run under the mixer lock, which was a mistake that only became
+   * visible once the ring worked: a frozen window is a FULL window, so the
+   * broken version decoded nothing and cost nothing. Decoding for real means
+   * several sceAudiodecDecode calls per grain, and holding the mixer lock
+   * across them puts every createSound and playSound -- i.e. the game thread --
+   * to sleep waiting for the audio thread.
+   *
+   * The ring and the decoder are touched only by this thread, so they need no
+   * lock of their own. What the lock must still cover is the shared bits: the
+   * reader channel's position, the restart flag playSound sets, and the handover
+   * of streams whose Sound has been released. Snapshot those, then let go. */
+  struct { Stream *st; uint64_t pos; int havepos; } feed[MAX_SOUNDS];
+  Stream *doomed[MAX_SOUNDS];
+  int nfeed = 0, ndoomed = 0;
 
-  /* Refill streams before mixing, retiring what the stream's one reader has
-   * already passed. A stream with no live reader is still topped up, so it is
-   * ready the moment the game unpauses it. The feeder runs under this lock on
-   * purpose: it is what makes closing a stream from Snd_release safe.
-   * FEED_MAX_FRAMES is what keeps the hold time short. */
+  lock();
+  while (g_stream_retire_n > 0) doomed[ndoomed++] = g_stream_retire[--g_stream_retire_n];
   for (int i = 0; i < MAX_SOUNDS; i++) {
     Snd *s = &g_snd[i];
     if (!s->used || !s->st) continue;
-    /* Retire by the ONE reader, never by a minimum over several: the window
-     * only moves forward, so a second channel sitting behind it would pin it
-     * there and starve the channel that is actually playing. */
+    /* Snapshot the ONE reader's position, never a minimum over several: the
+     * window only moves forward, so a second channel sitting behind it would
+     * pin it there and starve the channel that is actually playing. */
     Chan *rd = (Chan *)s->st->reader;
-    int live = rd && rd->used && rd->playing && rd->snd == s;
-    if (live) audio_ring_retire(&s->st->ring, (uint64_t)rd->pos);
-    audio_ring_feed(&s->st->ring, stream_fill_cb, s->st, FEED_MAX_FRAMES);
+    feed[nfeed].st      = s->st;
+    feed[nfeed].havepos = (rd && rd->used && rd->playing && rd->snd == s);
+    feed[nfeed].pos     = feed[nfeed].havepos ? (uint64_t)rd->pos : 0;
+    nfeed++;
+  }
+  unlock();
 
-    /* Underruns are counted per sample, so they can only be reported in bulk --
-     * and log168 had 5.4 million of them arriving in bursts with no way to say
-     * WHICH stream, or why. Two readers pinning the window between them used to
-     * be one of the answers; the single-reader claim above makes that case
-     * structurally impossible, so what is left is the reader's position against
-     * the window, which is the whole diagnosis:
-     *
-     *   pos BEHIND base -- the reader is reading frames already retired, which
-     *   it can never get back. That was log170-172: a replayed track started at
-     *   frame 0 against a window sitting at the end of the asset, and underran
-     *   on every sample for exactly one track length. Must not happen now.
-     *
-     *   pos AHEAD of base+fill -- the decoder genuinely is not keeping up, and
-     *   the window is starved rather than stale.
-     *
-     * Print the position and the window rather than a spread, so those two are
-     * never again indistinguishable. Rate-limited to roughly one line every two
-     * seconds per stream. */
-    if (s->st->unders) {
-      static unsigned last_report = 0;
-      if (g_lim_grains - last_report >= 96) {
-        last_report = g_lim_grains;
-        uint64_t pos  = live ? (uint64_t)rd->pos : 0;
-        uint64_t base = s->st->ring.base;
-        log_printf("[snd] stream UNDERRUN \"%.31s\": %u samples, reader %s, "
-                   "pos %u vs window %u..%u of ring %u%s",
-                   s->st->name, s->st->unders,
-                   !live ? "none" : (pos < base ? "BEHIND (stale)" : "ahead (starved)"),
-                   (unsigned)pos, (unsigned)base,
-                   (unsigned)(base + s->st->ring.fill), RING_FRAMES,
-                   s->st->ring.eos ? " (eos)" : "");
-        s->st->unders = 0;
+  for (int i = 0; i < ndoomed; i++) stream_close(doomed[i]);
+
+  {
+    SceUInt64 t0 = sceKernelGetProcessTimeWide();
+    for (int i = 0; i < nfeed; i++) {
+      Stream *st = feed[i].st;
+      if (st->restart) {          /* playSound asked for the track from the top */
+        audio_mp3_stream_rewind(st->dec);
+        audio_ring_reset(&st->ring);
+        st->restart = 0;
       }
+      if (feed[i].havepos) audio_ring_retire(&st->ring, feed[i].pos);
+      audio_ring_feed(&st->ring, stream_fill_cb, st, FEED_MAX_FRAMES);
+
+      /* Underruns are counted per sample, so they can only be reported in bulk
+       * -- and log168 had 5.4 million of them arriving in bursts with no way to
+       * say WHICH stream, or why. Two readers pinning the window between them
+       * used to be one of the answers; the single-reader claim above makes that
+       * case structurally impossible, so what is left is the reader's position
+       * against the window, which is the whole diagnosis:
+       *
+       *   pos BEHIND base -- the reader is reading frames already retired,
+       *   which it can never get back. That was log170-172: a replayed track
+       *   started at frame 0 against a window sitting at the end of the asset
+       *   and underran on every sample for exactly one track length. The
+       *   restart flag above is what must stop this happening again.
+       *
+       *   pos AHEAD of base+fill -- the decoder genuinely is not keeping up,
+       *   and the window is starved rather than stale.
+       *
+       * Print the position and the window rather than a spread, so those two
+       * are never again indistinguishable. Rate-limited to roughly one line
+       * every two seconds per stream. */
+      if (st->unders) {
+        static unsigned last_report = 0;
+        if (g_lim_grains - last_report >= 96) {
+          last_report = g_lim_grains;
+          uint64_t pos = feed[i].pos, base = st->ring.base;
+          log_printf("[snd] stream UNDERRUN \"%.31s\": %u samples, reader %s, "
+                     "pos %u vs window %u..%u of ring %u%s",
+                     st->name, st->unders,
+                     !feed[i].havepos ? "none"
+                                      : (pos < base ? "BEHIND (stale)"
+                                                    : "ahead (starved)"),
+                     (unsigned)pos, (unsigned)base,
+                     (unsigned)(base + st->ring.fill), RING_FRAMES,
+                     st->ring.eos ? " (eos)" : "");
+          st->unders = 0;
+        }
+      }
+    }
+    if (nfeed) {
+      unsigned us = (unsigned)(sceKernelGetProcessTimeWide() - t0);
+      if (us > g_feed_us_max) g_feed_us_max = us;
+      g_feed_us_tot += us;
+      g_feed_n++;
     }
   }
 
+  lock();
   for (int c = 0; c < g_nchannels; c++) {
     Chan *ch = &g_chan[c];
     if (!ch->used || !ch->playing || ch->paused || !ch->snd) continue;
@@ -1255,6 +1307,7 @@ have_pcm:;
                  "vol3d n=%u min=%.3f max=%.3f avg=%.3f, "
                  "bus2d avg=%.3f over %u, bus3d avg=%.3f over %u, "
                  "streams %u opened / %d live / %u underruns, "
+                 "decode %u us avg / %u us worst over %u grains (budget 21333), "
                  "chans %d used / %d playing / %d endPending of %d",
                  n, g_cache_hits, g_cache_miss, g_pcm_bytes / 1024, g_missing,
                  g_steals, g_steals_live, g_ends_fired, g_updates, g_played,
@@ -1274,6 +1327,7 @@ have_pcm:;
                  g_mix_n2d ? g_mix_sum2d / (float)g_mix_n2d : 0.0f, g_mix_n2d,
                  g_mix_n3d ? g_mix_sum3d / (float)g_mix_n3d : 0.0f, g_mix_n3d,
                  g_streams_open, g_stream_decoders, g_stream_underruns,
+                 g_feed_n ? g_feed_us_tot / g_feed_n : 0u, g_feed_us_max, g_feed_n,
                  nused, nplaying, npend, g_nchannels);
   }
 
@@ -1330,9 +1384,8 @@ static int Sys_playSound(void *self, void *sound, void *group, int paused, void 
      * with it, or a replayed track would decode from wherever the last one
      * stopped. Safe here: the feeder runs under this same lock. */
     if (s->st) {
-      audio_mp3_stream_rewind(s->st->dec);
-      audio_ring_reset(&s->st->ring);
-      s->st->reader = c;
+      s->st->reader  = c;
+      s->st->restart = 1;      /* the audio thread rewinds; see mix_grain */
     }
   }
   unlock();
@@ -1373,15 +1426,26 @@ static int Snd_release(void *self) {
     }
   cache_release(s->ent);          /* samples stay cached for the next request */
   s->ent = NULL;
-  /* Detach the stream under the same lock the feeder runs under, so it cannot
-   * be mid-decode on a Stream we are about to free. Streams are never cached:
-   * each owns its decoder, ring and compressed bytes outright. */
+  /* Detach the stream under the lock, so no grain can pick it up again after
+   * this point. Streams are never cached: each owns its decoder, ring and
+   * compressed bytes outright. */
   Stream *st = s->st;
   s->st = NULL;
+  /* Hand it to the audio thread rather than closing it here. That thread
+   * decodes outside the lock, so it may be inside this decoder right now, and
+   * freeing it from under itself would be a use-after-free. It closes the
+   * stream between grains, where it is certainly not using it. */
+  int handed = 0;
+  if (st && g_running && g_stream_retire_n < MAX_SOUNDS) {
+    g_stream_retire[g_stream_retire_n++] = st;
+    handed = 1;
+  }
   memset(&s->pcm, 0, sizeof s->pcm);
   s->used = 0;
   unlock();
-  stream_close(st);               /* outside the lock: frees memory, hits hardware */
+  /* No audio thread to hand it to (output never opened, or shutting down), so
+   * nothing can be inside it and closing here is safe. */
+  if (st && !handed) stream_close(st);
   return FMOD_OK;
 }
 
