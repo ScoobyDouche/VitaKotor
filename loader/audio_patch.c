@@ -379,6 +379,11 @@ static float chan_3d_gain(const Chan *c, float *pan_out) {
 }
 
 /* ---- mixer ---------------------------------------------------------------- */
+/* Limiter state: a global gain the mix rides instead of clipping. */
+static float    g_lim_gain = 1.0f, g_lim_min = 1.0f;
+static unsigned g_lim_grains = 0, g_lim_clipped = 0;
+static int32_t  g_lim_peak = 0;
+
 static int32_t g_acc[OUT_GRAIN * OUT_CH];
 static int16_t g_out[OUT_GRAIN * OUT_CH];
 
@@ -428,8 +433,43 @@ static void mix_grain(void) {
   }
   unlock();
 
+  /* Peak limiter.
+   *
+   * The mix used to be a raw sum hard-clipped at full scale, with every channel
+   * free to contribute a full-scale sample of its own. log160 had 15 voices
+   * playing at once with 83% of computed gains at or above 0.5, so the sum ran
+   * as much as an order of magnitude over the ceiling and simply squared off:
+   * once the loudest source saturates the bus, everything quieter under it is
+   * gone. That is exactly the hardware report -- environmental loops, which run
+   * continuously, drowning footsteps, menu clicks and combat, which do not.
+   *
+   * Attenuation could not fix this. It reduces each voice, but the sum was over
+   * by a factor, not by a margin, and clipping destroys the quiet sources
+   * regardless of how loud the loud ones are.
+   *
+   * So ride a global gain instead of clipping. Attack is instantaneous, because
+   * a limiter that lets even one sample through has not limited anything;
+   * release is slow enough (~1 s at this grain) that a loud burst does not pump
+   * the whole mix around it. Nothing is clipped in normal operation, and the
+   * balance between voices is preserved rather than flattened. */
+  int32_t peak = 0;
   for (int i = 0; i < OUT_GRAIN * OUT_CH; i++) {
-    int32_t v = g_acc[i];
+    int32_t a = g_acc[i] < 0 ? -g_acc[i] : g_acc[i];
+    if (a > peak) peak = a;
+  }
+  float target = 1.0f;
+  if (peak > 32767) {
+    target = 32767.0f / (float)peak;
+    g_lim_clipped++;
+    if (peak > g_lim_peak) g_lim_peak = peak;
+  }
+  if (target < g_lim_gain) g_lim_gain = target;              /* instant attack */
+  else g_lim_gain += (target - g_lim_gain) * 0.02f;          /* gentle release */
+  if (g_lim_gain < g_lim_min) g_lim_min = g_lim_gain;
+  g_lim_grains++;
+
+  for (int i = 0; i < OUT_GRAIN * OUT_CH; i++) {
+    int32_t v = (int32_t)((float)g_acc[i] * g_lim_gain);
     if (v >  32767) v =  32767;
     if (v < -32768) v = -32768;
     g_out[i] = (int16_t)v;
@@ -894,6 +934,7 @@ have_pcm:;
                  "basis %s (%u degenerate), "
                  "gain n=%u min=%.3f max=%.3f loud=%u quiet=%u maxdist=%.0f, "
                  "playSound %u calls / %u badsnd / %u nochan, "
+                 "limiter gain %.3f (min %.3f), %u of %u grains over (peak %d = %.1fx), "
                  "chans %d used / %d playing / %d endPending of %d",
                  n, g_cache_hits, g_cache_miss, g_pcm_bytes / 1024, g_missing,
                  g_steals, g_steals_live, g_ends_fired, g_updates, g_played,
@@ -903,6 +944,8 @@ have_pcm:;
                  g_lis_basis_ok ? "OK" : "NONE", g_lis_degenerate,
                  g_g3_n, g_g3_min, g_g3_max, g_g3_loud, g_g3_quiet, g_dist_max,
                  g_play_calls, g_play_badsnd, g_play_nochan,
+                 g_lim_gain, g_lim_min, g_lim_clipped, g_lim_grains,
+                 (int)g_lim_peak, (double)g_lim_peak / 32767.0,
                  nused, nplaying, npend, g_nchannels);
   }
 
@@ -1142,6 +1185,14 @@ static int Sys_set3DListenerAttributes(void *self, int listener, const FmodVec *
                                        const FmodVec *up) {
   (void)self; (void)vel;
   if (listener != 0) return FMOD_OK;          /* single-listener game */
+  /* Snapshot before doing anything else. log160 printed fwd=(0,0,0) up=(0,0,0)
+   * next to "0 degenerate" and a perfectly good right vector, which is not a
+   * contradiction: the print dereferenced the game's own vectors after the lock
+   * was dropped, by which time it had reused them. The basis was always fine;
+   * only the report was lying. */
+  FmodVec f = {0,0,0}, u = {0,0,0};
+  if (fwd) f = *fwd;
+  if (up)  u = *up;
   lock();
   if (pos) { g_lis_px = pos->x; g_lis_py = pos->y; g_lis_pz = pos->z; }
   if (fwd && up) {
@@ -1151,13 +1202,13 @@ static int Sys_set3DListenerAttributes(void *self, int listener, const FmodVec *
      * feels. Left-handed wants up x forward; right-handed wants forward x up. */
     float rx, ry, rz;
 #if AUDIO_3D_RIGHTHANDED
-    rx = fwd->y * up->z - fwd->z * up->y;
-    ry = fwd->z * up->x - fwd->x * up->z;
-    rz = fwd->x * up->y - fwd->y * up->x;
+    rx = f.y * u.z - f.z * u.y;
+    ry = f.z * u.x - f.x * u.z;
+    rz = f.x * u.y - f.y * u.x;
 #else
-    rx = up->y * fwd->z - up->z * fwd->y;
-    ry = up->z * fwd->x - up->x * fwd->z;
-    rz = up->x * fwd->y - up->y * fwd->x;
+    rx = u.y * f.z - u.z * f.y;
+    ry = u.z * f.x - u.x * f.z;
+    rz = u.x * f.y - u.y * f.x;
 #endif
     float len = sqrtf(rx * rx + ry * ry + rz * rz);
     if (len > 0.0001f) {
@@ -1176,8 +1227,7 @@ static int Sys_set3DListenerAttributes(void *self, int listener, const FmodVec *
                "up=(%.2f,%.2f,%.2f) -> right=(%.2f,%.2f,%.2f) basis=%s "
                "(%u degenerate) [%s]",
                g_lis_sets, g_lis_px, g_lis_py, g_lis_pz,
-               fwd ? fwd->x : 0.0f, fwd ? fwd->y : 0.0f, fwd ? fwd->z : 0.0f,
-               up ? up->x : 0.0f, up ? up->y : 0.0f, up ? up->z : 0.0f,
+               f.x, f.y, f.z, u.x, u.y, u.z,
                g_lis_rx, g_lis_ry, g_lis_rz,
                g_lis_basis_ok ? "OK" : "NONE YET", g_lis_degenerate,
                AUDIO_3D_RIGHTHANDED ? "right-handed" : "left-handed");
