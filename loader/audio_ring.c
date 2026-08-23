@@ -25,6 +25,12 @@ void audio_ring_retire(AudioRing *ring, uint64_t consumed) {
   }
 }
 
+void audio_ring_reset(AudioRing *ring) {
+  ring->base = 0;
+  ring->fill = 0;
+  ring->eos  = 0;      /* a latched eos would refuse to decode the restart */
+}
+
 unsigned audio_ring_feed(AudioRing *ring, AudioRingFill fn, void *ctx,
                          unsigned budget) {
   unsigned produced = 0;

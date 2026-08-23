@@ -187,6 +187,62 @@ static void test_short_source_does_not_spin(void) {
   printf("ok short_source_does_not_spin\n");
 }
 
+/* The window only moves forward, so a reader behind `base` is starved for good.
+ * This is why a stream serves one reader and restarts go through reset. */
+static void test_reader_behind_base_is_starved(void) {
+  int16_t buf[64];
+  AudioRing r;
+  audio_ring_init(&r, buf, 64, 1);
+  FakeSrc s = { 0, 100000, 0, 1, 0 };
+  audio_ring_feed(&r, fake_fill, &s, 64);
+  audio_ring_retire(&r, 500);                       /* reader ran on to 500 */
+  /* retire clamps to base+fill, so the window does not leap to 500 -- it
+   * crawls, one feed at a time, and a reader left at 0 is behind it for good. */
+  assert(r.base == 64 && r.fill == 0);
+  audio_ring_feed(&r, fake_fill, &s, 64);
+  float l, rr;
+  assert(audio_ring_frame(&r, 0, &l, &rr) == 0);    /* a restart at 0 is lost */
+  assert(r.base > 0);
+  printf("ok reader_behind_base_is_starved\n");
+}
+
+/* reset is the recovery: window back to 0, nothing decoded, ready to refill. */
+static void test_reset_rewinds_the_window(void) {
+  int16_t buf[64];
+  AudioRing r;
+  audio_ring_init(&r, buf, 64, 1);
+  FakeSrc s = { 0, 100000, 0, 1, 0 };
+  audio_ring_feed(&r, fake_fill, &s, 64);
+  audio_ring_retire(&r, 500);
+  audio_ring_feed(&r, fake_fill, &s, 64);
+  assert(r.base > 0);
+
+  audio_ring_reset(&r);
+  assert(r.base == 0 && r.fill == 0 && r.eos == 0);
+
+  FakeSrc s2 = { 0, 100000, 0, 1, 0 };              /* decoder rewound too */
+  unsigned got = audio_ring_feed(&r, fake_fill, &s2, 64);
+  assert(got == 64);
+  float l, rr;
+  assert(audio_ring_frame(&r, 0, &l, &rr) == 1 && l == 0.0f);
+  printf("ok reset_rewinds_the_window\n");
+}
+
+/* reset must clear a latched eos, or a restarted track refuses to decode. */
+static void test_reset_clears_eos(void) {
+  int16_t buf[64];
+  AudioRing r;
+  audio_ring_init(&r, buf, 64, 1);
+  FakeSrc s = { 0, 5, 0, 1, 0 };
+  audio_ring_feed(&r, fake_fill, &s, 64);
+  assert(r.eos == 1);
+  audio_ring_reset(&r);
+  assert(r.eos == 0);
+  FakeSrc s2 = { 0, 5, 0, 1, 0 };
+  assert(audio_ring_feed(&r, fake_fill, &s2, 64) == 5);
+  printf("ok reset_clears_eos\n");
+}
+
 int main(void) {
   test_init_is_empty();
   test_feed_fills_and_reads_back();
@@ -199,6 +255,9 @@ int main(void) {
   test_eos_is_sticky_and_stops_feeding();
   test_eos_leaves_window_readable();
   test_short_source_does_not_spin();
+  test_reader_behind_base_is_starved();
+  test_reset_rewinds_the_window();
+  test_reset_clears_eos();
   printf("\nall audio_ring tests passed\n");
   return 0;
 }

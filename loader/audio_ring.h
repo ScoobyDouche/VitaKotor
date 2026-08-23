@@ -38,8 +38,21 @@ void audio_ring_init(AudioRing *ring, int16_t *buf, unsigned cap_frames,
                      unsigned ch);
 
 /* Drop every frame before absolute index `consumed`. Safe to call with a value
- * behind base (no-op) or beyond the window (drops everything). */
+ * behind base (no-op) or beyond the window (drops everything).
+ *
+ * IMPORTANT: the window only ever moves FORWARD. A reader positioned behind
+ * `base` can never be served again -- see audio_ring_reset. */
 void audio_ring_retire(AudioRing *ring, uint64_t consumed);
+
+/* Rewind the window to frame 0 and forget everything decoded.
+ *
+ * A ring serves exactly ONE sequential reader. That is not a stylistic
+ * preference: with one decoder there is only one read position, and retiring by
+ * the minimum of two readers freezes the window between them -- measured at
+ * 100% starvation for the reader behind and 83% for the reader ahead, neither
+ * recovering. So when playback restarts, the decoder is rewound and the window
+ * reset together, rather than trying to serve the old and new positions at once. */
+void audio_ring_reset(AudioRing *ring);
 
 /* Top the window up, decoding at most `budget` frames this call. Returns frames
  * added. Bounding the budget is what stops one refill from overrunning the
