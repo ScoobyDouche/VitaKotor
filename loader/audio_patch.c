@@ -142,6 +142,9 @@ typedef struct {
   int16_t  *ring_buf;   /* RING_FRAMES * ch int16 units */
   AudioRing ring;
   int       loop;       /* honour FMOD_LOOP_NORMAL; the game sends LOOP_OFF */
+  int       hw;         /* holds a sceAudiodec handle (MP3) vs software (ADPCM) */
+  unsigned  unders;     /* mixer wanted a frame this stream could not supply */
+  char      name[32];   /* asset basename, for the finish line below */
 } Stream;
 
 /* ---- decoded-PCM cache ----------------------------------------------------
@@ -317,14 +320,20 @@ static unsigned stream_fill_cb(void *ctx, int16_t *dst, unsigned frames,
  * inside it. Caller must hold NO lock: this allocates and touches hardware. */
 static Stream *stream_open(void *src_owned, const void *es, unsigned len,
                            AudioPcm *fmt, int loop) {
-  int live;
-  lock();
-  live = g_stream_decoders;
-  unlock();
-  if (live >= AUDIO_MP3_STREAM_MAX) {
-    log_printf("[snd] stream decoder cap reached (%d of pool %d) -- not streaming this one",
-               live, AUDIO_MP3_DECODER_POOL);
-    return NULL;
+  /* Only hardware-decoded streams are capped: the cap exists to keep a
+   * sceAudiodec handle free for the short synchronous decodes, and a software
+   * ADPCM stream takes none. */
+  int needs_hw = audio_mp3_stream_needs_hw(es, len);
+  if (needs_hw) {
+    int live;
+    lock();
+    live = g_stream_decoders;
+    unlock();
+    if (live >= AUDIO_MP3_STREAM_MAX) {
+      log_printf("[snd] stream decoder cap reached (%d of pool %d) -- not streaming this one",
+                 live, AUDIO_MP3_DECODER_POOL);
+      return NULL;
+    }
   }
 
   Stream *st = (Stream *)calloc(1, sizeof *st);
@@ -332,6 +341,7 @@ static Stream *stream_open(void *src_owned, const void *es, unsigned len,
 
   st->dec = audio_mp3_stream_open(es, len, fmt);
   if (!st->dec) { free(st); return NULL; }
+  st->hw = needs_hw;
 
   unsigned ch = (fmt && fmt->channels) ? fmt->channels : 1;
   st->src      = src_owned;
@@ -345,7 +355,7 @@ static Stream *stream_open(void *src_owned, const void *es, unsigned len,
   audio_ring_init(&st->ring, st->ring_buf, RING_FRAMES, ch);
 
   lock();
-  g_stream_decoders++;
+  if (st->hw) g_stream_decoders++;
   g_streams_open++;
   unlock();
   return st;
@@ -360,11 +370,14 @@ static Stream *stream_open(void *src_owned, const void *es, unsigned len,
 static void stream_close(Stream *st) {
   if (!st) return;
   if (st->dec) {
+    int hw = st->hw;
     audio_mp3_stream_close(st->dec);
     st->dec = NULL;
-    lock();
-    g_stream_decoders--;                   /* the handle went back to the pool */
-    unlock();
+    if (hw) {
+      lock();
+      g_stream_decoders--;                 /* the handle went back to the pool */
+      unlock();
+    }
   }
   big_free(st->ring_buf);
   big_free(st->src);
@@ -454,6 +467,15 @@ static unsigned g_lis_degenerate = 0;
 /* Gain census: is attenuation reasonable, or is it burying everything? */
 static unsigned g_g3_n = 0, g_g3_loud = 0, g_g3_quiet = 0;
 static float    g_g3_min = 1.0f, g_g3_max = 0.0f, g_dist_max = 0.0f;
+/* The quietest attenuation of the session, with the numbers that produced it.
+ * log169 raised a question the census could not answer: dialogue was quiet in
+ * one spot on Dantooine and normal moments later. "81 gains below 0.05" does
+ * not say whether we attenuated a line into the floor or whether that take is
+ * simply quiet -- for that you need the distance and the min/max the game set,
+ * which is what FMOD's inverse rolloff (gain = mindistance / distance) is
+ * actually made of. Three floats, no per-call logging. */
+static float    g_g3_worst = 1.0f, g_g3_worst_d = 0.0f;
+static float    g_g3_worst_mn = 0.0f, g_g3_worst_mx = 0.0f;
 /* Volume census. The mixer computes v = ch->vol * g3, and nothing has ever
  * logged ch->vol -- so "3D sounds are too quiet" has stayed a hypothesis. The
  * discriminator is whether the 3D volumes VARY: a spread means the game is
@@ -490,6 +512,9 @@ static float chan_3d_gain(const Chan *c, float *pan_out) {
   if (g > g_g3_max) g_g3_max = g;
   if (d > g_dist_max) g_dist_max = d;
   if (g >= 0.5f) g_g3_loud++; else if (g < 0.05f) g_g3_quiet++;
+  if (g < g_g3_worst) {
+    g_g3_worst = g; g_g3_worst_d = d; g_g3_worst_mn = mn; g_g3_worst_mx = mx;
+  }
 
   /* Pan by projecting the direction onto the listener's right vector. At the
    * listener's own position there is no direction, so stay centred; and with no
@@ -524,16 +549,45 @@ static void mix_grain(void) {
   for (int i = 0; i < MAX_SOUNDS; i++) {
     Snd *s = &g_snd[i];
     if (!s->used || !s->st) continue;
-    uint64_t consumed = (uint64_t)-1;
+    uint64_t consumed = (uint64_t)-1, ahead = 0;
+    int readers = 0;
     for (int c = 0; c < g_nchannels; c++) {
       Chan *ch = &g_chan[c];
       if (ch->used && ch->playing && ch->snd == s) {
         uint64_t p = (uint64_t)ch->pos;
+        readers++;
         if (p < consumed) consumed = p;
+        if (p > ahead)    ahead = p;
       }
     }
     if (consumed != (uint64_t)-1) audio_ring_retire(&s->st->ring, consumed);
     audio_ring_feed(&s->st->ring, stream_fill_cb, s->st, FEED_MAX_FRAMES);
+
+    /* Underruns are counted per sample, so they can only be reported in bulk --
+     * and log168 had 5.4 million of them arriving in bursts with no way to say
+     * WHICH stream, or why. The two candidate whys are both visible right here:
+     *
+     *   readers > 1 with a spread wider than the ring -- retiring on the
+     *   slowest reader means the window can never reach the fastest one, so it
+     *   underruns on every sample for as long as both play; or
+     *
+     *   one reader and a starved window -- the decoder genuinely is not
+     *   keeping up.
+     *
+     * Rate-limited to roughly one line every two seconds per stream. */
+    if (s->st->unders) {
+      static unsigned last_report = 0;
+      if (g_lim_grains - last_report >= 96) {
+        last_report = g_lim_grains;
+        log_printf("[snd] stream UNDERRUN \"%.31s\": %u samples, %d reader(s), "
+                   "spread %u frames vs ring %u, window %u frames%s",
+                   s->st->name, s->st->unders, readers,
+                   (unsigned)(ahead - (consumed == (uint64_t)-1 ? ahead : consumed)),
+                   RING_FRAMES, s->st->ring.fill,
+                   s->st->ring.eos ? " (eos)" : "");
+        s->st->unders = 0;
+      }
+    }
   }
 
   for (int c = 0; c < g_nchannels; c++) {
@@ -565,11 +619,25 @@ static void mix_grain(void) {
            * Otherwise this is a refill underrun: emit nothing for this sample
            * but keep the clock moving, so a dropout cannot become drift. */
           if (ring->eos && i0 + 1 >= ring->base + (uint64_t)ring->fill) {
+            /* A track reaching its end is the handoff point for the game's music
+             * director: it plays LOOP_OFF and is supposed to queue the next one
+             * off the END callback. In log166 the last music stream was created
+             * at t=302 for an 87.8 s track, 2D voices per grain collapsed at
+             * t=390 -- exactly 302+87.8 -- and no CreateStream ever followed, so
+             * the rest of the session was silent. Printing the end of every
+             * track makes that gap measurable against the next CreateStream
+             * instead of inferred from a mixing average. Once per track. */
+            unsigned rate = s->pcm.rate ? s->pcm.rate : 1;
+            log_printf("[snd] stream FINISHED \"%.31s\" after %u ms "
+                       "(chan %d, %u decoded frames) -- END now owed to the game",
+                       s->st->name, (unsigned)(i0 * 1000ull / rate), c,
+                       (unsigned)(ring->base + ring->fill));
             chan_finish(ch);
             break;
           }
           ch->pos += ch->step;
           g_stream_underruns++;
+          s->st->unders++;
           continue;
         }
         float frac = (float)(ch->pos - (double)i0);
@@ -1059,6 +1127,12 @@ static int Sys_createSound(void *self, const char *name, unsigned mode,
           Stream *st = stream_open(owned, buf, len, &fmt,
                                    (mode & FMOD_LOOP_NORMAL) != 0);
           if (st) {
+            const char *base = what;
+            for (const char *q = what; *q; q++)
+              if (*q == '\\' || *q == '/') base = q + 1;
+            unsigned bn = 0;
+            while (base[bn] && bn < sizeof st->name - 1) { st->name[bn] = base[bn]; bn++; }
+            st->name[bn] = '\0';
             lock();
             Snd *ss = snd_alloc();
             unlock();
@@ -1158,7 +1232,8 @@ have_pcm:;
                  "%u release killed %u live / %u pending, "
                  "3D %u listener / %u pos / %u minmax, "
                  "basis %s (%u degenerate), "
-                 "gain n=%u min=%.3f max=%.3f loud=%u quiet=%u maxdist=%.0f, "
+                 "gain n=%u min=%.3f max=%.3f loud=%u quiet=%u maxdist=%.0f "
+                 "(worst %.3f at d=%.1f, min/max %.1f/%.1f), "
                  "playSound %u calls / %u badsnd / %u nochan, "
                  "limiter gain %.3f (min %.3f), %u of %u grains over (peak %d = %.1fx), "
                  "vol2d n=%u min=%.3f max=%.3f avg=%.3f, "
@@ -1173,6 +1248,7 @@ have_pcm:;
                  g_lis_sets, g_pos_sets, g_mm_sets,
                  g_lis_basis_ok ? "OK" : "NONE", g_lis_degenerate,
                  g_g3_n, g_g3_min, g_g3_max, g_g3_loud, g_g3_quiet, g_dist_max,
+                 g_g3_worst, g_g3_worst_d, g_g3_worst_mn, g_g3_worst_mx,
                  g_play_calls, g_play_badsnd, g_play_nochan,
                  g_lim_gain, g_lim_min, g_lim_clipped, g_lim_grains,
                  (int)g_lim_peak, (double)g_lim_peak / 32767.0,

@@ -64,6 +64,13 @@ typedef struct AudioMp3Stream AudioMp3Stream;
  * the same asset. Returns NULL if the asset is not decodable. */
 AudioMp3Stream *audio_mp3_stream_open(const void *data, unsigned len, AudioPcm *fmt);
 
+/* 1 if streaming this asset would take one of the AUDIO_MP3_DECODER_POOL
+ * hardware handles. The ambient beds are IMA ADPCM behind a 470-byte junk-MP3
+ * prefix and decode in software, so they must NOT count against the pool --
+ * Lower City runs an ADPCM bed and an MP3 track at the same time, and with a
+ * shared cap of 2 the second one would be refused. Cheap: a header sniff. */
+int  audio_mp3_stream_needs_hw(const void *data, unsigned len);
+
 /* Decode up to `frames` frames into `dst` (interleaved, fmt->channels per
  * frame). Returns frames actually produced; short or 0 at end of stream. */
 unsigned audio_mp3_stream_read(AudioMp3Stream *s, int16_t *dst, unsigned frames);

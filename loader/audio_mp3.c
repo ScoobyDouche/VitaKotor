@@ -12,6 +12,29 @@
  * So we sniff rather than blindly skipping 58 bytes, and we never trust the RIFF
  * fields -- the MPEG frame header is the only authority for rate and channels.
  *
+ * THAT SAMPLE MISSED A THIRD CONTAINER, and it is the one the ambience uses.
+ * A full census of the OBB (log167 follow-up) finds 51 of the 119 STREAMMUSIC
+ * assets -- every environmental bed -- laid out the other way round:
+ *
+ *     bytes 0..469   a fake 3-frame LAME3.93 MPEG-2 header, padded with 0x55
+ *     byte  470      a REAL RIFF/WAVE, almost always IMA ADPCM 4-bit,
+ *                    44100 Hz stereo, blockAlign 2048, 2041 frames per block
+ *
+ * It is the mirror image of the 58-byte case: there a fake RIFF wraps real MP3,
+ * here a fake MP3 wraps a real RIFF. (STREAMSOUNDS uses the same 470-byte
+ * prefix, which is why the companion opens those files at offset 470 -- but for
+ * STREAMMUSIC it hands us the whole file from byte 0 and leaves the sniffing to
+ * us.) Getting this wrong was not subtle: find_sync locked onto the fake LAME
+ * frame, the bitrate identity turned a 46-second loop into a fictional 338691 ms
+ * MP3, the streaming decoder emitted the 3 junk frames (1728 samples, 78 ms) and
+ * hit EOS -- so every ambient bed in the game "finished" after 78 ms and the
+ * engine restarted it ten times a second, forever. log167 caught 1256 of those
+ * phantom finishes.
+ *
+ * So: look for RIFF at 0 AND at 470, and believe a `data` chunk with a real
+ * size. A `data` size of 0 still means the fake header, and still falls through
+ * to MP3 -- that rule is what keeps the 58-byte case working.
+ *
  * Decoding runs on sceAudiodec (hardware). We do NOT hand-compute frame lengths:
  * sceAudiodecDecode reports how much elementary stream it actually consumed in
  * ctrl.inputEsSize, so we just advance by that. It is both simpler and correct
@@ -125,6 +148,68 @@ static inline int ima_next(int nib, int *pred, int *idx) {
   return p;
 }
 
+/* Decode ONE IMA ADPCM block into `dst`. Returns frames written.
+ *
+ * Each block carries its own predictor and step index in its first 4 bytes per
+ * channel, so blocks are entirely independent of one another. That is the whole
+ * reason streaming this format is easy: any block can be decoded on its own, a
+ * rewind is just "go back to block 0", and there is no inter-block state to
+ * carry -- unlike MP3, where the bit reservoir spans frames. */
+static unsigned adpcm_block(const unsigned char *blk, unsigned blen, unsigned ch,
+                            int16_t *dst, unsigned cap_frames) {
+  if (blen < 4 * ch || !cap_frames) return 0;
+  int pred[2] = {0, 0}, idx[2] = {0, 0};
+  unsigned f = 0, pos = 4 * ch;
+
+  for (unsigned c = 0; c < ch; c++) {
+    pred[c] = (int16_t)rd16(blk + c * 4);
+    idx[c]  = blk[c * 4 + 2];
+    if (idx[c] > 88) idx[c] = 88;
+  }
+  for (unsigned c = 0; c < ch; c++) dst[c] = (int16_t)pred[c];  /* header seeds frame 0 */
+  f = 1;
+
+  if (ch == 1) {                        /* nibbles run low-then-high, in order */
+    for (; pos < blen && f < cap_frames; pos++) {
+      dst[f++] = (int16_t)ima_next(blk[pos] & 15, &pred[0], &idx[0]);
+      if (f < cap_frames)
+        dst[f++] = (int16_t)ima_next(blk[pos] >> 4, &pred[0], &idx[0]);
+    }
+    return f;
+  }
+
+  /* Stereo is NOT interleaved per sample. The data is 4-byte groups that
+   * ALTERNATE channels, each group holding 8 consecutive samples of one
+   * channel, so a pair of groups yields 8 interleaved frames.
+   *
+   * Emitting the nibbles in the order they appear -- which is what this did
+   * before the ambient beds started using it -- writes eight left samples into
+   * the space where L R L R belongs. Every output frame then takes two adjacent
+   * samples of the SAME channel: half the frames, so the track plays an octave
+   * high with the stereo image shredded. It went unnoticed because the only
+   * ADPCM assets in use were four mono effects, and the mono path above is
+   * right. Verified against a reference decoder in tools/. */
+  int16_t l[8], r[8];
+  while (pos + 8 <= blen && f < cap_frames) {
+    for (unsigned j = 0; j < 4; j++) {
+      unsigned b = blk[pos + j];
+      l[j * 2]     = (int16_t)ima_next(b & 15, &pred[0], &idx[0]);
+      l[j * 2 + 1] = (int16_t)ima_next(b >> 4,  &pred[0], &idx[0]);
+    }
+    for (unsigned j = 0; j < 4; j++) {
+      unsigned b = blk[pos + 4 + j];
+      r[j * 2]     = (int16_t)ima_next(b & 15, &pred[1], &idx[1]);
+      r[j * 2 + 1] = (int16_t)ima_next(b >> 4,  &pred[1], &idx[1]);
+    }
+    pos += 8;
+    for (unsigned j = 0; j < 8 && f < cap_frames; j++, f++) {
+      dst[f * 2]     = l[j];
+      dst[f * 2 + 1] = r[j];
+    }
+  }
+  return f;
+}
+
 static int adpcm_ima_decode(const unsigned char *d, unsigned len, unsigned ch,
                             unsigned rate, unsigned balign, AudioPcm *out) {
   if ((ch != 1 && ch != 2) || !rate) return 0;
@@ -143,32 +228,16 @@ static int adpcm_ima_decode(const unsigned char *d, unsigned len, unsigned ch,
   int16_t *pcm = (int16_t *)big_malloc((size_t)frames * ch * sizeof(int16_t));
   if (!pcm) { log_printf("[snd] ADPCM out of memory (%u frames)", frames); return 0; }
 
-  int pred[2] = {0, 0}, idx[2] = {0, 0};
   unsigned w = 0;
-  for (unsigned b = 0; b * balign < len && w < frames * ch; b++) {
+  for (unsigned b = 0; b * balign < len && w < frames; b++) {
     const unsigned char *blk = d + b * balign;
     unsigned blen = len - b * balign;
     if (blen > balign) blen = balign;
-    if (blen < 4 * ch) break;
-
-    for (unsigned c = 0; c < ch; c++) {
-      pred[c] = (int16_t)rd16(blk + c * 4);
-      idx[c]  = blk[c * 4 + 2];
-      if (idx[c] > 88) idx[c] = 88;
-    }
-    for (unsigned c = 0; c < ch && w < frames * ch; c++) pcm[w++] = (int16_t)pred[c];
-
-    /* mono: nibbles run low-then-high. stereo: 4-byte groups alternate channels. */
-    for (unsigned i = 4 * ch; i < blen && w < frames * ch; i++) {
-      unsigned c = (ch == 1) ? 0 : ((i - 4 * ch) / 4) & 1;
-      pcm[w++] = (int16_t)ima_next(blk[i] & 15, &pred[c], &idx[c]);
-      if (w < frames * ch)
-        pcm[w++] = (int16_t)ima_next(blk[i] >> 4, &pred[c], &idx[c]);
-    }
+    w += adpcm_block(blk, blen, ch, pcm + (size_t)w * ch, frames - w);
   }
 
   out->pcm      = pcm;
-  out->nsamples = w / ch;
+  out->nsamples = w;
   out->channels = ch;
   out->rate     = rate;
   out->ms       = (unsigned)((uint64_t)out->nsamples * 1000u / rate);
@@ -187,57 +256,104 @@ static int adpcm_ima_decode(const unsigned char *d, unsigned len, unsigned ch,
  * one declares the true byte count. So: real data chunk -> PCM, else fall
  * through to the MP3 sniffer.
  */
-static int wav_try_pcm(const unsigned char *d, unsigned len, AudioPcm *out) {
-  if (len < 44 || memcmp(d, "RIFF", 4) || memcmp(d + 8, "WAVE", 4)) return 0;
+/* KOTOR's fixed junk-MP3 prefix. The companion itself uses this constant: it
+ * opens every STREAMSOUNDS asset at offset 470. For STREAMMUSIC it passes the
+ * whole file from 0 and leaves the sniffing to us. */
+#define WAV_JUNK_PREFIX 470
 
-  unsigned pos = 12, afmt = 0, ch = 0, rate = 0, bits = 0, balign = 0, have_fmt = 0;
+/* Where the real RIFF starts, or -1 if there is not one. */
+static int wav_riff_at(const unsigned char *d, unsigned len) {
+  if (len >= 44 && !memcmp(d, "RIFF", 4) && !memcmp(d + 8, "WAVE", 4)) return 0;
+  if (len >= WAV_JUNK_PREFIX + 44 &&
+      !memcmp(d + WAV_JUNK_PREFIX, "RIFF", 4) &&
+      !memcmp(d + WAV_JUNK_PREFIX + 8, "WAVE", 4)) return WAV_JUNK_PREFIX;
+  return -1;
+}
+
+/* Everything the two RIFF forms need, read from the header alone. */
+typedef struct {
+  unsigned afmt, ch, rate, bits, balign;
+  unsigned data_off, data_len;             /* absolute, into the caller's buffer */
+  unsigned per_block;                      /* ADPCM frames per block, else 0 */
+  unsigned frames;
+} WavInfo;
+
+/* Header-only parse. Returns 1 only for a container we can actually decode --
+ * a `data` chunk with a real size and a format we implement. A size of 0 is the
+ * fake header wrapping MP3, and must fail here so the MP3 sniffer gets it. */
+static int wav_header(const unsigned char *d, unsigned len, WavInfo *w) {
+  int base = wav_riff_at(d, len);
+  if (base < 0) return 0;
+
+  memset(w, 0, sizeof *w);
+  unsigned pos = (unsigned)base + 12, have_fmt = 0;
   while (pos + 8 <= len) {
     unsigned csz = rd32(d + pos + 4);
-    const unsigned char *body = d + pos + 8;
-    unsigned avail = len - (pos + 8);
+    unsigned body = pos + 8;
+    unsigned avail = len - body;
     if (csz > avail) csz = avail;                  /* tolerate a short tail */
 
     if (!memcmp(d + pos, "fmt ", 4) && csz >= 16) {
-      afmt = rd16(body); ch = rd16(body + 2); rate = rd32(body + 4);
-      balign = rd16(body + 12); bits = rd16(body + 14);
+      w->afmt = rd16(d + body);      w->ch   = rd16(d + body + 2);
+      w->rate = rd32(d + body + 4);  w->balign = rd16(d + body + 12);
+      w->bits = rd16(d + body + 14);
       have_fmt = 1;
     } else if (!memcmp(d + pos, "data", 4)) {
-      /* size 0 == the fake header the MP3 assets carry; let MP3 handle it */
       if (!have_fmt || csz == 0) return 0;
-      if (afmt == 17) return adpcm_ima_decode(body, csz, ch, rate, balign, out);
-      if (afmt != 1) return 0;
-      if (ch != 1 && ch != 2) return 0;
-      if (bits != 8 && bits != 16) return 0;
-      if (!rate) return 0;
-
-      unsigned frames = csz / (ch * (bits / 8));
-      if (!frames) return 0;
-      int16_t *pcm = (int16_t *)big_malloc((size_t)frames * ch * sizeof(int16_t));
-      if (!pcm) return 0;
-
-      if (bits == 16) {
-        memcpy(pcm, body, (size_t)frames * ch * sizeof(int16_t));
+      w->data_off = body;
+      w->data_len = csz;
+      if (w->ch != 1 && w->ch != 2) return 0;
+      if (!w->rate) return 0;
+      if (w->afmt == 17) {                          /* IMA ADPCM, 4-bit */
+        if (w->balign < 4 * w->ch) w->balign = 1024;
+        w->per_block = 1 + ((w->balign - 4 * w->ch) * 2) / w->ch;
+        unsigned nblocks = csz / w->balign, tail = csz % w->balign;
+        w->frames = nblocks * w->per_block;
+        if (tail > 4 * w->ch) w->frames += 1 + ((tail - 4 * w->ch) * 2) / w->ch;
+      } else if (w->afmt == 1 && (w->bits == 8 || w->bits == 16)) {
+        w->frames = csz / (w->ch * (w->bits / 8));
       } else {
-        /* 8-bit WAV is unsigned, centred on 128 */
-        for (unsigned i = 0; i < frames * ch; i++)
-          pcm[i] = (int16_t)(((int)body[i] - 128) << 8);
+        return 0;
       }
-
-      out->pcm      = pcm;
-      out->nsamples = frames;
-      out->channels = ch;
-      out->rate     = rate;
-      out->ms       = (unsigned)((uint64_t)frames * 1000u / rate);
-      /* Throttled: this fired 2569 times in log110 and the log I/O alone hurt. */
-      static unsigned nlog = 0;
-      if (nlog++ < 24)
-        log_printf("[snd] RIFF PCM %u Hz %u ch %u-bit -> %u frames (%u ms)",
-                   rate, ch, bits, frames, out->ms);
-      return 1;
+      return w->frames ? 1 : 0;
     }
     pos += 8 + csz + (csz & 1);                    /* chunks are word-aligned */
   }
   return 0;
+}
+
+static int wav_try_pcm(const unsigned char *d, unsigned len, AudioPcm *out) {
+  WavInfo w;
+  if (!wav_header(d, len, &w)) return 0;
+
+  const unsigned char *body = d + w.data_off;
+  unsigned ch = w.ch, rate = w.rate, bits = w.bits, frames = w.frames;
+
+  if (w.afmt == 17)
+    return adpcm_ima_decode(body, w.data_len, ch, rate, w.balign, out);
+
+  int16_t *pcm = (int16_t *)big_malloc((size_t)frames * ch * sizeof(int16_t));
+  if (!pcm) return 0;
+
+  if (bits == 16) {
+    memcpy(pcm, body, (size_t)frames * ch * sizeof(int16_t));
+  } else {
+    /* 8-bit WAV is unsigned, centred on 128 */
+    for (unsigned i = 0; i < frames * ch; i++)
+      pcm[i] = (int16_t)(((int)body[i] - 128) << 8);
+  }
+
+  out->pcm      = pcm;
+  out->nsamples = frames;
+  out->channels = ch;
+  out->rate     = rate;
+  out->ms       = (unsigned)((uint64_t)frames * 1000u / rate);
+  /* Throttled: this fired 2569 times in log110 and the log I/O alone hurt. */
+  static unsigned nlog = 0;
+  if (nlog++ < 24)
+    log_printf("[snd] RIFF PCM %u Hz %u ch %u-bit -> %u frames (%u ms)",
+               rate, ch, bits, frames, out->ms);
+  return 1;
 }
 
 /* kbps by bitrate index, Layer III. Index 0 (free) and 15 (bad) are rejected by
@@ -251,12 +367,18 @@ int audio_mp3_probe(const void *data, unsigned len, AudioPcm *out) {
 
   const unsigned char *d = (const unsigned char *)data;
 
-  /* Real PCM: the exact answer is in the header, so no estimate needed. */
-  AudioPcm tmp;
-  if (wav_try_pcm(d, len, &tmp)) {
-    big_free(tmp.pcm);
-    tmp.pcm = NULL;
-    *out = tmp;
+  /* A real RIFF answers exactly, from its header -- no estimate and, since the
+   * ADPCM beds are 8-25 MB decoded, no decoding either. (This used to call
+   * wav_try_pcm and free the result, which meant "how long is this?" cost a full
+   * decode of the largest assets in the game, on the game thread, before we had
+   * even decided whether to stream it.) */
+  WavInfo w;
+  if (wav_header(d, len, &w)) {
+    out->pcm      = NULL;
+    out->nsamples = w.frames;
+    out->channels = w.ch;
+    out->rate     = w.rate;
+    out->ms       = (unsigned)((uint64_t)w.frames * 1000u / w.rate);
     return 1;
   }
 
@@ -377,6 +499,7 @@ int audio_mp3_decode(const void *data, unsigned len, AudioPcm *out) {
       pos++;
       continue;
     }
+    errs = 0;                       /* consecutive, not lifetime */
     unsigned got = ctrl.outputPcmSize / sizeof(int16_t);
     if (got) {
       memcpy(pcm + total, frame, ctrl.outputPcmSize);
@@ -436,10 +559,60 @@ struct AudioMp3Stream {
    * asked for; the remainder waits here rather than being decoded twice. */
   int16_t  carry[MP3_MAX_SAMPLES * 2];
   unsigned carry_n, carry_off;             /* in int16 units */
+
+  /* RIFF mode: the ambient beds are IMA ADPCM, not MP3 (see the file header).
+   * They need no hardware decoder at all -- `created` stays 0 and the
+   * sceAudiodec pool is left for the MP3 tracks and the VO. */
+  int      is_wav;
+  WavInfo  wav;
+  unsigned blk;                            /* next block index */
+  int16_t *wbuf;                           /* one block of decoded frames */
+  unsigned wbuf_n, wbuf_off;               /* in int16 units */
 };
+
+/* Would this asset need one of the AUDIO_MP3_DECODER_POOL hardware handles?
+ * The caller checks its stream cap against the pool, and a RIFF stream must not
+ * count against it -- Lower City runs an ADPCM bed and an MP3 track at once. */
+int audio_mp3_stream_needs_hw(const void *data, unsigned len) {
+  WavInfo w;
+  if (!data || len < 16) return 0;
+  return !wav_header((const unsigned char *)data, len, &w);
+}
 
 AudioMp3Stream *audio_mp3_stream_open(const void *data, unsigned len, AudioPcm *fmt) {
   if (!data || !len) return NULL;
+
+  /* RIFF first, and without touching the decoder library: the beds are ADPCM
+   * and the whole point of streaming them is that they cost a block buffer
+   * rather than 8-25 MB of PCM. */
+  {
+    WavInfo w;
+    if (wav_header((const unsigned char *)data, len, &w)) {
+      AudioMp3Stream *s = (AudioMp3Stream *)calloc(1, sizeof *s);
+      if (!s) return NULL;
+      unsigned per = (w.afmt == 17) ? w.per_block : 1024;   /* PCM: arbitrary chunk */
+      s->wbuf = (int16_t *)malloc((size_t)per * w.ch * sizeof(int16_t));
+      if (!s->wbuf) { free(s); return NULL; }
+      s->is_wav = 1;
+      s->wav    = w;
+      s->d      = (const unsigned char *)data;
+      s->len    = len;
+      s->ch     = w.ch;
+      s->rate   = w.rate;
+      if (fmt) {
+        fmt->pcm      = NULL;
+        fmt->nsamples = w.frames;
+        fmt->channels = w.ch;
+        fmt->rate     = w.rate;
+        fmt->ms       = (unsigned)((uint64_t)w.frames * 1000u / w.rate);
+      }
+      log_printf("[snd] stream is RIFF fmt=0x%x %u Hz %u ch -> %u frames (%u ms), "
+                 "no hw decoder", w.afmt, w.rate, w.ch, w.frames,
+                 (unsigned)((uint64_t)w.frames * 1000u / w.rate));
+      return s;
+    }
+  }
+
   if (!audio_mp3_init_library()) return NULL;   /* idempotent; sizes the pool */
 
   /* Reuse the header walk so duration/rate/channels match what the non-stream
@@ -492,8 +665,51 @@ AudioMp3Stream *audio_mp3_stream_open(const void *data, unsigned len, AudioPcm *
   return s;
 }
 
+/* One block (ADPCM) or one chunk (plain PCM) into s->wbuf. 0 = nothing left. */
+static unsigned wav_fill_block(AudioMp3Stream *s) {
+  const WavInfo *w = &s->wav;
+  unsigned per = (w->afmt == 17) ? w->per_block : 1024;
+  unsigned bsz = (w->afmt == 17) ? w->balign : (1024 * w->ch * (w->bits / 8));
+  unsigned off = s->blk * bsz;
+  if (off >= w->data_len) return 0;
+  unsigned blen = w->data_len - off;
+  if (blen > bsz) blen = bsz;
+  const unsigned char *p = s->d + w->data_off + off;
+  s->blk++;
+
+  if (w->afmt == 17) return adpcm_block(p, blen, w->ch, s->wbuf, per);
+
+  unsigned n = blen / (w->ch * (w->bits / 8));
+  if (w->bits == 16) memcpy(s->wbuf, p, (size_t)n * w->ch * sizeof(int16_t));
+  else for (unsigned i = 0; i < n * w->ch; i++)
+         s->wbuf[i] = (int16_t)(((int)p[i] - 128) << 8);
+  return n;
+}
+
 unsigned audio_mp3_stream_read(AudioMp3Stream *s, int16_t *dst, unsigned frames) {
-  if (!s || !dst || !frames || !s->created) return 0;
+  if (!s || !dst || !frames) return 0;
+
+  if (s->is_wav) {
+    unsigned want = frames * s->ch, got = 0;
+    while (got < want) {
+      if (s->wbuf_off < s->wbuf_n) {
+        unsigned take = s->wbuf_n - s->wbuf_off;
+        if (take > want - got) take = want - got;
+        memcpy(dst + got, s->wbuf + s->wbuf_off, take * sizeof(int16_t));
+        s->wbuf_off += take;
+        got += take;
+        continue;
+      }
+      if (s->eos) break;
+      unsigned n = wav_fill_block(s);
+      if (!n) { s->eos = 1; break; }
+      s->wbuf_n   = n * s->ch;
+      s->wbuf_off = 0;
+    }
+    return got / s->ch;
+  }
+
+  if (!s->created) return 0;
   unsigned want = frames * s->ch;          /* int16 units */
   unsigned got = 0;
 
@@ -520,11 +736,17 @@ unsigned audio_mp3_stream_read(AudioMp3Stream *s, int16_t *dst, unsigned frames)
     int r = sceAudiodecDecode(&s->ctrl);
     if (r < 0 || s->ctrl.inputEsSize == 0) {
       /* Same resync rule as the whole-asset path: a few bad frames at an edge
-       * are normal, a wall of them means the stream is finished or broken. */
+       * are normal, a wall of them means the stream is finished or broken.
+       * CONSECUTIVE is the point -- this used to be a lifetime count that was
+       * never cleared on a good frame, so a long track could accumulate 65
+       * scattered resync bytes over several minutes and then declare EOS in the
+       * middle of itself. A 1149-byte ID3v2 tag between the fake RIFF and the
+       * first frame would have done it on its own. */
       if (++s->errs > 64) { s->eos = 1; break; }
       s->pos++;
       continue;
     }
+    s->errs      = 0;      /* consecutive, not lifetime -- see below */
     s->carry_n   = s->ctrl.outputPcmSize / sizeof(int16_t);
     s->carry_off = 0;
     s->pos      += s->ctrl.inputEsSize;
@@ -534,11 +756,17 @@ unsigned audio_mp3_stream_read(AudioMp3Stream *s, int16_t *dst, unsigned frames)
 }
 
 int audio_mp3_stream_eos(const AudioMp3Stream *s) {
-  return !s || (s->eos && s->carry_off >= s->carry_n);
+  if (!s) return 1;
+  if (s->is_wav) return s->eos && s->wbuf_off >= s->wbuf_n;
+  return s->eos && s->carry_off >= s->carry_n;
 }
 
 void audio_mp3_stream_rewind(AudioMp3Stream *s) {
   if (!s) return;
+  /* ADPCM blocks are self-contained, so rewinding is just "block 0 again" --
+   * no predictor state to reset and no reservoir to refill. */
+  s->blk = 0;
+  s->wbuf_n = s->wbuf_off = 0;
   s->pos = s->start;
   s->carry_n = s->carry_off = 0;
   s->eos  = 0;
@@ -548,5 +776,6 @@ void audio_mp3_stream_rewind(AudioMp3Stream *s) {
 void audio_mp3_stream_close(AudioMp3Stream *s) {
   if (!s) return;
   if (s->created) sceAudiodecDeleteDecoder(&s->ctrl);
+  free(s->wbuf);
   free(s);
 }
