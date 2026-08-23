@@ -503,10 +503,71 @@ static void mix_grain(void) {
   memset(g_acc, 0, sizeof g_acc);
 
   lock();
+
+  /* Refill streams before mixing, retiring only what every channel reading them
+   * has already passed. A stream with no live reader is still topped up, so it
+   * is ready the moment the game unpauses it. The feeder runs under this lock
+   * on purpose: it is what makes closing a stream from Snd_release safe.
+   * FEED_MAX_FRAMES is what keeps the hold time short. */
+  for (int i = 0; i < MAX_SOUNDS; i++) {
+    Snd *s = &g_snd[i];
+    if (!s->used || !s->st) continue;
+    uint64_t consumed = (uint64_t)-1;
+    for (int c = 0; c < g_nchannels; c++) {
+      Chan *ch = &g_chan[c];
+      if (ch->used && ch->playing && ch->snd == s) {
+        uint64_t p = (uint64_t)ch->pos;
+        if (p < consumed) consumed = p;
+      }
+    }
+    if (consumed != (uint64_t)-1) audio_ring_retire(&s->st->ring, consumed);
+    audio_ring_feed(&s->st->ring, stream_fill_cb, s->st, FEED_MAX_FRAMES);
+  }
+
   for (int c = 0; c < g_nchannels; c++) {
     Chan *ch = &g_chan[c];
     if (!ch->used || !ch->playing || ch->paused || !ch->snd) continue;
     Snd *s = ch->snd;
+
+    if (s->st) {                      /* streamed: read the decoded window */
+      AudioRing *ring = &s->st->ring;
+      float pan;
+      float g3 = chan_3d_gain(ch, &pan);
+      float v  = ch->vol * g3;
+      float gl = v * (pan <= 0.0f ? 1.0f : 1.0f - pan);
+      float gr = v * (pan >= 0.0f ? 1.0f : 1.0f + pan);
+
+      for (int i = 0; i < OUT_GRAIN; i++) {
+        uint64_t i0 = (uint64_t)ch->pos;
+        float l0, r0, l1, r1;
+        if (!audio_ring_frame(ring, i0, &l0, &r0) ||
+            !audio_ring_frame(ring, i0 + 1, &l1, &r1)) {
+          /* Outside the decoded window. Finish ONLY if the decoder is done AND
+           * the window really is drained: eos is set the moment the decoder hits
+           * the end of the file, while up to RING_FRAMES of already-decoded
+           * audio may still be waiting to be mixed. Finishing on eos alone would
+           * cut the last 0.7 s off every single track.
+           *
+           * Otherwise this is a refill underrun: emit nothing for this sample
+           * but keep the clock moving, so a dropout cannot become drift. */
+          if (ring->eos && i0 + 1 >= ring->base + (uint64_t)ring->fill) {
+            chan_finish(ch);
+            break;
+          }
+          ch->pos += ch->step;
+          g_stream_underruns++;
+          continue;
+        }
+        float frac = (float)(ch->pos - (double)i0);
+        float l = l0 + (l1 - l0) * frac;
+        float r = r0 + (r1 - r0) * frac;
+        g_acc[i * 2]     += (int32_t)(l * gl);
+        g_acc[i * 2 + 1] += (int32_t)(r * gr);
+        ch->pos += ch->step;
+      }
+      continue;
+    }
+
     const int16_t *src = s->pcm.pcm;
     unsigned n = s->pcm.nsamples, sch = s->pcm.channels;
     if (!n) { chan_finish(ch); continue; }
