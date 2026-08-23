@@ -25,6 +25,7 @@
 #include "audio_patch.h"
 #include "bink_patch.h"
 #include "fs_patch.h"
+#include "input_patch.h"
 #include "sdl_patch.h"
 #include "gl_patch.h"
 #include "ime_patch.h"
@@ -153,6 +154,16 @@ static void *watchdog_thread(void *arg) {
         last_mask = m;
         mask_seen = 1;
       }
+    }
+    /* Input census, every fourth tick (12s). Two lines: what the hardware is
+     * doing, and what the game consumed from SDL in the same window. log166 lost
+     * the camera (right stick) and touch while BUTTONS -- same joystick, same
+     * queue -- kept working, and nothing in the log could say whether the pad
+     * stopped reporting, SDL stopped delivering, or the game stopped listening.
+     * These two lines separate those three. */
+    {
+      static unsigned itick = 0;
+      if (itick++ % 4 == 0) { input_probe_census(); sdl_input_census(); }
     }
     log_printf("[vgl] free: vram %u/%u KB, ram %u/%u KB, phycont %u/%u KB",
                (unsigned)(vglMemFree(VGL_MEM_VRAM) / 1024u),
@@ -1894,6 +1905,40 @@ static void *FmodCreateSound_probe(void *self, char *name, int id, void *data,
   n++;
   return FmodCreateSound_orig(self, name, id, data, size, e, f);
 }
+/* Churn detector.
+ *
+ * log167: from t=808 the game created the SAME music stream about 7.5 times a
+ * second for the rest of the session -- 1255 KB pulled out of the OBB each time,
+ * never played, released 23 ms later -- and that is what took Lower City from
+ * 38 fps to 1.5. The per-call log above had spent its 40-line budget by t=100,
+ * so the one thing the log could not tell us was WHICH asset was storming; the
+ * name had to be recovered afterwards by matching byte counts against the OBB.
+ *
+ * This costs a strcmp per CreateStream and prints nothing during normal play:
+ * repeats of the same name only get reported at 16, 64, 256, ... and a run is
+ * summarised when it ends. Unbudgeted on purpose -- a storm that starts in hour
+ * two must still be named. */
+static void createstream_churn(const char *name) {
+  static char last[96];
+  static unsigned run = 0;
+  static unsigned next = 16;
+
+  if (run && !strncmp(last, name, sizeof last - 1)) {
+    if (++run >= next) {
+      log_printf("[snd] CreateStream CHURN: \"%s\" x%u back to back "
+                 "-- the game is re-creating this and not keeping it", last, run);
+      next *= 4;
+    }
+    return;
+  }
+  if (run >= 16)
+    log_printf("[snd] CreateStream churn ended: \"%s\" was created %u times in a row",
+               last, run);
+  snprintf(last, sizeof last, "%s", name ? name : "?");
+  run  = 1;
+  next = 16;
+}
+
 static void *FmodCreateStream_probe(void *self, char *name, void *rw, int c, int d,
                                     int e, int f, int g) {
   static unsigned n = 0;
@@ -1902,6 +1947,7 @@ static void *FmodCreateStream_probe(void *self, char *name, void *rw, int c, int
                "[files open=%d, closes so far=%u]",
                n, name ? name : "?", rw, c, d, e, f, g, io_open_count(), g_nclose);
   n++;
+  createstream_churn(name ? name : "?");
   return FmodCreateStream_orig(self, name, rw, c, d, e, f, g);
 }
 /* Does the companion ever give a stream's OBB handle back?

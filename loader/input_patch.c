@@ -70,6 +70,49 @@ void input_touch_init(void) {
              (unsigned)s_window_id);
 }
 
+/* Raw-hardware witnesses, reported by input_probe_census on the watchdog's
+ * clock. log166 could not tell whether input died in the pad/panel, in SDL, or
+ * in the game, because the only evidence was our own injection log (alive to the
+ * last line) and the game's reaction (absent). These count what the HARDWARE is
+ * doing in the same windows sdl_input_census covers the SDL queue, so the two
+ * lines together localise the break to one of the three layers.
+ *
+ * SDL_PushEvent's return was previously discarded. It returns 0 when the queue
+ * is full, which would drop every finger event while the game kept draining
+ * buttons -- exactly the observed symptom -- and we had no way to see it. */
+static unsigned s_frames = 0;        /* pump calls this window */
+static unsigned s_rstick_frames = 0; /* ... with the right stick off centre */
+static unsigned s_rstick_max = 0;    /* ... peak deflection, 0..127 */
+static unsigned s_touch_frames = 0;  /* ... with a finger on the panel */
+static unsigned s_pushed = 0;        /* finger events handed to SDL */
+static unsigned s_push_fail = 0;     /* ... that SDL refused (queue full) */
+
+void input_probe_census(void) {
+  log_printf("[input] raw: %u frames, rstick off-centre %u (peak %u/127), "
+             "touching %u; pushed %u finger events, %u REFUSED by SDL",
+             s_frames, s_rstick_frames, s_rstick_max, s_touch_frames,
+             s_pushed, s_push_fail);
+  s_frames = s_rstick_frames = s_rstick_max = s_touch_frames = 0;
+  s_pushed = s_push_fail = 0;
+}
+
+/* Read the right stick straight from the pad. main() selects ANALOG_WIDE via
+ * sceCtrlSetSamplingModeExt, so the Ext2 reader is the one that sees analog. */
+static void sample_rstick(void) {
+  SceCtrlData pad;
+  memset(&pad, 0, sizeof(pad));
+  if (sceCtrlPeekBufferPositiveExt2(0, &pad, 1) <= 0) return;
+  int dx = (int)pad.rx - 128, dy = (int)pad.ry - 128;
+  if (dx < 0) dx = -dx;
+  if (dy < 0) dy = -dy;
+  unsigned d = (unsigned)(dx > dy ? dx : dy);
+  /* 32/127 is well outside stick slop and well inside a deliberate push. */
+  if (d > 32) {
+    s_rstick_frames++;
+    if (d > s_rstick_max) s_rstick_max = d;
+  }
+}
+
 static void push_finger(Uint32 type, float nx, float ny) {
   SDL_Event e;
   memset(&e, 0, sizeof(e));
@@ -83,7 +126,8 @@ static void push_finger(Uint32 type, float nx, float ny) {
   e.tfinger.dy = 0.0f;
   e.tfinger.pressure = (type == SDL_FINGERUP) ? 0.0f : 1.0f;
   e.tfinger.windowID = s_window_id;
-  SDL_PushEvent(&e);
+  s_pushed++;
+  if (SDL_PushEvent(&e) <= 0) s_push_fail++;
 }
 
 void input_touch_pump(void) {
@@ -95,6 +139,11 @@ void input_touch_pump(void) {
 
   if (!s_ready)
     return;
+
+  /* Sampled before the IME early-out: the stick keeps meaning something to the
+   * game whether or not the keyboard owns the panel. */
+  s_frames++;
+  sample_rstick();
 
   /* While the on-screen keyboard is up, the panel belongs to it: the taps are
    * aimed at its keys, and forwarding them would also press whatever GUI
@@ -112,6 +161,7 @@ void input_touch_pump(void) {
   SceTouchData td;
   int n = sceTouchPeek(SCE_TOUCH_PORT_FRONT, &td, 1);
   int touching = (n >= 0 && td.reportNum > 0);
+  if (touching) s_touch_frames++;
 
   // log144 spent its whole budget in the first five minutes of a 31-minute
   // session, and log143 -- where the chargen name screen would not advance --

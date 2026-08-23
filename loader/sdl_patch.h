@@ -44,4 +44,9 @@ void sdl_gamepad_probe_init(uintptr_t pressed, uintptr_t this_frame, uintptr_t m
 // The game's current held-button mask, for periodic sampling. 0 if unavailable.
 unsigned sdl_gamepad_mask(void);
 
+// Per-type counts of the events the game actually consumed since the previous
+// call. Drive it from a clock, not from event volume: the failure we are chasing
+// is events NOT arriving, and a volume-triggered summary goes quiet exactly then.
+void sdl_input_census(void);
+
 #endif

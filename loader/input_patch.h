@@ -9,4 +9,9 @@ void input_touch_init(void);
 // state change. Call once per frame (from the swap hook, on the game thread).
 void input_touch_pump(void);
 
+// What the pad and panel are physically doing, and whether SDL accepted the
+// finger events we pushed. Call on a fixed clock (the watchdog), alongside
+// sdl_input_census: together they say which layer input died in.
+void input_probe_census(void);
+
 #endif

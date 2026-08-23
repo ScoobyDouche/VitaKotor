@@ -144,8 +144,17 @@ static void SDL_Delay_hook(Uint32 ms) {
 // Keep the diagnostic value, drop the cost: log the FIRST sighting of each event
 // type (that is the interesting signal -- "a new kind of event started arriving")
 // then only counts, summarised occasionally.
+//
+// log166 then hit the limit of that design. Input died mid-session -- the right
+// stick stopped turning the camera and taps stopped registering -- while BUTTONS
+// kept working (square still toggled stealth at t=408). Counts summarised "every
+// 4096 events" cannot show that: the summary fires on event volume, so the very
+// failure that stops events from arriving also stops the probe that would have
+// reported it, and log166 got two summaries in seven minutes, neither near the
+// break. Report on a CLOCK instead, and report DELTAS: a window with 0x600 at
+// zero is then a printed line rather than a missing one.
 #define EVT_SLOTS 24
-static struct { unsigned type; unsigned n; } g_evt[EVT_SLOTS];
+static struct { unsigned type; unsigned n, reported; } g_evt[EVT_SLOTS];
 static unsigned g_evt_used = 0, g_evt_total = 0;
 
 /* Set by sdl_gamepad_probe_init from main, once libKOTOR is resolved. Volatile:
@@ -254,14 +263,26 @@ static void log_event(const char *via, const SDL_Event *e) {
                (unsigned)e->jhat.value, hat_n);
   }
 
-  if ((++g_evt_total % 4096) == 0) {
-    char buf[256];
-    int p = 0;
-    for (i = 0; i < g_evt_used && p < (int)sizeof(buf) - 24; i++)
-      p += snprintf(buf + p, sizeof(buf) - p, "%s0x%x=%u",
-                    i ? " " : "", g_evt[i].type, g_evt[i].n);
-    log_printf("[input] %u events: %s", g_evt_total, buf);
+  g_evt_total++;
+}
+
+// Called on the watchdog's fixed schedule, NOT on event volume -- see the note
+// above g_evt. Prints what the game actually consumed since the last call, so
+// the interesting line is the one where a type that had been flowing reads 0.
+// Types are still delivered even when nothing is touched (the Vita sticks emit
+// SDL_JOYAXISMOTION continuously), so 0x600=0 means the backend stopped, while
+// 0x600 healthy alongside a frozen camera means the GAME stopped acting on it.
+void sdl_input_census(void) {
+  char buf[256];
+  int p = 0;
+  for (unsigned i = 0; i < g_evt_used && p < (int)sizeof(buf) - 32; i++) {
+    unsigned d = g_evt[i].n - g_evt[i].reported;
+    g_evt[i].reported = g_evt[i].n;
+    p += snprintf(buf + p, sizeof(buf) - p, "%s0x%x=%u", p ? " " : "",
+                  g_evt[i].type, d);
   }
+  log_printf("[input] delivered since last (total %u): %s", g_evt_total,
+             p ? buf : "(no event type has ever arrived)");
 }
 static void SDL_PumpEvents_hook(void) {
   static volatile int n = 0;
