@@ -36,7 +36,11 @@ int audio_mp3_init_library(void) {
   SceAudiodecInitParam p;
   memset(&p, 0, sizeof p);
   p.mp3.size = sizeof(SceAudiodecInitStreamParam);
-  p.mp3.totalStreams = 1;
+  /* A hard pool, not a hint, and fixed for the life of the process: this runs
+   * once and a second call returns 0x807F0002 ("already initialised") without
+   * changing the value. See the constant's comment in audio_mp3.h for what
+   * getting it wrong did to dialogue. */
+  p.mp3.totalStreams = AUDIO_MP3_DECODER_POOL;
   int r = sceAudiodecInitLibrary(SCE_AUDIODEC_TYPE_MP3, &p);
   // 0x807F0002 = already initialised; treat as success.
   if (r < 0 && (unsigned)r != 0x807F0002u) {
@@ -409,4 +413,140 @@ int audio_mp3_decode(const void *data, unsigned len, AudioPcm *out) {
 
 void audio_pcm_free(AudioPcm *p) {
   if (p && p->pcm) { big_free(p->pcm); p->pcm = NULL; }
+}
+
+/* ---- incremental decoding -------------------------------------------------
+ * audio_mp3_decode above turns a whole asset into one PCM block. That is right
+ * for the short clips the game fires constantly, and the cache above it makes
+ * repeats free. It is wrong for music: a track is ~15 MB decoded against a heap
+ * shared with the game, which is why oversized streams used to be replaced with
+ * silence and the score was never audible.
+ *
+ * Streaming keeps the decoder open and pulls frames on demand instead. The
+ * elementary stream must stay alive and unmoved for the lifetime of the handle;
+ * the caller owns it. */
+struct AudioMp3Stream {
+  SceAudiodecCtrl ctrl;
+  SceAudiodecInfo info;
+  const unsigned char *d;
+  unsigned len, start, pos;
+  unsigned ch, rate;
+  int      created, eos, errs;
+  /* One decode call emits a whole granule pair, usually more than the caller
+   * asked for; the remainder waits here rather than being decoded twice. */
+  int16_t  carry[MP3_MAX_SAMPLES * 2];
+  unsigned carry_n, carry_off;             /* in int16 units */
+};
+
+AudioMp3Stream *audio_mp3_stream_open(const void *data, unsigned len, AudioPcm *fmt) {
+  if (!data || !len) return NULL;
+  if (!audio_mp3_init_library()) return NULL;   /* idempotent; sizes the pool */
+
+  /* Reuse the header walk so duration/rate/channels match what the non-stream
+   * path would have reported. */
+  AudioPcm probe;
+  if (!audio_mp3_probe(data, len, &probe)) return NULL;
+
+  const unsigned char *d = (const unsigned char *)data;
+  int off = find_sync(d, len);
+  if (off < 0) return NULL;
+
+  unsigned ver  = (d[off + 1] >> 3) & 3;
+  unsigned sri  = (d[off + 2] >> 2) & 3;
+  unsigned cmod = (d[off + 3] >> 6) & 3;
+  unsigned ch   = (cmod == 3) ? 1 : 2;
+  unsigned rate = rate_of(ver, sri);
+  if (!rate) return NULL;
+
+  AudioMp3Stream *s = (AudioMp3Stream *)calloc(1, sizeof *s);
+  if (!s) return NULL;
+
+  s->d = d; s->len = len; s->start = (unsigned)off; s->pos = (unsigned)off;
+  s->ch = ch; s->rate = rate;
+
+  s->info.mp3.size    = sizeof(SceAudiodecInfoMp3);
+  s->info.mp3.ch      = ch;
+  s->info.mp3.version = ver;
+  s->ctrl.size        = sizeof s->ctrl;
+  s->ctrl.pInfo       = &s->info;          /* must point at storage we keep */
+  s->ctrl.maxEsSize   = SCE_AUDIODEC_MP3_MAX_ES_SIZE;
+  s->ctrl.maxPcmSize  = MP3_MAX_PCM;
+  s->ctrl.wordLength  = SCE_AUDIODEC_WORD_LENGTH_16BITS;
+
+  int r = sceAudiodecCreateDecoder(&s->ctrl, SCE_AUDIODEC_TYPE_MP3);
+  if (r < 0) {
+    log_printf("[snd] stream CreateDecoder failed 0x%08X (ch=%u ver=%u rate=%u)",
+               (unsigned)r, ch, ver, rate);
+    free(s);
+    return NULL;
+  }
+  s->created = 1;
+
+  if (fmt) {
+    fmt->pcm      = NULL;                  /* streaming: no flat buffer */
+    fmt->nsamples = probe.nsamples;
+    fmt->channels = ch;
+    fmt->rate     = rate;
+    fmt->ms       = probe.ms;
+  }
+  return s;
+}
+
+unsigned audio_mp3_stream_read(AudioMp3Stream *s, int16_t *dst, unsigned frames) {
+  if (!s || !dst || !frames || !s->created) return 0;
+  unsigned want = frames * s->ch;          /* int16 units */
+  unsigned got = 0;
+
+  while (got < want) {
+    if (s->carry_off < s->carry_n) {       /* drain leftovers first */
+      unsigned take = s->carry_n - s->carry_off;
+      if (take > want - got) take = want - got;
+      memcpy(dst + got, s->carry + s->carry_off, take * sizeof(int16_t));
+      s->carry_off += take;
+      got += take;
+      continue;
+    }
+    if (s->eos) break;
+
+    s->ctrl.pEs           = (SceUInt8 *)(s->d + s->pos);
+    s->ctrl.inputEsSize   = 0;
+    s->ctrl.pPcm          = s->carry;
+    s->ctrl.outputPcmSize = 0;
+    unsigned avail = (s->pos < s->len) ? s->len - s->pos : 0;
+    if (avail < 4) { s->eos = 1; break; }
+    s->ctrl.maxEsSize = avail < SCE_AUDIODEC_MP3_MAX_ES_SIZE
+                          ? avail : SCE_AUDIODEC_MP3_MAX_ES_SIZE;
+
+    int r = sceAudiodecDecode(&s->ctrl);
+    if (r < 0 || s->ctrl.inputEsSize == 0) {
+      /* Same resync rule as the whole-asset path: a few bad frames at an edge
+       * are normal, a wall of them means the stream is finished or broken. */
+      if (++s->errs > 64) { s->eos = 1; break; }
+      s->pos++;
+      continue;
+    }
+    s->carry_n   = s->ctrl.outputPcmSize / sizeof(int16_t);
+    s->carry_off = 0;
+    s->pos      += s->ctrl.inputEsSize;
+    if (!s->carry_n && s->pos >= s->len) { s->eos = 1; break; }
+  }
+  return got / s->ch;
+}
+
+int audio_mp3_stream_eos(const AudioMp3Stream *s) {
+  return !s || (s->eos && s->carry_off >= s->carry_n);
+}
+
+void audio_mp3_stream_rewind(AudioMp3Stream *s) {
+  if (!s) return;
+  s->pos = s->start;
+  s->carry_n = s->carry_off = 0;
+  s->eos  = 0;
+  s->errs = 0;
+}
+
+void audio_mp3_stream_close(AudioMp3Stream *s) {
+  if (!s) return;
+  if (s->created) sceAudiodecDeleteDecoder(&s->ctrl);
+  free(s);
 }
