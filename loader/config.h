@@ -213,6 +213,20 @@
 // has chased several stalls, so that ceiling matters more than the last few
 // syscalls. Set LOG_BUFFER_KB to 0 for the old unbuffered line-at-a-time
 // behaviour.
+// Diagnostic probe logging. The probes are how every bug in this port has been
+// found, and they are also what fills the card: in log162, twelve periodic tags
+// accounted for about 85% of 17,599 lines across 28 minutes, and that write
+// traffic lands on exactly the loading and combat bursts that stutter.
+//
+// Release builds set this to 0, which drops those lines before they are even
+// formatted -- the tag is a literal prefix of the format string, so the test is
+// a few string compares and no vsnprintf, no lock, no card I/O. Anything whose
+// format mentions a failure, an error or a warning is kept regardless, as is
+// everything written in panic mode, so a crash report is still worth reading.
+//
+// Set to 1 to get the full trace back for a debugging session.
+#define LOG_DIAGNOSTICS 0
+
 #define LOG_BUFFER_KB  8
 #define LOG_FLUSH_MS   1000
 
