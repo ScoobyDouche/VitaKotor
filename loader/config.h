@@ -351,7 +351,10 @@
 // stereo image -- inaudible as a defect, wrong every time. Left-handed takes
 // up x forward, right-handed forward x up. The first listener update prints the
 // resulting basis so it can be checked against known geometry on hardware.
-// Set to 1 if positional audio comes out mirrored.
+// VERIFIED, do not flip on a hunch: FModAudioSystem::InitSystem passes flags=0
+// to FMOD::System::init (an immediate `movs r2, #0` before the call), so
+// FMOD_INIT_3D_RIGHTHANDED is not set and the game is left-handed. If the
+// stereo image ever sounds mirrored, the cause is elsewhere.
 #define AUDIO_3D_RIGHTHANDED 0
 
 // Stream long audio assets instead of replacing them with timed silence.

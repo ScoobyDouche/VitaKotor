@@ -454,6 +454,18 @@ static unsigned g_lis_degenerate = 0;
 /* Gain census: is attenuation reasonable, or is it burying everything? */
 static unsigned g_g3_n = 0, g_g3_loud = 0, g_g3_quiet = 0;
 static float    g_g3_min = 1.0f, g_g3_max = 0.0f, g_dist_max = 0.0f;
+/* Volume census. The mixer computes v = ch->vol * g3, and nothing has ever
+ * logged ch->vol -- so "3D sounds are too quiet" has stayed a hypothesis. The
+ * discriminator is whether the 3D volumes VARY: a spread means the game is
+ * attenuating by distance itself and we are doubling it, while a single
+ * constant means the game expects FMOD's 3D system to supply the rest and we
+ * are taking its base literally. min == max answers that on its own. */
+static unsigned g_vol_n2d = 0, g_vol_n3d = 0;
+static float    g_vol_min2d = 1.0f, g_vol_max2d = 0.0f, g_vol_sum2d = 0.0f;
+static float    g_vol_min3d = 1.0f, g_vol_max3d = 0.0f, g_vol_sum3d = 0.0f;
+/* What actually reaches the bus, per channel per grain, after 3D gain. */
+static unsigned g_mix_n2d = 0, g_mix_n3d = 0;
+static float    g_mix_sum2d = 0.0f, g_mix_sum3d = 0.0f;
 
 /* Caller holds the lock. Returns linear gain and writes a pan in [-1,1]. */
 static float chan_3d_gain(const Chan *c, float *pan_out) {
@@ -534,6 +546,8 @@ static void mix_grain(void) {
       float pan;
       float g3 = chan_3d_gain(ch, &pan);
       float v  = ch->vol * g3;
+      if (s->is3d) { g_mix_n3d++; g_mix_sum3d += v; }
+      else         { g_mix_n2d++; g_mix_sum2d += v; }
       float gl = v * (pan <= 0.0f ? 1.0f : 1.0f - pan);
       float gr = v * (pan >= 0.0f ? 1.0f : 1.0f + pan);
 
@@ -581,6 +595,8 @@ static void mix_grain(void) {
     float pan;
     float g3 = chan_3d_gain(ch, &pan);
     float v  = ch->vol * g3;
+    if (s->is3d) { g_mix_n3d++; g_mix_sum3d += v; }
+    else         { g_mix_n2d++; g_mix_sum2d += v; }
     float gl = v * (pan <= 0.0f ? 1.0f : 1.0f - pan);
     float gr = v * (pan >= 0.0f ? 1.0f : 1.0f + pan);
 
@@ -1145,6 +1161,10 @@ have_pcm:;
                  "gain n=%u min=%.3f max=%.3f loud=%u quiet=%u maxdist=%.0f, "
                  "playSound %u calls / %u badsnd / %u nochan, "
                  "limiter gain %.3f (min %.3f), %u of %u grains over (peak %d = %.1fx), "
+                 "vol2d n=%u min=%.3f max=%.3f avg=%.3f, "
+                 "vol3d n=%u min=%.3f max=%.3f avg=%.3f, "
+                 "bus2d avg=%.3f over %u, bus3d avg=%.3f over %u, "
+                 "streams %u opened / %d live / %u underruns, "
                  "chans %d used / %d playing / %d endPending of %d",
                  n, g_cache_hits, g_cache_miss, g_pcm_bytes / 1024, g_missing,
                  g_steals, g_steals_live, g_ends_fired, g_updates, g_played,
@@ -1156,6 +1176,13 @@ have_pcm:;
                  g_play_calls, g_play_badsnd, g_play_nochan,
                  g_lim_gain, g_lim_min, g_lim_clipped, g_lim_grains,
                  (int)g_lim_peak, (double)g_lim_peak / 32767.0,
+                 g_vol_n2d, g_vol_min2d, g_vol_max2d,
+                 g_vol_n2d ? g_vol_sum2d / (float)g_vol_n2d : 0.0f,
+                 g_vol_n3d, g_vol_min3d, g_vol_max3d,
+                 g_vol_n3d ? g_vol_sum3d / (float)g_vol_n3d : 0.0f,
+                 g_mix_n2d ? g_mix_sum2d / (float)g_mix_n2d : 0.0f, g_mix_n2d,
+                 g_mix_n3d ? g_mix_sum3d / (float)g_mix_n3d : 0.0f, g_mix_n3d,
+                 g_streams_open, g_stream_decoders, g_stream_underruns,
                  nused, nplaying, npend, g_nchannels);
   }
 
@@ -1297,9 +1324,21 @@ static int Ch_setPaused(void *self, int paused) {
 }
 static int Ch_setVolume(void *self, uint32_t v) {          /* softfp float */
   if (!chan_valid(self)) return FMOD_ERR_INVALID_PARAM;
+  Chan *c = (Chan *)self;
   float f = u2f(v);
   if (f < 0.0f) f = 0.0f; else if (f > 1.0f) f = 1.0f;
-  ((Chan *)self)->vol = f;
+  c->vol = f;
+  if (c->snd && c->snd->is3d) {
+    g_vol_n3d++;
+    g_vol_sum3d += f;
+    if (f < g_vol_min3d) g_vol_min3d = f;
+    if (f > g_vol_max3d) g_vol_max3d = f;
+  } else {
+    g_vol_n2d++;
+    g_vol_sum2d += f;
+    if (f < g_vol_min2d) g_vol_min2d = f;
+    if (f > g_vol_max2d) g_vol_max2d = f;
+  }
   return FMOD_OK;
 }
 static int Ch_setPan(void *self, uint32_t v) {             /* softfp float */
