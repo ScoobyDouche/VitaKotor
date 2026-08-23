@@ -302,3 +302,26 @@
 // Set to 0 to restore the untouched extents.
 #define GUI_AUTOSCALE_UNSCALED_IMAGES 1
 
+// Spatial audio. All four FMOD 3D entry points -- set3DAttributes,
+// set3DMinMaxDistance, set3DListenerAttributes, set3DOcclusion -- were
+// fmod_stub, so no positional sound ever attenuated with distance or panned:
+// rushing water across the level played at the same level as water underfoot,
+// and footsteps and dialogue sat under the ambience. log155 marks 418 of 617
+// logged sounds FMOD_3D, so this is most of the mix, not an edge case.
+//
+// Implements FMOD Ex's default inverse rolloff (gain = mindistance/distance,
+// flat inside mindistance, floored -- not silenced -- past maxdistance) plus a
+// pan projected onto the listener's right vector. 2D sounds are untouched by
+// design: music, UI and the ambient bed carry no position and play flat.
+// Set to 0 to go back to every source at full volume, dead centre.
+#define AUDIO_3D_ATTENUATION 1
+
+// Handedness of the 3D listener basis. FMOD Ex is left-handed by default and
+// only switches when the game passes FMOD_INIT_3D_RIGHTHANDED to System::init.
+// The two conventions produce exactly opposite right vectors, i.e. a mirrored
+// stereo image -- inaudible as a defect, wrong every time. Left-handed takes
+// up x forward, right-handed forward x up. The first listener update prints the
+// resulting basis so it can be checked against known geometry on hardware.
+// Set to 1 if positional audio comes out mirrored.
+#define AUDIO_3D_RIGHTHANDED 0
+

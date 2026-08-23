@@ -59,7 +59,9 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
+#include "config.h"
 #include "audio_patch.h"
 #include "audio_mp3.h"
 #include "bigalloc.h"
@@ -138,6 +140,7 @@ typedef struct {
 
 typedef struct {
   int       used;
+  int       is3d;                          /* created with FMOD_3D: attenuates */
   PcmEntry *ent;                           /* owns a reference */
   AudioPcm  pcm;                           /* borrowed copy of ent->pcm */
 } Snd;
@@ -158,6 +161,10 @@ typedef struct {
   void  *userdata;
   chan_cb cb;                             /* FModAudioSystem::ChannelCallback */
   int    end_pending;                     /* finished naturally, END not yet sent */
+  float  px, py, pz;                      /* emitter position, world units */
+  float  mindist, maxdist;                /* rolloff range; FMOD defaults 1 / 10000 */
+  float  occl;                            /* direct occlusion, 0 = clear path */
+  int    has_pos;                         /* set3DAttributes has been called */
 } Chan;
 
 static Snd      g_snd[MAX_SOUNDS];
@@ -302,6 +309,53 @@ static void chan_finish(Chan *c) {
   c->end_pending = 1;
 }
 
+/* ---- 3D attenuation --------------------------------------------------------
+ * All four FMOD 3D entry points used to be fmod_stub, so nothing in the game's
+ * spatial audio reached the mixer: every positional source played at whatever
+ * channel volume it was given, with no rolloff and no pan. On hardware that is
+ * rushing water across the level sitting at the same level as water underfoot,
+ * footsteps and dialogue buried under ambience, and no directional cue at all.
+ * It is not subtle -- log155 marks 418 of 617 logged sounds FMOD_3D.
+ *
+ * FMOD Ex's default rolloff is inverse: gain = mindistance / distance, held at
+ * 1 inside mindistance, and -- this part is easy to get wrong -- NOT silent past
+ * maxdistance. maxdistance is where attenuation STOPS, so the gain floors at
+ * mindistance/maxdistance and stays there. Match that rather than inventing a
+ * curve, because the game picks its min/max per source expecting it.
+ *
+ * 2D sounds (music, UI, the global ambient bed) are deliberately untouched:
+ * they carry no position and are meant to play flat. */
+static float g_lis_px = 0.0f, g_lis_py = 0.0f, g_lis_pz = 0.0f;
+static float g_lis_rx = 1.0f, g_lis_ry = 0.0f, g_lis_rz = 0.0f;   /* right vector */
+static unsigned g_lis_sets = 0, g_pos_sets = 0, g_mm_sets = 0;
+
+/* Caller holds the lock. Returns linear gain and writes a pan in [-1,1]. */
+static float chan_3d_gain(const Chan *c, float *pan_out) {
+  *pan_out = c->pan;
+  if (!AUDIO_3D_ATTENUATION) return 1.0f;
+  if (!c->snd || !c->snd->is3d || !c->has_pos) return 1.0f;
+
+  float dx = c->px - g_lis_px, dy = c->py - g_lis_py, dz = c->pz - g_lis_pz;
+  float d2 = dx * dx + dy * dy + dz * dz;
+  float d  = (d2 > 0.0f) ? sqrtf(d2) : 0.0f;
+
+  float mn = (c->mindist > 0.0f) ? c->mindist : 1.0f;
+  float mx = (c->maxdist > mn)   ? c->maxdist : 10000.0f;
+  float dd = d < mn ? mn : (d > mx ? mx : d);
+  float g  = mn / dd;
+
+  if (c->occl > 0.0f) g *= (1.0f - (c->occl > 1.0f ? 1.0f : c->occl));
+
+  /* Pan by projecting the direction onto the listener's right vector. At the
+   * listener's own position there is no direction, so stay centred. */
+  if (d > 0.0001f) {
+    float p = (dx * g_lis_rx + dy * g_lis_ry + dz * g_lis_rz) / d;
+    if (p < -1.0f) p = -1.0f; else if (p > 1.0f) p = 1.0f;
+    *pan_out = p;
+  }
+  return g;
+}
+
 /* ---- mixer ---------------------------------------------------------------- */
 static int32_t g_acc[OUT_GRAIN * OUT_CH];
 static int16_t g_out[OUT_GRAIN * OUT_CH];
@@ -324,8 +378,11 @@ static void mix_grain(void) {
     }
 
     /* pan -1 = hard left, +1 = hard right */
-    float gl = ch->vol * (ch->pan <= 0.0f ? 1.0f : 1.0f - ch->pan);
-    float gr = ch->vol * (ch->pan >= 0.0f ? 1.0f : 1.0f + ch->pan);
+    float pan;
+    float g3 = chan_3d_gain(ch, &pan);
+    float v  = ch->vol * g3;
+    float gl = v * (pan <= 0.0f ? 1.0f : 1.0f - pan);
+    float gr = v * (pan >= 0.0f ? 1.0f : 1.0f + pan);
 
     for (int i = 0; i < OUT_GRAIN; i++) {
       unsigned i0 = (unsigned)ch->pos;
@@ -497,6 +554,8 @@ static int chan_valid(const void *p) { return p >= (void *)g_chan && p < (void *
 #define FMOD_TIMEUNIT_PCM  0x00000002
 #define FMOD_CREATESTREAM  0x00000080
 #define FMOD_OPENMEMORY    0x00000800
+#define FMOD_2D            0x00000008
+#define FMOD_3D            0x00000010
 
 static int fmod_stub(void) { return FMOD_OK; }
 
@@ -808,11 +867,13 @@ have_pcm:;
                  "%u END sent over %u updates, %u playSound, "
                  "%u END on steal / %u lost, "
                  "%u release killed %u live / %u pending, "
+                 "3D %u listener / %u pos / %u minmax, "
                  "chans %d used / %d playing / %d endPending of %d",
                  n, g_cache_hits, g_cache_miss, g_pcm_bytes / 1024, g_missing,
                  g_steals, g_steals_live, g_ends_fired, g_updates, g_played,
                  g_ends_rescued, g_ends_lost,
                  g_rel_calls, g_rel_kill_live, g_rel_kill_pend,
+                 g_lis_sets, g_pos_sets, g_mm_sets,
                  nused, nplaying, npend, g_nchannels);
   }
 
@@ -820,6 +881,7 @@ have_pcm:;
   Snd *s = snd_alloc();
   unlock();
   if (!s) { lock(); cache_release(ent); unlock(); return FMOD_ERR_INVALID_PARAM; }
+  s->is3d = (mode & FMOD_3D) ? 1 : 0;
   s->ent = ent;
   s->pcm = ent->pcm;                 /* borrowed: the cache owns the samples */
   *out = s;
@@ -853,6 +915,10 @@ static int Sys_playSound(void *self, void *sound, void *group, int paused, void 
     c->pan     = 0.0f;
     c->paused  = paused ? 1 : 0;
     c->playing = 1;
+    c->mindist = 1.0f;                 /* FMOD defaults until the game says else */
+    c->maxdist = 10000.0f;
+    c->occl    = 0.0f;
+    c->has_pos = 0;
   }
   unlock();
   if (!c) return FMOD_ERR_INVALID_PARAM;
@@ -995,6 +1061,86 @@ static int Ch_getUserData(void *self, void **ud) {
   return FMOD_OK;
 }
 
+/* FMOD_VECTOR is three floats and arrives BY POINTER, so unlike setVolume these
+ * need no softfp shim -- only the scalar float entry points below do. */
+typedef struct { float x, y, z; } FmodVec;
+
+static int Ch_set3DAttributes(void *self, const FmodVec *pos, const FmodVec *vel) {
+  (void)vel;                                  /* no doppler: nothing reads velocity */
+  if (!chan_valid(self)) return FMOD_ERR_INVALID_PARAM;
+  if (!pos) return FMOD_OK;
+  Chan *c = (Chan *)self;
+  lock();
+  c->px = pos->x; c->py = pos->y; c->pz = pos->z;
+  c->has_pos = 1;
+  unlock();
+  g_pos_sets++;
+  return FMOD_OK;
+}
+
+/* Both parameters are floats in core registers (softfp caller). */
+static int Ch_set3DMinMaxDistance(void *self, uint32_t mn, uint32_t mx) {
+  if (!chan_valid(self)) return FMOD_ERR_INVALID_PARAM;
+  Chan *c = (Chan *)self;
+  float fmn = u2f(mn), fmx = u2f(mx);
+  lock();
+  if (fmn > 0.0f)   c->mindist = fmn;
+  if (fmx > fmn)    c->maxdist = fmx;
+  unlock();
+  g_mm_sets++;
+  return FMOD_OK;
+}
+
+static int Ch_set3DOcclusion(void *self, uint32_t direct, uint32_t reverb) {
+  (void)reverb;                               /* no reverb bus to occlude */
+  if (!chan_valid(self)) return FMOD_ERR_INVALID_PARAM;
+  float d = u2f(direct);
+  ((Chan *)self)->occl = (d < 0.0f) ? 0.0f : (d > 1.0f ? 1.0f : d);
+  return FMOD_OK;
+}
+
+/* The listener's basis. right = forward x up, which is what a pan projects
+ * onto; KOTOR hands us an already-orthonormal pair, but normalise anyway so a
+ * denormal frame cannot turn into a silent divide. */
+static int Sys_set3DListenerAttributes(void *self, int listener, const FmodVec *pos,
+                                       const FmodVec *vel, const FmodVec *fwd,
+                                       const FmodVec *up) {
+  (void)self; (void)vel;
+  if (listener != 0) return FMOD_OK;          /* single-listener game */
+  lock();
+  if (pos) { g_lis_px = pos->x; g_lis_py = pos->y; g_lis_pz = pos->z; }
+  if (fwd && up) {
+    /* FMOD is LEFT-handed unless the game passes FMOD_INIT_3D_RIGHTHANDED, and
+     * the two orders give exactly opposite right vectors -- a silently mirrored
+     * stereo image, which is the kind of thing nobody notices and everybody
+     * feels. Left-handed wants up x forward; right-handed wants forward x up. */
+    float rx, ry, rz;
+#if AUDIO_3D_RIGHTHANDED
+    rx = fwd->y * up->z - fwd->z * up->y;
+    ry = fwd->z * up->x - fwd->x * up->z;
+    rz = fwd->x * up->y - fwd->y * up->x;
+#else
+    rx = up->y * fwd->z - up->z * fwd->y;
+    ry = up->z * fwd->x - up->x * fwd->z;
+    rz = up->x * fwd->y - up->y * fwd->x;
+#endif
+    float len = sqrtf(rx * rx + ry * ry + rz * rz);
+    if (len > 0.0001f) { g_lis_rx = rx / len; g_lis_ry = ry / len; g_lis_rz = rz / len; }
+  }
+  unlock();
+  /* Print the basis once: it is the one number here that cannot be checked
+   * without hardware, and a mirrored image is invisible in any counter. */
+  if (g_lis_sets == 0)
+    log_printf("[snd] listener basis: fwd=(%.2f,%.2f,%.2f) up=(%.2f,%.2f,%.2f) "
+               "-> right=(%.2f,%.2f,%.2f) [%s]",
+               fwd ? fwd->x : 0.0f, fwd ? fwd->y : 0.0f, fwd ? fwd->z : 0.0f,
+               up ? up->x : 0.0f, up ? up->y : 0.0f, up ? up->z : 0.0f,
+               g_lis_rx, g_lis_ry, g_lis_rz,
+               AUDIO_3D_RIGHTHANDED ? "right-handed" : "left-handed");
+  g_lis_sets++;
+  return FMOD_OK;
+}
+
 /* OpenSLES interface IDs are data objects the engine dereferences by address;
  * a stable dummy address per IID is enough to satisfy relocation. */
 static const uint32_t sl_iid_engine      = 0;
@@ -1026,7 +1172,7 @@ static const so_default_dynlib audio_dynlib[] = {
   { "_ZN4FMOD6System13getNumDriversEPi", (uintptr_t)&Sys_getNumDrivers },
   { "_ZN4FMOD6System13setFileSystemEPF11FMOD_RESULTPKcPjPPvS5_EPFS1_S5_S5_EPFS1_S5_S5_jS4_S5_EPFS1_S5_jS5_EPFS1_P18FMOD_ASYNCREADINFOS5_ESI_i", (uintptr_t)&Sys_setFileSystem },
   { "_ZN4FMOD6System19setStreamBufferSizeEjj", (uintptr_t)&fmod_stub },
-  { "_ZN4FMOD6System23set3DListenerAttributesEiPK11FMOD_VECTORS3_S3_S3_", (uintptr_t)&fmod_stub },
+  { "_ZN4FMOD6System23set3DListenerAttributesEiPK11FMOD_VECTORS3_S3_S3_", (uintptr_t)&Sys_set3DListenerAttributes },
   { "_ZN4FMOD5Sound7releaseEv", (uintptr_t)&Snd_release },
   { "_ZN4FMOD5Sound9getLengthEPjj", (uintptr_t)&Snd_getLength },
   { "_ZN4FMOD5Sound11setUserDataEPv", (uintptr_t)&fmod_stub },
@@ -1041,9 +1187,9 @@ static const so_default_dynlib audio_dynlib[] = {
   { "_ZN4FMOD14ChannelControl9setVolumeEf", (uintptr_t)&Ch_setVolume },  // softfp
   { "_ZN4FMOD14ChannelControl11getUserDataEPPv", (uintptr_t)&Ch_getUserData },
   { "_ZN4FMOD14ChannelControl11setUserDataEPv", (uintptr_t)&Ch_setUserData },
-  { "_ZN4FMOD14ChannelControl14set3DOcclusionEff", (uintptr_t)&fmod_stub },
-  { "_ZN4FMOD14ChannelControl15set3DAttributesEPK11FMOD_VECTORS3_S3_", (uintptr_t)&fmod_stub },
-  { "_ZN4FMOD14ChannelControl19set3DMinMaxDistanceEff", (uintptr_t)&fmod_stub },
+  { "_ZN4FMOD14ChannelControl14set3DOcclusionEff", (uintptr_t)&Ch_set3DOcclusion },
+  { "_ZN4FMOD14ChannelControl15set3DAttributesEPK11FMOD_VECTORS3_S3_", (uintptr_t)&Ch_set3DAttributes },
+  { "_ZN4FMOD14ChannelControl19set3DMinMaxDistanceEff", (uintptr_t)&Ch_set3DMinMaxDistance },
   { "_ZN4FMOD14ChannelControl11setCallbackEPF11FMOD_RESULTP19FMOD_CHANNELCONTROL24FMOD_CHANNELCONTROL_TYPE33FMOD_CHANNELCONTROL_CALLBACK_TYPEPvS6_E", (uintptr_t)&Ch_setCallback },
 };
 
