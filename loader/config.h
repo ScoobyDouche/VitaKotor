@@ -218,14 +218,19 @@
 // accounted for about 85% of 17,599 lines across 28 minutes, and that write
 // traffic lands on exactly the loading and combat bursts that stutter.
 //
-// Release builds set this to 0, which drops those lines before they are even
-// formatted -- the tag is a literal prefix of the format string, so the test is
-// a few string compares and no vsnprintf, no lock, no card I/O. Anything whose
-// format mentions a failure, an error or a warning is kept regardless, as is
-// everything written in panic mode, so a crash report is still worth reading.
+// SHIPPED BUILDS KEEP THIS ON. The log is how players report faults: they post
+// ux0:data/kotor/log.txt and that is what makes a bug fixable by someone who
+// was not holding the console. A quiet release trades away the entire support
+// path to buy back some card I/O, which is a bad trade and not one to make
+// again without asking.
 //
-// Set to 1 to get the full trace back for a debugging session.
-#define LOG_DIAGNOSTICS 0
+// Set to 0 only to measure what the logging itself costs, or for a build made
+// for one person who is chasing framerate. When it is 0, lines are dropped
+// before they are even formatted -- the tag is a literal prefix of the format
+// string, so the test is a few byte compares and no vsnprintf, no lock, no
+// card I/O -- and anything whose format mentions a failure, an error or a
+// warning is kept regardless, as is everything written in panic mode.
+#define LOG_DIAGNOSTICS 1
 
 #define LOG_BUFFER_KB  8
 #define LOG_FLUSH_MS   1000
