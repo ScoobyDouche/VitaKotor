@@ -40,6 +40,7 @@ add_executable(KOTOR
   loader/jni_patch.c
   loader/audio_patch.c
   loader/audio_mp3.c
+  loader/audio_ring.c
   loader/bink_patch.c
   loader/fs_patch.c
   loader/sdl_patch.c
