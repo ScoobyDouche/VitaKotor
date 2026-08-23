@@ -213,6 +213,20 @@
 // has chased several stalls, so that ceiling matters more than the last few
 // syscalls. Set LOG_BUFFER_KB to 0 for the old unbuffered line-at-a-time
 // behaviour.
+// Diagnostic probe logging. The probes are how every bug in this port has been
+// found, and they are also what fills the card: in log162, twelve periodic tags
+// accounted for about 85% of 17,599 lines across 28 minutes, and that write
+// traffic lands on exactly the loading and combat bursts that stutter.
+//
+// Release builds set this to 0, which drops those lines before they are even
+// formatted -- the tag is a literal prefix of the format string, so the test is
+// a few string compares and no vsnprintf, no lock, no card I/O. Anything whose
+// format mentions a failure, an error or a warning is kept regardless, as is
+// everything written in panic mode, so a crash report is still worth reading.
+//
+// Set to 1 to get the full trace back for a debugging session.
+#define LOG_DIAGNOSTICS 0
+
 #define LOG_BUFFER_KB  8
 #define LOG_FLUSH_MS   1000
 
@@ -236,6 +250,33 @@
 // Set to 0 if textures ever look wrong, to rule this out.
 #define GL_FILTER_REDUNDANT_BINDS 1
 
+// Skip glUseProgram calls that re-select the program already current. vitaGL's
+// glUseProgram does no GXM work but marks every uniform dirty, so a redundant
+// one costs a full uniform re-upload (u_boneMatrices[51] included) on the next
+// draw. The Undercity makes ~43 of these a frame across ten programs total.
+// MEASURED 0% IN log151: the game alternates programs genuinely and essentially
+// never re-selects the current one, so this saves nothing in practice. Kept
+// because it is one comparison and correct, not because it earned its place --
+// the real cost is that ~2700 GENUINE switches per window each force a full
+// uniform re-upload, and that cannot be filtered away from here.
+// Set to 0 if lighting or skinning ever looks stale, to rule this out.
+#define GL_FILTER_REDUNDANT_PROGS 1
+
+// Pad NPOT texture widths to a multiple of 8 on upload. Added to prove the
+// background-shear theory, and it did. The pad leaves the texture wider than
+// the game believes, so a quad sampling u across [0,1] also covers the pad;
+// it now RESAMPLES the row onto the padded width rather than extending the
+// last column, so [0,1] still spans the whole picture at any size.
+//
+// That resample was aimed at the oversized minimap and the fog panel in the
+// character screens, and it did NOT fix them -- log156 shows 81 resampled
+// uploads (2x2, 4x4, 90x70, 756x106, 860x478) with both boxes unchanged on
+// screen. Keep the resample anyway: it is strictly more correct than the smear
+// it replaced, and the tiny gradients it was mangling were real. But the boxes
+// are NOT the upload pad, so do not come back here for them. The real fix for
+// the shear this exists to mask is strided texture init in vitaGL.
+#define GL_NPOT_WIDTH_PAD 1
+
 // Skinning bisect: force the ubershader's `#define USE_SKIN 1` to 0 in
 // glShaderSource, bypassing kotor.vert's dynamic uniform-array read
 // (u_boneMatrices[indices.x]) while leaving everything else identical.
@@ -255,3 +296,77 @@
 #define SKIN_INDEX_ROUND_FIX 0
 
 #endif
+
+// Scale GUI images that never went through ScaleExtentForResolution.
+//
+// log157 asked, per widget, whether it had been scaled, and every image at or
+// above 200x200 came back NO -- while 138 other widgets in the same screen had
+// been scaled normally. Two of the three are the pillarbox wings, which arrive
+// at exactly the screen height (217x544 at x=-100 and x=843) and are already in
+// device pixels; shrinking those would be wrong, so anything at or above the
+// screen height is left alone. The third is a 238x238 image that is neither a
+// texture size nor a device-space number, and 238 x 0.7083 is 169: an element
+// left at authored size inside a frame the game scaled by 544/768 is 1.41x too
+// big for it, which is exactly how far the minimap overflows its frame.
+//
+// TESTED AND DISPROVED (log158). The rescale fired exactly once, on precisely
+// the widget it was aimed at -- "autoscaled self=0x85b42738 238x238 by x0.7083"
+// -- and the minimap was unchanged on screen. So either that widget is not the
+// minimap, or its size was never the problem. Either way the extent path is now
+// finished as an explanation for these boxes: scaling is applied correctly to
+// the 138 widgets that get it, and forcing it onto the ones that skip it fixes
+// nothing.
+//
+// Left at 0. It is a speculative mutation of widget geometry with no evidence
+// behind it any more, and shipping one of those is worse than the bug.
+//
+// Next suspect is blending, not geometry: the haze bands line up with the UI
+// slots and read like additive overlays drawn opaque, and KOTOR stores
+// per-texture blend modes in .txi files -- of which log157 shows a great many
+// missing.
+#define GUI_AUTOSCALE_UNSCALED_IMAGES 0
+
+// Spatial audio. All four FMOD 3D entry points -- set3DAttributes,
+// set3DMinMaxDistance, set3DListenerAttributes, set3DOcclusion -- were
+// fmod_stub, so no positional sound ever attenuated with distance or panned:
+// rushing water across the level played at the same level as water underfoot,
+// and footsteps and dialogue sat under the ambience. log155 marks 418 of 617
+// logged sounds FMOD_3D, so this is most of the mix, not an edge case.
+//
+// Implements FMOD Ex's default inverse rolloff (gain = mindistance/distance,
+// flat inside mindistance, floored -- not silenced -- past maxdistance) plus a
+// pan projected onto the listener's right vector. 2D sounds are untouched by
+// design: music, UI and the ambient bed carry no position and play flat.
+// Set to 0 to go back to every source at full volume, dead centre.
+#define AUDIO_3D_ATTENUATION 1
+
+// Handedness of the 3D listener basis. FMOD Ex is left-handed by default and
+// only switches when the game passes FMOD_INIT_3D_RIGHTHANDED to System::init.
+// The two conventions produce exactly opposite right vectors, i.e. a mirrored
+// stereo image -- inaudible as a defect, wrong every time. Left-handed takes
+// up x forward, right-handed forward x up. The first listener update prints the
+// resulting basis so it can be checked against known geometry on hardware.
+// Set to 1 if positional audio comes out mirrored.
+#define AUDIO_3D_RIGHTHANDED 0
+
+// Upload textures as 16-bit instead of 32-bit.
+//
+// The live-texture census (log161) is emphatic that nothing leaks: 1,014,190 KB
+// uploaded against 920,002 KB released over 28 minutes, balancing to the byte.
+// The problem is that the working set does not FIT -- it peaks at 102,639 KB
+// against the Vita's fixed 96 MB of CDRAM -- so vitaGL evicts and re-uploads
+// continuously, runs at a few hundred KB free, and the picture starts tearing.
+// VRAM cannot be raised to meet it; MEMORY_VITAGL_THRESHOLD_MB governs system
+// RAM, not CDRAM. The only lever is making the textures smaller.
+//
+// RGBA8 -> RGBA4444 and RGB8 -> RGB565 halves the footprint to roughly 51 MB,
+// which fits with room to spare. Ordered 4x4 Bayer dithering keeps the banding
+// down; without it, gradients and skies posterise badly at 4 bits a channel.
+//
+// Render targets and cube maps are left alone: an FBO's attachment format is
+// not ours to change, and the environment map is 64x64x6 and not worth the
+// risk. Textures we convert are remembered per id so glTexSubImage2D can
+// match, since a byte-typed sub-upload into a 4444 texture would corrupt it.
+// Set to 0 to go back to full-precision uploads.
+#define GL_TEX16_CONVERT 1
+

@@ -59,7 +59,9 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
+#include "config.h"
 #include "audio_patch.h"
 #include "audio_mp3.h"
 #include "bigalloc.h"
@@ -79,6 +81,13 @@
  * log what is actually requested. Mixing cost is per PLAYING channel, so a large
  * pool is nearly free. */
 #define MAX_CHANNELS 96
+/* The tail of g_chan is not playable: it is where a voice about to be stolen
+ * parks its undelivered END so System::update can still hand it to the game.
+ * See chan_retire. Reserving it inside g_chan (rather than a separate array)
+ * keeps chan_valid -- and therefore getUserData/isPlaying, which the game calls
+ * from inside HandleChannelEnd -- working on a retired voice for free. */
+#define RETIRE_SLOTS      32
+#define MAX_PLAY_CHANNELS (MAX_CHANNELS - RETIRE_SLOTS)
 #define MAX_SOUNDS   128
 
 /* Streams decode whole: a 4-minute track at 32 kHz mono is ~15 MB of PCM. The
@@ -131,6 +140,7 @@ typedef struct {
 
 typedef struct {
   int       used;
+  int       is3d;                          /* created with FMOD_3D: attenuates */
   PcmEntry *ent;                           /* owns a reference */
   AudioPcm  pcm;                           /* borrowed copy of ent->pcm */
 } Snd;
@@ -151,6 +161,10 @@ typedef struct {
   void  *userdata;
   chan_cb cb;                             /* FModAudioSystem::ChannelCallback */
   int    end_pending;                     /* finished naturally, END not yet sent */
+  float  px, py, pz;                      /* emitter position, world units */
+  float  mindist, maxdist;                /* rolloff range; FMOD defaults 1 / 10000 */
+  float  occl;                            /* direct occlusion, 0 = clear path */
+  int    has_pos;                         /* set3DAttributes has been called */
 } Chan;
 
 static Snd      g_snd[MAX_SOUNDS];
@@ -295,7 +309,81 @@ static void chan_finish(Chan *c) {
   c->end_pending = 1;
 }
 
+/* ---- 3D attenuation --------------------------------------------------------
+ * All four FMOD 3D entry points used to be fmod_stub, so nothing in the game's
+ * spatial audio reached the mixer: every positional source played at whatever
+ * channel volume it was given, with no rolloff and no pan. On hardware that is
+ * rushing water across the level sitting at the same level as water underfoot,
+ * footsteps and dialogue buried under ambience, and no directional cue at all.
+ * It is not subtle -- log155 marks 418 of 617 logged sounds FMOD_3D.
+ *
+ * FMOD Ex's default rolloff is inverse: gain = mindistance / distance, held at
+ * 1 inside mindistance, and -- this part is easy to get wrong -- NOT silent past
+ * maxdistance. maxdistance is where attenuation STOPS, so the gain floors at
+ * mindistance/maxdistance and stays there. Match that rather than inventing a
+ * curve, because the game picks its min/max per source expecting it.
+ *
+ * 2D sounds (music, UI, the global ambient bed) are deliberately untouched:
+ * they carry no position and are meant to play flat. */
+static float g_lis_px = 0.0f, g_lis_py = 0.0f, g_lis_pz = 0.0f;
+static float g_lis_rx = 1.0f, g_lis_ry = 0.0f, g_lis_rz = 0.0f;   /* right vector */
+static unsigned g_lis_sets = 0, g_pos_sets = 0, g_mm_sets = 0;
+/* log159's first listener update carried fwd=(0,0,0) up=(0,0,0), so the cross
+ * product was degenerate and the right vector stayed at its (1,0,0) default --
+ * a stereo image nailed to a fixed world axis that never turns with the camera.
+ * Whether that persists is unknown, because the probe logged only the first
+ * call and then went silent, which was a bad probe.
+ *
+ * Until a valid basis arrives, do not pan at all. A centred image is merely
+ * missing information; panning off an arbitrary axis is confidently wrong, and
+ * on headphones that is far more disturbing than mono. */
+static int      g_lis_basis_ok = 0;
+static unsigned g_lis_degenerate = 0;
+/* Gain census: is attenuation reasonable, or is it burying everything? */
+static unsigned g_g3_n = 0, g_g3_loud = 0, g_g3_quiet = 0;
+static float    g_g3_min = 1.0f, g_g3_max = 0.0f, g_dist_max = 0.0f;
+
+/* Caller holds the lock. Returns linear gain and writes a pan in [-1,1]. */
+static float chan_3d_gain(const Chan *c, float *pan_out) {
+  *pan_out = c->pan;
+  if (!AUDIO_3D_ATTENUATION) return 1.0f;
+  if (!c->snd || !c->snd->is3d || !c->has_pos) return 1.0f;
+
+  float dx = c->px - g_lis_px, dy = c->py - g_lis_py, dz = c->pz - g_lis_pz;
+  float d2 = dx * dx + dy * dy + dz * dz;
+  float d  = (d2 > 0.0f) ? sqrtf(d2) : 0.0f;
+
+  float mn = (c->mindist > 0.0f) ? c->mindist : 1.0f;
+  float mx = (c->maxdist > mn)   ? c->maxdist : 10000.0f;
+  float dd = d < mn ? mn : (d > mx ? mx : d);
+  float g  = mn / dd;
+
+  if (c->occl > 0.0f) g *= (1.0f - (c->occl > 1.0f ? 1.0f : c->occl));
+
+  /* Census the spread so the next log can say whether this is sane. */
+  g_g3_n++;
+  if (g < g_g3_min) g_g3_min = g;
+  if (g > g_g3_max) g_g3_max = g;
+  if (d > g_dist_max) g_dist_max = d;
+  if (g >= 0.5f) g_g3_loud++; else if (g < 0.05f) g_g3_quiet++;
+
+  /* Pan by projecting the direction onto the listener's right vector. At the
+   * listener's own position there is no direction, so stay centred; and with no
+   * valid basis yet, panning would be off an arbitrary axis, so stay centred. */
+  if (g_lis_basis_ok && d > 0.0001f) {
+    float p = (dx * g_lis_rx + dy * g_lis_ry + dz * g_lis_rz) / d;
+    if (p < -1.0f) p = -1.0f; else if (p > 1.0f) p = 1.0f;
+    *pan_out = p;
+  }
+  return g;
+}
+
 /* ---- mixer ---------------------------------------------------------------- */
+/* Limiter state: a global gain the mix rides instead of clipping. */
+static float    g_lim_gain = 1.0f, g_lim_min = 1.0f;
+static unsigned g_lim_grains = 0, g_lim_clipped = 0;
+static int32_t  g_lim_peak = 0;
+
 static int32_t g_acc[OUT_GRAIN * OUT_CH];
 static int16_t g_out[OUT_GRAIN * OUT_CH];
 
@@ -317,8 +405,11 @@ static void mix_grain(void) {
     }
 
     /* pan -1 = hard left, +1 = hard right */
-    float gl = ch->vol * (ch->pan <= 0.0f ? 1.0f : 1.0f - ch->pan);
-    float gr = ch->vol * (ch->pan >= 0.0f ? 1.0f : 1.0f + ch->pan);
+    float pan;
+    float g3 = chan_3d_gain(ch, &pan);
+    float v  = ch->vol * g3;
+    float gl = v * (pan <= 0.0f ? 1.0f : 1.0f - pan);
+    float gr = v * (pan >= 0.0f ? 1.0f : 1.0f + pan);
 
     for (int i = 0; i < OUT_GRAIN; i++) {
       unsigned i0 = (unsigned)ch->pos;
@@ -342,8 +433,43 @@ static void mix_grain(void) {
   }
   unlock();
 
+  /* Peak limiter.
+   *
+   * The mix used to be a raw sum hard-clipped at full scale, with every channel
+   * free to contribute a full-scale sample of its own. log160 had 15 voices
+   * playing at once with 83% of computed gains at or above 0.5, so the sum ran
+   * as much as an order of magnitude over the ceiling and simply squared off:
+   * once the loudest source saturates the bus, everything quieter under it is
+   * gone. That is exactly the hardware report -- environmental loops, which run
+   * continuously, drowning footsteps, menu clicks and combat, which do not.
+   *
+   * Attenuation could not fix this. It reduces each voice, but the sum was over
+   * by a factor, not by a margin, and clipping destroys the quiet sources
+   * regardless of how loud the loud ones are.
+   *
+   * So ride a global gain instead of clipping. Attack is instantaneous, because
+   * a limiter that lets even one sample through has not limited anything;
+   * release is slow enough (~1 s at this grain) that a loud burst does not pump
+   * the whole mix around it. Nothing is clipped in normal operation, and the
+   * balance between voices is preserved rather than flattened. */
+  int32_t peak = 0;
   for (int i = 0; i < OUT_GRAIN * OUT_CH; i++) {
-    int32_t v = g_acc[i];
+    int32_t a = g_acc[i] < 0 ? -g_acc[i] : g_acc[i];
+    if (a > peak) peak = a;
+  }
+  float target = 1.0f;
+  if (peak > 32767) {
+    target = 32767.0f / (float)peak;
+    g_lim_clipped++;
+    if (peak > g_lim_peak) g_lim_peak = peak;
+  }
+  if (target < g_lim_gain) g_lim_gain = target;              /* instant attack */
+  else g_lim_gain += (target - g_lim_gain) * 0.02f;          /* gentle release */
+  if (g_lim_gain < g_lim_min) g_lim_min = g_lim_gain;
+  g_lim_grains++;
+
+  for (int i = 0; i < OUT_GRAIN * OUT_CH; i++) {
+    int32_t v = (int32_t)((float)g_acc[i] * g_lim_gain);
     if (v >  32767) v =  32767;
     if (v < -32768) v = -32768;
     g_out[i] = (int16_t)v;
@@ -397,6 +523,66 @@ static Snd *snd_alloc(void) {
  * real FMOD does under voice pressure: take a free slot, else steal the
  * oldest FINISHED voice, else the oldest playing one. */
 static unsigned g_chan_stamp = 0, g_steals = 0, g_steals_live = 0;
+static unsigned g_ends_rescued = 0, g_ends_lost = 0;
+/* log154's ratchet: playSound outran END delivery by 28 at t=134 and 163 at
+ * t=949, monotonically, and the deficit never once fell. At t=854 the pool
+ * pinned at 45 of 45 used with ~10 playing, and playSound collapsed from ~6/s
+ * to ~0.4/s while createSound held its full rate -- the game kept building
+ * sounds and stopped playing them, so its own voice bookkeeping is wedged.
+ *
+ * chan_alloc cannot fail (it steals), and the only other way out of playSound
+ * is !snd_valid, so we are not refusing the game: it stopped asking. The one
+ * uncounted path that can wedge a CExoSoundSource is right below in
+ * Snd_release, which clears `playing`, `end_pending` and `cb` together on
+ * every channel still holding the released Sound. A voice killed there while
+ * still playing never raised END at all, and HandleChannelEnd is the only
+ * writer of ChannelInfo+0x1c.
+ *
+ * Whether that is the leak depends on something we cannot see from here --
+ * whether the game's ReleaseSound resets ChannelInfo itself, the way
+ * StopChannel does. Firing END for a voice it has already reset would be a
+ * duplicate, and HandleChannelEnd's other branch is the loop restart, so
+ * count first and only then decide whether to re-home these. If the killed
+ * total tracks the deficit, this is it. */
+static unsigned g_rel_calls = 0, g_rel_kill_live = 0, g_rel_kill_pend = 0;
+static unsigned g_play_calls = 0, g_play_badsnd = 0, g_play_nochan = 0;
+
+/* Stealing a voice must not silently swallow an END it still owes.
+ *
+ * KOTOR never polls FMOD to learn that a sound finished: FModAudioSystem reads
+ * ChannelInfo+0x1c, and the only writer of that flag is HandleChannelEnd, off
+ * the END callback. A voice that has finished but has not been drained by
+ * System::update yet is still holding `end_pending`; memsetting it on steal
+ * destroys the one notification its owner will ever get, and that
+ * CExoSoundSource is then wedged in "still playing" for the rest of the session.
+ *
+ * Park the callback and userdata in a reserved slot instead and let
+ * System::update deliver it from the game's own thread as usual. The slot lives
+ * inside g_chan, so getUserData -- which the game calls from inside
+ * HandleChannelEnd -- still resolves the ORIGINAL owner.
+ *
+ * Deliberately narrow: only a still-pending END is re-homed. Sending one for a
+ * voice that has ALREADY been drained would be a SECOND END for that source,
+ * and HandleChannelEnd's other branch is the loop restart -- a duplicate there
+ * brings back ambience the game believes it already has. Whether this window is
+ * wide enough to explain log4's decay is what `END on steal / lost` is there to
+ * answer; see the note on g_played in the stats line. */
+static void chan_retire(Chan *c) {
+  if (!c->used || !c->end_pending || !c->cb) return;   /* nothing owed to anyone */
+  for (int i = MAX_PLAY_CHANNELS; i < MAX_CHANNELS; i++) {
+    Chan *r = &g_chan[i];
+    if (r->used) continue;
+    memset(r, 0, sizeof *r);
+    r->used        = 1;
+    r->playing     = 0;
+    r->cb          = c->cb;
+    r->userdata    = c->userdata;
+    r->end_pending = 1;
+    g_ends_rescued++;
+    return;
+  }
+  g_ends_lost++;                              /* ring full: same old silent loss */
+}
 
 static Chan *chan_take(Chan *c) {
   memset(c, 0, sizeof *c);
@@ -413,8 +599,8 @@ static Chan *chan_alloc(void) {
     if (!c->playing) { if (!oldest_done || c->stamp < oldest_done->stamp) oldest_done = c; }
     else             { if (!oldest_live || c->stamp < oldest_live->stamp) oldest_live = c; }
   }
-  if (oldest_done) { g_steals++;      return chan_take(oldest_done); }
-  if (oldest_live) { g_steals_live++; return chan_take(oldest_live); }
+  if (oldest_done) { g_steals++;      chan_retire(oldest_done); return chan_take(oldest_done); }
+  if (oldest_live) { g_steals_live++; chan_retire(oldest_live); return chan_take(oldest_live); }
   return NULL;
 }
 /* The game hands these pointers back to us; validate they are ours before use so
@@ -431,6 +617,8 @@ static int chan_valid(const void *p) { return p >= (void *)g_chan && p < (void *
 #define FMOD_TIMEUNIT_PCM  0x00000002
 #define FMOD_CREATESTREAM  0x00000080
 #define FMOD_OPENMEMORY    0x00000800
+#define FMOD_2D            0x00000008
+#define FMOD_3D            0x00000010
 
 static int fmod_stub(void) { return FMOD_OK; }
 
@@ -448,11 +636,11 @@ static int Sys_Create(void **out) {
 
 static int Sys_init(void *self, int maxch, unsigned flags, void *extra) {
   (void)self; (void)flags; (void)extra;
-  g_nchannels = (maxch > 0 && maxch < MAX_CHANNELS) ? maxch : MAX_CHANNELS;
-  if (maxch > MAX_CHANNELS)
+  g_nchannels = (maxch > 0 && maxch < MAX_PLAY_CHANNELS) ? maxch : MAX_PLAY_CHANNELS;
+  if (maxch > MAX_PLAY_CHANNELS)
     log_printf("[snd] WARNING: game asked for %d channels, pool is %d -- "
                "getChannel will fail past the end and abort InitChannels",
-               maxch, MAX_CHANNELS);
+               maxch, g_nchannels);
   log_printf("[snd] System::init maxchannels=%d (pool %d)", maxch, g_nchannels);
   audio_start();
   return FMOD_OK;
@@ -474,7 +662,10 @@ static int Sys_update(void *self) {
   g_updates++;
   if (draining) return FMOD_OK;         /* HandleChannelEnd -> playSound -> ... */
   draining = 1;
-  for (int i = 0; i < g_nchannels; i++) {
+  /* Playable voices first, then the retirement ring -- a slot there exists only
+   * to carry one END and is freed the moment it is delivered. */
+  for (int i = 0; i < MAX_CHANNELS; i++) {
+    if (i >= g_nchannels && i < MAX_PLAY_CHANNELS) continue;   /* never allocated */
     Chan *c = &g_chan[i];
     lock();
     chan_cb cb = c->cb;
@@ -484,6 +675,7 @@ static int Sys_update(void *self) {
     if (fire) {                          /* never under the lock */
       g_ends_fired++;
       cb(c, FMOD_CHANNELCONTROL_CHANNEL, FMOD_CHANNELCONTROL_CALLBACK_END, NULL, NULL);
+      if (i >= MAX_PLAY_CHANNELS) { lock(); c->used = 0; c->cb = NULL; unlock(); }
     }
   }
   draining = 0;
@@ -718,18 +910,50 @@ have_pcm:;
    * working cache from a broken key. */
   {
     static unsigned n = 0;
+    /* g_played is the discriminator log4 lacked. Its END rate fell from ~127 per
+     * 128 createSound to 0 while createSound itself kept climbing, and both
+     * steal counters froze -- which is either "the game stopped calling
+     * playSound" or "sounds are played but never finish", and nothing logged
+     * could tell the two apart. A live channel census settles it alongside. */
+    int nused = 0, nplaying = 0, npend = 0;
+    lock();
+    for (int i = 0; i < MAX_CHANNELS; i++) {
+      if (!g_chan[i].used) continue;
+      nused++;
+      if (g_chan[i].playing)     nplaying++;
+      if (g_chan[i].end_pending) npend++;
+    }
+    unlock();
     if ((++n & 127) == 0)
       log_printf("[snd] stats: %u createSound, cache %u hit / %u miss, "
                  "%u KB PCM held, %u decode fail, voices reused %u/%u (done/live), "
-                 "%u END sent over %u updates",
+                 "%u END sent over %u updates, %u playSound, "
+                 "%u END on steal / %u lost, "
+                 "%u release killed %u live / %u pending, "
+                 "3D %u listener / %u pos / %u minmax, "
+                 "basis %s (%u degenerate), "
+                 "gain n=%u min=%.3f max=%.3f loud=%u quiet=%u maxdist=%.0f, "
+                 "playSound %u calls / %u badsnd / %u nochan, "
+                 "limiter gain %.3f (min %.3f), %u of %u grains over (peak %d = %.1fx), "
+                 "chans %d used / %d playing / %d endPending of %d",
                  n, g_cache_hits, g_cache_miss, g_pcm_bytes / 1024, g_missing,
-                 g_steals, g_steals_live, g_ends_fired, g_updates);
+                 g_steals, g_steals_live, g_ends_fired, g_updates, g_played,
+                 g_ends_rescued, g_ends_lost,
+                 g_rel_calls, g_rel_kill_live, g_rel_kill_pend,
+                 g_lis_sets, g_pos_sets, g_mm_sets,
+                 g_lis_basis_ok ? "OK" : "NONE", g_lis_degenerate,
+                 g_g3_n, g_g3_min, g_g3_max, g_g3_loud, g_g3_quiet, g_dist_max,
+                 g_play_calls, g_play_badsnd, g_play_nochan,
+                 g_lim_gain, g_lim_min, g_lim_clipped, g_lim_grains,
+                 (int)g_lim_peak, (double)g_lim_peak / 32767.0,
+                 nused, nplaying, npend, g_nchannels);
   }
 
   lock();
   Snd *s = snd_alloc();
   unlock();
   if (!s) { lock(); cache_release(ent); unlock(); return FMOD_ERR_INVALID_PARAM; }
+  s->is3d = (mode & FMOD_3D) ? 1 : 0;
   s->ent = ent;
   s->pcm = ent->pcm;                 /* borrowed: the cache owns the samples */
   *out = s;
@@ -746,10 +970,16 @@ have_pcm:;
   return FMOD_OK;
 }
 
+/* g_played counts SUCCESSES, which cannot distinguish "the game stopped asking"
+ * from "the game asked and we turned it down" -- and log154 and log159 both show
+ * playSound flatlining exactly while the pool sits at 45 of 45. Count the calls
+ * themselves, and both ways one can fail. */
+
 static int Sys_playSound(void *self, void *sound, void *group, int paused, void **outch) {
   (void)self; (void)group;
+  g_play_calls++;
   if (outch) *outch = NULL;
-  if (!snd_valid(sound)) return FMOD_ERR_INVALID_PARAM;
+  if (!snd_valid(sound)) { g_play_badsnd++; return FMOD_ERR_INVALID_PARAM; }
   Snd *s = (Snd *)sound;
 
   audio_start();
@@ -763,9 +993,13 @@ static int Sys_playSound(void *self, void *sound, void *group, int paused, void 
     c->pan     = 0.0f;
     c->paused  = paused ? 1 : 0;
     c->playing = 1;
+    c->mindist = 1.0f;                 /* FMOD defaults until the game says else */
+    c->maxdist = 10000.0f;
+    c->occl    = 0.0f;
+    c->has_pos = 0;
   }
   unlock();
-  if (!c) return FMOD_ERR_INVALID_PARAM;
+  if (!c) { g_play_nochan++; return FMOD_ERR_INVALID_PARAM; }
   if (outch) *outch = c;
   if (g_played < 24)
     log_printf("[snd] playSound -> chan %d (%u ms, paused=%d)",
@@ -792,8 +1026,11 @@ static int Snd_release(void *self) {
   if (!snd_valid(self)) return FMOD_ERR_INVALID_PARAM;
   Snd *s = (Snd *)self;
   lock();
+  g_rel_calls++;
   for (int i = 0; i < g_nchannels; i++)
     if (g_chan[i].used && g_chan[i].snd == s) {
+      if (g_chan[i].playing)     g_rel_kill_live++;   /* died with no END at all */
+      if (g_chan[i].end_pending) g_rel_kill_pend++;   /* END built, never sent */
       g_chan[i].playing = 0; g_chan[i].used = 0;
       g_chan[i].end_pending = 0; g_chan[i].cb = NULL;   /* the source is gone */
     }
@@ -902,6 +1139,102 @@ static int Ch_getUserData(void *self, void **ud) {
   return FMOD_OK;
 }
 
+/* FMOD_VECTOR is three floats and arrives BY POINTER, so unlike setVolume these
+ * need no softfp shim -- only the scalar float entry points below do. */
+typedef struct { float x, y, z; } FmodVec;
+
+static int Ch_set3DAttributes(void *self, const FmodVec *pos, const FmodVec *vel) {
+  (void)vel;                                  /* no doppler: nothing reads velocity */
+  if (!chan_valid(self)) return FMOD_ERR_INVALID_PARAM;
+  if (!pos) return FMOD_OK;
+  Chan *c = (Chan *)self;
+  lock();
+  c->px = pos->x; c->py = pos->y; c->pz = pos->z;
+  c->has_pos = 1;
+  unlock();
+  g_pos_sets++;
+  return FMOD_OK;
+}
+
+/* Both parameters are floats in core registers (softfp caller). */
+static int Ch_set3DMinMaxDistance(void *self, uint32_t mn, uint32_t mx) {
+  if (!chan_valid(self)) return FMOD_ERR_INVALID_PARAM;
+  Chan *c = (Chan *)self;
+  float fmn = u2f(mn), fmx = u2f(mx);
+  lock();
+  if (fmn > 0.0f)   c->mindist = fmn;
+  if (fmx > fmn)    c->maxdist = fmx;
+  unlock();
+  g_mm_sets++;
+  return FMOD_OK;
+}
+
+static int Ch_set3DOcclusion(void *self, uint32_t direct, uint32_t reverb) {
+  (void)reverb;                               /* no reverb bus to occlude */
+  if (!chan_valid(self)) return FMOD_ERR_INVALID_PARAM;
+  float d = u2f(direct);
+  ((Chan *)self)->occl = (d < 0.0f) ? 0.0f : (d > 1.0f ? 1.0f : d);
+  return FMOD_OK;
+}
+
+/* The listener's basis. right = forward x up, which is what a pan projects
+ * onto; KOTOR hands us an already-orthonormal pair, but normalise anyway so a
+ * denormal frame cannot turn into a silent divide. */
+static int Sys_set3DListenerAttributes(void *self, int listener, const FmodVec *pos,
+                                       const FmodVec *vel, const FmodVec *fwd,
+                                       const FmodVec *up) {
+  (void)self; (void)vel;
+  if (listener != 0) return FMOD_OK;          /* single-listener game */
+  /* Snapshot before doing anything else. log160 printed fwd=(0,0,0) up=(0,0,0)
+   * next to "0 degenerate" and a perfectly good right vector, which is not a
+   * contradiction: the print dereferenced the game's own vectors after the lock
+   * was dropped, by which time it had reused them. The basis was always fine;
+   * only the report was lying. */
+  FmodVec f = {0,0,0}, u = {0,0,0};
+  if (fwd) f = *fwd;
+  if (up)  u = *up;
+  lock();
+  if (pos) { g_lis_px = pos->x; g_lis_py = pos->y; g_lis_pz = pos->z; }
+  if (fwd && up) {
+    /* FMOD is LEFT-handed unless the game passes FMOD_INIT_3D_RIGHTHANDED, and
+     * the two orders give exactly opposite right vectors -- a silently mirrored
+     * stereo image, which is the kind of thing nobody notices and everybody
+     * feels. Left-handed wants up x forward; right-handed wants forward x up. */
+    float rx, ry, rz;
+#if AUDIO_3D_RIGHTHANDED
+    rx = f.y * u.z - f.z * u.y;
+    ry = f.z * u.x - f.x * u.z;
+    rz = f.x * u.y - f.y * u.x;
+#else
+    rx = u.y * f.z - u.z * f.y;
+    ry = u.z * f.x - u.x * f.z;
+    rz = u.x * f.y - u.y * f.x;
+#endif
+    float len = sqrtf(rx * rx + ry * ry + rz * rz);
+    if (len > 0.0001f) {
+      g_lis_rx = rx / len; g_lis_ry = ry / len; g_lis_rz = rz / len;
+      g_lis_basis_ok = 1;
+    } else {
+      g_lis_degenerate++;          /* zero fwd/up: keep the last good basis */
+    }
+  }
+  unlock();
+  /* Periodically, not once. The single first-call print in log159 caught the
+   * one update guaranteed to be uninitialised and then went blind, which said
+   * nothing about whether the basis is ever valid. */
+  if ((g_lis_sets % 8192) == 0)
+    log_printf("[snd] listener #%u: pos=(%.1f,%.1f,%.1f) fwd=(%.2f,%.2f,%.2f) "
+               "up=(%.2f,%.2f,%.2f) -> right=(%.2f,%.2f,%.2f) basis=%s "
+               "(%u degenerate) [%s]",
+               g_lis_sets, g_lis_px, g_lis_py, g_lis_pz,
+               f.x, f.y, f.z, u.x, u.y, u.z,
+               g_lis_rx, g_lis_ry, g_lis_rz,
+               g_lis_basis_ok ? "OK" : "NONE YET", g_lis_degenerate,
+               AUDIO_3D_RIGHTHANDED ? "right-handed" : "left-handed");
+  g_lis_sets++;
+  return FMOD_OK;
+}
+
 /* OpenSLES interface IDs are data objects the engine dereferences by address;
  * a stable dummy address per IID is enough to satisfy relocation. */
 static const uint32_t sl_iid_engine      = 0;
@@ -933,7 +1266,7 @@ static const so_default_dynlib audio_dynlib[] = {
   { "_ZN4FMOD6System13getNumDriversEPi", (uintptr_t)&Sys_getNumDrivers },
   { "_ZN4FMOD6System13setFileSystemEPF11FMOD_RESULTPKcPjPPvS5_EPFS1_S5_S5_EPFS1_S5_S5_jS4_S5_EPFS1_S5_jS5_EPFS1_P18FMOD_ASYNCREADINFOS5_ESI_i", (uintptr_t)&Sys_setFileSystem },
   { "_ZN4FMOD6System19setStreamBufferSizeEjj", (uintptr_t)&fmod_stub },
-  { "_ZN4FMOD6System23set3DListenerAttributesEiPK11FMOD_VECTORS3_S3_S3_", (uintptr_t)&fmod_stub },
+  { "_ZN4FMOD6System23set3DListenerAttributesEiPK11FMOD_VECTORS3_S3_S3_", (uintptr_t)&Sys_set3DListenerAttributes },
   { "_ZN4FMOD5Sound7releaseEv", (uintptr_t)&Snd_release },
   { "_ZN4FMOD5Sound9getLengthEPjj", (uintptr_t)&Snd_getLength },
   { "_ZN4FMOD5Sound11setUserDataEPv", (uintptr_t)&fmod_stub },
@@ -948,9 +1281,9 @@ static const so_default_dynlib audio_dynlib[] = {
   { "_ZN4FMOD14ChannelControl9setVolumeEf", (uintptr_t)&Ch_setVolume },  // softfp
   { "_ZN4FMOD14ChannelControl11getUserDataEPPv", (uintptr_t)&Ch_getUserData },
   { "_ZN4FMOD14ChannelControl11setUserDataEPv", (uintptr_t)&Ch_setUserData },
-  { "_ZN4FMOD14ChannelControl14set3DOcclusionEff", (uintptr_t)&fmod_stub },
-  { "_ZN4FMOD14ChannelControl15set3DAttributesEPK11FMOD_VECTORS3_S3_", (uintptr_t)&fmod_stub },
-  { "_ZN4FMOD14ChannelControl19set3DMinMaxDistanceEff", (uintptr_t)&fmod_stub },
+  { "_ZN4FMOD14ChannelControl14set3DOcclusionEff", (uintptr_t)&Ch_set3DOcclusion },
+  { "_ZN4FMOD14ChannelControl15set3DAttributesEPK11FMOD_VECTORS3_S3_", (uintptr_t)&Ch_set3DAttributes },
+  { "_ZN4FMOD14ChannelControl19set3DMinMaxDistanceEff", (uintptr_t)&Ch_set3DMinMaxDistance },
   { "_ZN4FMOD14ChannelControl11setCallbackEPF11FMOD_RESULTP19FMOD_CHANNELCONTROL24FMOD_CHANNELCONTROL_TYPE33FMOD_CHANNELCONTROL_CALLBACK_TYPEPvS6_E", (uintptr_t)&Ch_setCallback },
 };
 

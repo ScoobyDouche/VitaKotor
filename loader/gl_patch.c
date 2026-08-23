@@ -289,11 +289,15 @@ static void glReleaseShaderCompiler_t(void) {
              "every later shader compile fail silently; shark_online=%d)",
              (int)is_shark_online);
 }
+static GLuint   g_cur_prog = 0;           /* redundant program-switch shadow */
+static unsigned g_prog_skipped_win = 0;
+
 static void glLinkProgram_t(GLuint p) {
   extern GLboolean is_shark_online;
   log_printf("[GL] glLinkProgram(%u) ... shark_online=%d", (unsigned)p,
              (int)is_shark_online);
   glLinkProgram(p);
+  g_cur_prog = 0;             /* relinking can change what this id draws with */
   GLint ok = 0;
   glGetProgramiv(p, GL_LINK_STATUS, &ok);
   if (!ok) {
@@ -395,7 +399,39 @@ static void tex_note_draw(unsigned tex) {
  * next tuning step is chosen from data rather than guessed. */
 static unsigned g_draw_client_win = 0, g_draw_vbo_win = 0;
 static unsigned g_prog_win = 0, g_texbind_win = 0, g_bufdata_win = 0;
+/* Attribute-offset high-water mark, for the geometry corruption. The exploding
+ * characters were SceGxmVertexAttribute::offset being a uint16_t -- any VBO
+ * offset >= 64 KB truncated mod 65536 and the GPU fetched each attribute from a
+ * different vertex of the same buffer, drawing a recognisable model with long
+ * spikes. That is fixed in this tree's vitaGL and the fix is confirmed present
+ * in the linked library, but the photos of the late-session corruption show
+ * spikes rather than the diagonal smear the README describes, so watch the
+ * boundary instead of assuming it. If corruption arrives in the same window
+ * maxAttrOff first passes 64 KB, that is the answer; if offsets never approach
+ * it, the whole family is ruled out and the search moves to texture eviction. */
+static uintptr_t g_vap_max_off = 0;
+static unsigned  g_vap_over64k = 0;
 static unsigned g_bind_skipped_win = 0;   /* redundant binds we suppressed */
+static unsigned g_nontex2d_binds = 0;     /* cube/3D binds -- the envmap path */
+
+/* Live-texture census; the tallies live up here because the per-window stats
+ * line below reports them. TEXKIND_MAX and the maintenance helpers are further
+ * down with the rest of the texture-id bookkeeping. */
+#define TEXKIND_MAX  4096
+static uint32_t g_tex_bytes[TEXKIND_MAX];       /* per id, all mip levels */
+static uint64_t g_tex_live = 0, g_tex_peak = 0; /* bytes currently uploaded */
+static uint64_t g_tex_up = 0, g_tex_down = 0;   /* lifetime added / released */
+static unsigned g_tex_n_live = 0, g_tex_untracked = 0;
+
+/* 16-bit conversion state; up here because the stats line and the delete hook
+ * both read it. The packer itself lives with the upload path further down. */
+#define TEX16_NONE 0
+#define TEX16_4444 1
+#define TEX16_565  2
+static uint8_t  g_tex16[TEXKIND_MAX];
+static unsigned g_tex16_n = 0;
+static uint64_t g_tex16_saved = 0;          /* bytes NOT spent, lifetime */
+
 static GLuint   g_cur_arraybuf = 0;      /* last glBindBuffer(GL_ARRAY_BUFFER) */
 
 static inline void draw_note_source(void) {
@@ -437,11 +473,21 @@ void gl_patch_on_swap(void) {
       o += snprintf(ab + o, sizeof(ab) - o, "%ux%u=%u ", g_bk_w[k], g_bk_h[k], g_bk_n_draws[k]);
     if (o) log_printf("[GL]   draws by texture size (lifetime): %s", ab);
     log_printf("[GL]   per-window: clientArrayDraws=%u vboDraws=%u  texBinds=%u "
-               "(skipped %u = %u%%) progSwitches=%u bufferUploads=%u",
+               "(skipped %u = %u%%) progSwitches=%u (skipped %u = %u%%) "
+               "bufferUploads=%u nonTex2DBinds=%u maxAttrOff=0x%x over64k=%u\n"
+               "[GL]   textures live: %u KB in %u ids (peak %u KB); "
+               "lifetime %u KB up / %u KB released, %u untracked ids; "
+               "16-bit: %u ids, %u KB saved",
                g_draw_client_win, g_draw_vbo_win, g_texbind_win, g_bind_skipped_win,
                g_texbind_win ? (g_bind_skipped_win * 100 / g_texbind_win) : 0,
-               g_prog_win, g_bufdata_win);
-    g_bind_skipped_win = 0;
+               g_prog_win, g_prog_skipped_win,
+               g_prog_win ? (g_prog_skipped_win * 100 / g_prog_win) : 0,
+               g_bufdata_win, g_nontex2d_binds,
+               (unsigned)g_vap_max_off, g_vap_over64k,
+               (unsigned)(g_tex_live >> 10), g_tex_n_live, (unsigned)(g_tex_peak >> 10),
+               (unsigned)(g_tex_up >> 10), (unsigned)(g_tex_down >> 10), g_tex_untracked,
+               g_tex16_n, (unsigned)(g_tex16_saved >> 10));
+    g_bind_skipped_win = g_prog_skipped_win = 0;
     g_arrays_win = g_elements_win = g_clears_win = 0;
     g_draw_client_win = g_draw_vbo_win = 0;
     g_texbind_win = g_prog_win = g_bufdata_win = 0;
@@ -538,6 +584,15 @@ static void glDisable_e(GLenum cap) { GLLOG("glDisable(0x%x)", (unsigned)cap); g
  *   - GL_TEXTURE_2D only; every other target passes straight through
  *   - the whole shadow is dropped on glDeleteTextures, because ids get recycled
  *     and a stale entry would silently draw with the wrong texture
+ *   - and binding ANY other target to a unit clears that unit's entry. Desktop
+ *     GL keeps one binding per target per unit, so a cube bind would leave the
+ *     2D binding intact and skipping the next 2D bind would be correct -- but
+ *     GXM has a single texture per sampler slot and vitaGL is not obliged to
+ *     model GL's per-target state. The shadow must not assume it does: kotor.vert
+ *     samples u_texture2Sampler as a real GL_SAMPLER_CUBE for the environment
+ *     map, so exactly the shiny-armour materials bind a cube to a unit that
+ *     otherwise carries a 2D texture. Forgetting the entry costs one redundant
+ *     bind on the rare cube path and cannot draw the wrong texture.
  * Set GL_FILTER_REDUNDANT_BINDS to 0 in config.h to rule this out. */
 #define GL_MAX_TEXUNITS 8
 static unsigned g_active_unit = 0;
@@ -550,8 +605,115 @@ static void glActiveTexture_e(GLenum t) {
   glActiveTexture(t);
 }
 
+/* Cube-texture lifetime, for the armour.
+ *
+ * log151 settled that the envmap itself is fine: all six faces arrive with full
+ * mip chains at t=25s (faces seen 0x3f) and the cube is bound ~19k times across
+ * the session. Yet the armour is correct at boot, correct in the Upper City, and
+ * wrong again after returning to the Lower City -- so what breaks is tied to an
+ * AREA TRANSITION, and the cube is only ever uploaded that one time.
+ *
+ * The obvious way that goes wrong: an area unload deletes textures, the cube's
+ * id is freed, and a later glGenTextures hands the SAME id back for an ordinary
+ * 2D texture. The game keeps sampling u_texture2Sampler through that id and gets
+ * whatever 2D image now owns it -- which is exactly "smeared with a reflection
+ * of the room". Nothing in GL complains, because the id is perfectly valid.
+ *
+ * Remember which ids were uploaded as cubes and say so, loudly, when one is
+ * deleted or turns up bound as GL_TEXTURE_2D. Either line names the bug. */
+/* Track what each texture id CURRENTLY is, not what it once was.
+ *
+ * The first version of this kept a list of ids that had ever been uploaded as a
+ * cube and never forgot them, so once id 32 was recycled every later mention of
+ * 32 fired again -- log152 has 50 such lines and only the first pair means
+ * anything. Recycling an id is legal GL and by itself proves nothing.
+ *
+ * What would be a real fault is a MISMATCH: the game binding GL_TEXTURE_CUBE_MAP
+ * to an id whose most recent upload was 2D. That is the one that puts a flat
+ * image behind u_texture2Sampler and smears a character in reflections. So keep
+ * one byte per id, set it on upload, clear it on delete, and only shout when a
+ * bind disagrees with it. */
+#define TEXKIND_MAX  4096
+#define TEXKIND_NONE 0
+#define TEXKIND_2D   1
+#define TEXKIND_CUBE 2
+static uint8_t  g_tex_kind[TEXKIND_MAX];
+
+/* ---- live texture census ---------------------------------------------------
+ * vitaGL's free pools fall from 79 MB vram / 87 MB ram at boot to single-digit
+ * vram and 57 MB ram after 49 minutes (log155), and the geometry corruption
+ * shows up late in exactly those long sessions. But vram is NOT a one-way
+ * drain -- it oscillates (1.3 MB free at t=185, 13.7 at t=547, 0.6 at t=2175,
+ * 7.0 at t=2717), so memory is genuinely being recycled and the pool is simply
+ * running at its ceiling. The ram pool is the one with a real trend, about
+ * 30 MB gone over the session.
+ *
+ * "The pool is full" and "we are leaking" look identical from a free-bytes
+ * counter, and they need opposite fixes. So count what is actually LIVE: bytes
+ * of texture we have uploaded and not yet seen deleted. If live bytes track the
+ * pool drain, the game is holding more and more texture and the fix is upstream
+ * eviction. If live bytes sit flat while the pools keep falling, vitaGL is not
+ * reclaiming what we delete and the fix is in the allocator.
+ *
+ * Keyed by texture id, which is exactly what glDeleteTextures gives back. A
+ * level-0 upload replaces the id's contents, so it resets the tally first and
+ * the mip levels that follow add onto it. Padded widths are charged at what is
+ * really allocated, not what the game asked for. */
+
+static unsigned fmt_bpp(GLenum f) { return (f == GL_RGBA) ? 4u : (f == GL_RGB) ? 3u : 2u; }
+
+static void tex_charge(GLuint t, GLenum target, GLint level, GLsizei w, GLsizei h, unsigned bpp) {
+  if (!t || t >= TEXKIND_MAX) { g_tex_untracked++; return; }
+  /* A cube uploads six faces at the same id and level; only a 2D base level
+   * means "this id now holds a different image". */
+  if (target != GL_TEXTURE_2D) level = 1;
+  uint32_t add = (uint32_t)((w > 0 ? w : 0)) * (uint32_t)((h > 0 ? h : 0)) * bpp;
+  if (level == 0) {                       /* new base image: drop the old tally */
+    if (g_tex_bytes[t]) { g_tex_live -= g_tex_bytes[t]; g_tex_down += g_tex_bytes[t]; }
+    else                { g_tex_n_live++; }
+    g_tex_bytes[t] = 0;
+  }
+  g_tex_bytes[t] += add;
+  g_tex_live     += add;
+  g_tex_up       += add;
+  if (g_tex_live > g_tex_peak) g_tex_peak = g_tex_live;
+}
+
+static void tex_release(GLuint t) {
+  if (!t || t >= TEXKIND_MAX || !g_tex_bytes[t]) return;
+  g_tex_live -= g_tex_bytes[t];
+  g_tex_down += g_tex_bytes[t];
+  g_tex_bytes[t] = 0;
+  if (g_tex_n_live) g_tex_n_live--;
+}
+static GLuint   g_cur_cubetex = 0;
+
+static void tex_kind_set(GLuint t, uint8_t k) {
+  if (t && t < TEXKIND_MAX) {
+    if (g_tex_kind[t] && g_tex_kind[t] != k)
+      log_printf("[GL] texture %u changes kind %s -> %s", (unsigned)t,
+                 g_tex_kind[t] == TEXKIND_CUBE ? "CUBE" : "2D",
+                 k == TEXKIND_CUBE ? "CUBE" : "2D");
+    g_tex_kind[t] = k;
+  }
+}
+static uint8_t tex_kind_get(GLuint t) {
+  return (t && t < TEXKIND_MAX) ? g_tex_kind[t] : TEXKIND_NONE;
+}
+
 static void glDeleteTextures_e(GLsizei n, const GLuint *tex) {
   /* ids are recycled, so any cached binding may now mean a different texture */
+  if (tex)
+    for (GLsizei i = 0; i < n; i++) {
+      if (tex_kind_get(tex[i]) == TEXKIND_CUBE)
+        log_printf("[GL] cube texture %u deleted", (unsigned)tex[i]);
+      if (tex[i] && tex[i] < TEXKIND_MAX) g_tex_kind[tex[i]] = TEXKIND_NONE;
+      tex_release(tex[i]);
+      if (tex[i] < TEXKIND_MAX && g_tex16[tex[i]] != TEX16_NONE) {
+        g_tex16[tex[i]] = TEX16_NONE;      /* ids recycle; do not inherit a format */
+        if (g_tex16_n) g_tex16_n--;
+      }
+    }
   memset(g_bound2d, 0, sizeof g_bound2d);
   glDeleteTextures(n, tex);
 }
@@ -560,10 +722,29 @@ static void glGenTextures_e(GLsizei n, GLuint *t) { GLLOG("glGenTextures(%d)", (
 static void glBindTexture_e(GLenum tg, GLuint t) {
   GLLOG("glBindTexture(0x%x,%u)", (unsigned)tg, (unsigned)t);
   g_texbind_win++;
+  if (tg == GL_TEXTURE_CUBE_MAP) {
+    g_cur_cubetex = t;
+    if (tex_kind_get(t) == TEXKIND_2D) {          /* THE fault, if it happens */
+      static unsigned w1 = 0;
+      if (w1 < 16)
+        log_printf("[GL] *** MISMATCH: binding CUBE_MAP to id %u whose last upload "
+                   "was 2D -- the envmap is sampling a flat texture", (unsigned)t);
+      w1++;
+    }
+  } else if (tg == GL_TEXTURE_2D && tex_kind_get(t) == TEXKIND_CUBE) {
+    static unsigned w2 = 0;
+    if (w2 < 16)
+      log_printf("[GL] *** MISMATCH: binding 2D to id %u whose last upload was a "
+                 "CUBE", (unsigned)t);
+    w2++;
+  }
 #if GL_FILTER_REDUNDANT_BINDS
   if (tg == GL_TEXTURE_2D) {
     if (g_bound2d[g_active_unit] == t) { g_bind_skipped_win++; g_cur_tex = t; return; }
     g_bound2d[g_active_unit] = t;
+  } else {
+    g_bound2d[g_active_unit] = 0;        /* unit may no longer hold that 2D texture */
+    g_nontex2d_binds++;
   }
 #endif
   if (tg == GL_TEXTURE_2D) g_cur_tex = t;  // mirrored for the text-draw trace
@@ -609,6 +790,14 @@ static void glVertexAttribPointer_e(GLuint index, GLint size, GLenum type, GLboo
                (unsigned)index, (int)size, (unsigned)type, (int)normalized,
                (int)stride, (unsigned)(uintptr_t)pointer);
   }
+  /* Only meaningful when a VBO is bound: with no buffer, `pointer` is a real
+   * client address and comparing it to 0xFFFF is nonsense. log151 reported
+   * maxAttrOff=0x985daa2c -- an address inside libKOTOR -- and counted 2.35M
+   * "over 64 KB", which measured nothing at all. */
+  if (g_cur_arraybuf) {
+    if ((uintptr_t)pointer > g_vap_max_off) g_vap_max_off = (uintptr_t)pointer;
+    if ((uintptr_t)pointer > 0xFFFFu) g_vap_over64k++;
+  }
   glVertexAttribPointer(index, size, type, normalized, stride, pointer);
 }
 
@@ -645,11 +834,104 @@ static GLint glGetUniformLocation_e(GLuint prog, const GLchar *name) {
 
 static GLsizei gl_rt_align_w(GLsizei w) { return (w > 0 && (w & 7)) ? ((w + 7) & ~7) : w; }
 
+/* ---- 16-bit texture conversion --------------------------------------------
+ * See GL_TEX16_CONVERT in config.h. Halves the texture working set so it fits
+ * the Vita's fixed 96 MB of CDRAM instead of thrashing against it.
+ *
+ * Ordered 4x4 Bayer dithering is not decoration: at four bits a channel a plain
+ * truncation posterises every gradient into visible steps, and a sky or a
+ * saber glow is nothing but gradient. Dithering trades those steps for noise
+ * the eye ignores at this screen size.
+ *
+ * Which ids were converted is remembered, because glTexSubImage2D goes straight
+ * through to vitaGL: a byte-typed sub-upload into a 4444 texture would be read
+ * as though it were already 4444, and corrupt it. */
+
+static const uint8_t k_bayer4[16] = { 0, 8, 2,10, 12, 4,14, 6,  3,11, 1, 9, 15, 7,13, 5 };
+
+/* Writes w*h uint16 into dst. src is tightly packed 8-bit RGB(A). */
+static void tex16_pack(uint16_t *dst, const unsigned char *src, int w, int h, int kind) {
+  for (int y = 0; y < h; y++) {
+    const unsigned char *sp = src + (size_t)y * w * (kind == TEX16_4444 ? 4 : 3);
+    uint16_t *d = dst + (size_t)y * w;
+    for (int x = 0; x < w; x++) {
+      unsigned dth = k_bayer4[((y & 3) << 2) | (x & 3)];
+      if (kind == TEX16_4444) {
+        unsigned r4 = (sp[0] + dth) >> 4; if (r4 > 15) r4 = 15;
+        unsigned g4 = (sp[1] + dth) >> 4; if (g4 > 15) g4 = 15;
+        unsigned b4 = (sp[2] + dth) >> 4; if (b4 > 15) b4 = 15;
+        unsigned a4 = (sp[3] + dth) >> 4; if (a4 > 15) a4 = 15;
+        d[x] = (uint16_t)((r4 << 12) | (g4 << 8) | (b4 << 4) | a4);
+        sp += 4;
+      } else {
+        unsigned r5 = (sp[0] + (dth >> 1)) >> 3; if (r5 > 31) r5 = 31;
+        unsigned g6 = (sp[1] + (dth >> 2)) >> 2; if (g6 > 63) g6 = 63;
+        unsigned b5 = (sp[2] + (dth >> 1)) >> 3; if (b5 > 31) b5 = 31;
+        d[x] = (uint16_t)((r5 << 11) | (g6 << 5) | b5);
+        sp += 3;
+      }
+    }
+  }
+}
+
+/* The one 2D upload path: convert when we can, charge what was really spent,
+ * hand it to vitaGL. Always uploads exactly once. */
+static void tex_upload2d(GLenum tg, GLint l, GLint ifmt, GLsizei w, GLsizei h,
+                         GLint b, GLenum f, GLenum ty, const void *px) {
+#if GL_TEX16_CONVERT
+  int kind = (f == GL_RGBA) ? TEX16_4444 : (f == GL_RGB) ? TEX16_565 : TEX16_NONE;
+  if (px && kind != TEX16_NONE && ty == GL_UNSIGNED_BYTE && w > 0 && h > 0) {
+    uint16_t *cv = (uint16_t *)malloc((size_t)w * h * 2);
+    if (cv) {
+      tex16_pack(cv, (const unsigned char *)px, w, h, kind);
+      GLenum ty16 = (kind == TEX16_4444) ? GL_UNSIGNED_SHORT_4_4_4_4
+                                         : GL_UNSIGNED_SHORT_5_6_5;
+      if (g_cur_tex && g_cur_tex < TEXKIND_MAX && l == 0) {
+        if (g_tex16[g_cur_tex] == TEX16_NONE) g_tex16_n++;
+        g_tex16[g_cur_tex] = (uint8_t)kind;
+      }
+      g_tex16_saved += (uint64_t)w * h * (fmt_bpp(f) - 2u);
+      tex_charge(g_cur_tex, tg, l, w, h, 2u);
+      glTexImage2D(tg, l, ifmt, w, h, b, f, ty16, cv);
+      free(cv);
+      return;
+    }
+  }
+#endif
+  tex_charge(g_cur_tex, tg, l, w, h, fmt_bpp(f));
+  glTexImage2D(tg, l, ifmt, w, h, b, f, ty, px);
+}
+
 static void glTexImage2D_e(GLenum tg, GLint l, GLint ifmt, GLsizei w, GLsizei h, GLint b, GLenum f, GLenum ty, const void *px) {
   GLLOG("glTexImage2D(0x%x, l=%d, %dx%d, fmt=0x%x)", (unsigned)tg, l, (int)w, (int)h, (unsigned)f);
+  // The environment map is a real cube: kotor.vert declares u_texture2Sampler as
+  // GL_SAMPLER_CUBE and the shiny-armour material is the USE_CUBEMAP variant.
+  // Nothing in any log so far shows a single cube face being uploaded, so before
+  // theorising about why armour renders flat white, record whether the faces
+  // arrive at all -- and how many of the six.
+  if (tg >= GL_TEXTURE_CUBE_MAP_POSITIVE_X && tg <= GL_TEXTURE_CUBE_MAP_NEGATIVE_Z) {
+    static unsigned nc = 0, faces = 0;
+    tex_kind_set(g_cur_cubetex, TEXKIND_CUBE);
+    faces |= 1u << (tg - GL_TEXTURE_CUBE_MAP_POSITIVE_X);
+    /* Only level 0 past the first cap: log151 spent all 48 lines on ONE cube's
+     * mip chain and went blind afterwards, so a re-upload after an area change
+     * -- the thing actually in question -- could not have been seen. */
+    if (nc < 48 || (l == 0 && nc < 4096))
+      log_printf("[GL] cube face %u: l=%d %dx%d ifmt=0x%x fmt=0x%x data=%s "
+                 "(faces seen 0x%02x)",
+                 (unsigned)(tg - GL_TEXTURE_CUBE_MAP_POSITIVE_X), l, (int)w, (int)h,
+                 (unsigned)ifmt, (unsigned)f, px ? "yes" : "NULL", faces);
+    nc++;
+    tex_charge(g_cur_cubetex, tg, l, w, h, fmt_bpp(f));   /* cubes bind their own id */
+    glTexImage2D(tg, l, ifmt, w, h, b, f, ty, px);
+    return;                        // none of the 2D heuristics below apply
+  }
+  if (tg != GL_TEXTURE_2D) { tex_charge(g_cur_tex, tg, l, w, h, fmt_bpp(f));
+                             glTexImage2D(tg, l, ifmt, w, h, b, f, ty, px); return; }
   // Square power-of-two base levels are the font atlases; naming the texture id
   // here is what lets the text-draw trace say whether a glyph quad used one.
   if (l == 0) {
+    tex_kind_set(g_cur_tex, TEXKIND_2D);
     tex_note_size(g_cur_tex, (int)w, (int)h);
     if (w == h && (w == 256 || w == 512 || w == 1024))
       log_printf("[GL] atlas candidate: tex=%u %dx%d fmt=0x%x", g_cur_tex, (int)w, (int)h, (unsigned)f);
@@ -672,34 +954,89 @@ static void glTexImage2D_e(GLenum tg, GLint l, GLint ifmt, GLsizei w, GLsizei h,
   // Cost is one staging buffer per NPOT upload; these are a handful of
   // backgrounds, not a per-frame path.
   int bpp = (f == GL_RGBA) ? 4 : (f == GL_RGB) ? 3 : 0;
+  /* The pad makes the texture WIDER than the game asked for, and the game still
+   * samples u across [0,1] -- so whatever sits in the pad columns is drawn as
+   * part of the picture. Replicating the last column was fine for the 860x478
+   * background this was written for (0.5% of one edge column) and ruinous for
+   * everything small: log155 pads 2x2 -> 8x2 and 4x4 -> 8x4, where the real
+   * image ends up squeezed into the left quarter and the remaining
+   * three quarters are one flat colour. A soft gradient becomes a hard-edged
+   * rectangle, which is exactly what the minimap frame and the fog panel on the
+   * character and new-game screens look like.
+   *
+   * Resample the row onto the padded width instead of extending it. u in [0,1]
+   * then spans the whole picture again at any size, subrect texcoords keep
+   * pointing at the same texels, and vitaGL still gets the 8-aligned width its
+   * stride assumes. The only cost is a horizontal resample of at most seven
+   * columns' worth of ratio -- 0.5% on the background, exact-in-effect on the
+   * tiny gradients, and no hard edge anywhere.
+   *
+   * Kept separate from the RENDER TARGET padding below, which is the actual fix
+   * for the diagonal background shear and is not gated by this flag. */
+#if GL_NPOT_WIDTH_PAD
   if (px && bpp && l == 0 && w > 0 && h > 0 && (w & 7)) {
     int aw = (w + 7) & ~7;
     unsigned char *pad = (unsigned char *)malloc((size_t)aw * h * bpp);
     if (pad) {
       const unsigned char *src = (const unsigned char *)px;
+      /* 16.16 fixed point, sampling at column centres so the edges stay put. */
+      const int step = (int)(((int64_t)w << 16) / aw);
       for (int y = 0; y < h; y++) {
         unsigned char *drow = pad + (size_t)y * aw * bpp;
         const unsigned char *srow = src + (size_t)y * w * bpp;
-        memcpy(drow, srow, (size_t)w * bpp);
-        for (int x = w; x < aw; x++)              // replicate last column
-          memcpy(drow + (size_t)x * bpp, srow + (size_t)(w - 1) * bpp, bpp);
+        int pos = step / 2 - 32768;
+        for (int x = 0; x < aw; x++, pos += step) {
+          int p  = pos < 0 ? 0 : pos;
+          int x0 = p >> 16, fr = p & 0xFFFF;
+          if (x0 >= w - 1) { x0 = w - 1; fr = 0; }
+          int x1 = (x0 + 1 < w) ? x0 + 1 : x0;
+          const unsigned char *a = srow + (size_t)x0 * bpp;
+          const unsigned char *c = srow + (size_t)x1 * bpp;
+          unsigned char *d = drow + (size_t)x * bpp;
+          for (int k = 0; k < bpp; k++)
+            d[k] = (unsigned char)((a[k] * (65536 - fr) + c[k] * fr) >> 16);
+        }
       }
-      log_printf("[GL] NPOT pad: %dx%d -> %dx%d (bpp=%d)", (int)w, (int)h, aw, (int)h, bpp);
-      glTexImage2D(tg, l, ifmt, aw, h, b, f, ty, pad);
+      log_printf("[GL] NPOT resample: %dx%d -> %dx%d (bpp=%d)", (int)w, (int)h, aw, (int)h, bpp);
+      tex_upload2d(tg, l, ifmt, aw, h, b, f, ty, pad);
       free(pad);
       return;
     }
   }
+#endif
   // Storage-only allocation (data == NULL) is the FBO colour attachment; pad its
   // width to match the renderbuffer above so the two stay dimension-consistent.
   if (!px && l == 0) {
     GLsizei aw = gl_rt_align_w(w);
     if (aw != w)
       log_printf("[GL] RT pad: color tex %dx%d -> %dx%d", (int)w, (int)h, (int)aw, (int)h);
+    tex_charge(g_cur_tex, tg, l, aw, h, fmt_bpp(f));
     glTexImage2D(tg, l, ifmt, aw, h, b, f, ty, px);
     return;
   }
-  glTexImage2D(tg, l, ifmt, w, h, b, f, ty, px);
+  tex_upload2d(tg, l, ifmt, w, h, b, f, ty, px);
+}
+/* Must convert exactly as the base upload did, or vitaGL reads byte data as
+ * 16-bit and the texture turns to noise. */
+static void glTexSubImage2D_e(GLenum tg, GLint l, GLint xo, GLint yo, GLsizei w, GLsizei h,
+                              GLenum f, GLenum ty, const void *px) {
+  GLLOG("glTexSubImage2D(0x%x, l=%d, %dx%d)", (unsigned)tg, l, (int)w, (int)h);
+#if GL_TEX16_CONVERT
+  uint8_t kind = (g_cur_tex && g_cur_tex < TEXKIND_MAX) ? g_tex16[g_cur_tex] : TEX16_NONE;
+  if (px && kind != TEX16_NONE && ty == GL_UNSIGNED_BYTE && w > 0 && h > 0 &&
+      ((kind == TEX16_4444 && f == GL_RGBA) || (kind == TEX16_565 && f == GL_RGB))) {
+    uint16_t *cv = (uint16_t *)malloc((size_t)w * h * 2);
+    if (cv) {
+      tex16_pack(cv, (const unsigned char *)px, w, h, kind);
+      glTexSubImage2D(tg, l, xo, yo, w, h, f,
+                      (kind == TEX16_4444) ? GL_UNSIGNED_SHORT_4_4_4_4
+                                           : GL_UNSIGNED_SHORT_5_6_5, cv);
+      free(cv);
+      return;
+    }
+  }
+#endif
+  glTexSubImage2D(tg, l, xo, yo, w, h, f, ty, px);
 }
 static void glTexParameteri_e(GLenum tg, GLenum p, GLint v) { GLLOG("glTexParameteri(0x%x,0x%x,%d)", (unsigned)tg, (unsigned)p, v); glTexParameteri(tg, p, v); }
 static void glGenFramebuffers_e(GLsizei n, GLuint *f) { GLLOG("glGenFramebuffers(%d)", (int)n); glGenFramebuffers(n, f); }
@@ -739,7 +1076,40 @@ static void glBindBuffer_e(GLenum tg, GLuint b) {
 }
 static void glBufferData_e(GLenum tg, GLsizeiptr sz, const void *d, GLenum u) { GLLOG("glBufferData(0x%x, %d bytes)", (unsigned)tg, (int)sz); g_bufdata_win++; glBufferData(tg, sz, d, u); }
 static GLuint glCreateProgram_e(void) { GLLOG("glCreateProgram()"); GLuint p = glCreateProgram(); log_printf("[GL]  -> program %u", (unsigned)p); return p; }
-static void glUseProgram_e(GLuint p) { GLLOG("glUseProgram(%u)", (unsigned)p); g_prog_win++; glUseProgram(p); }
+/* Redundant program-switch filter.
+ *
+ * The Undercity issues ~480 draws and ~43 glUseProgram calls a frame at 5-8 fps,
+ * against 140 draws at 30-40 fps in the streets above, and there are only ten
+ * programs in the whole session -- so most of those switches re-select the
+ * program that is already current.
+ *
+ * That is not free here the way it is on desktop GL. vitaGL's glUseProgram does
+ * no GXM work at all; it sets cur_program and then marks EVERY uniform dirty
+ * (dirty_vert_unifs = 0xFFFF, dirty_frag_unifs = 0xFFFFFFFF, custom_shaders.c
+ * ~2462). The next draw therefore re-uploads the program's entire uniform set,
+ * u_boneMatrices[51] and u_lightData[15] included, for a call that changed
+ * nothing.
+ *
+ * Skipping it is safe, and checked against vitaGL rather than assumed:
+ *   - uniforms are per-program state and persist across a re-select, so not
+ *     re-marking them dirty cannot lose a value;
+ *   - glUniform* flags its own slot via flag_dirty_vert_unif, so writes are
+ *     still tracked while the filter is active;
+ *   - gxm.c ~796 re-dirties everything at each frame end regardless ("just to be
+ *     safe"), so the per-frame invalidation never depended on this call.
+ * The shadow is dropped whenever a program is linked or deleted, since either
+ * can change what an id means.
+ * Set GL_FILTER_REDUNDANT_PROGS to 0 in config.h to rule this out. */
+static void glUseProgram_e(GLuint p) {
+  GLLOG("glUseProgram(%u)", (unsigned)p);
+  g_prog_win++;
+#if GL_FILTER_REDUNDANT_PROGS
+  if (p && p == g_cur_prog) { g_prog_skipped_win++; return; }
+  g_cur_prog = p;
+#endif
+  glUseProgram(p);
+}
+static void glDeleteProgram_e(GLuint p) { g_cur_prog = 0; glDeleteProgram(p); }
 static void glScissor_e(GLint x, GLint y, GLsizei w, GLsizei h) { GLLOG("glScissor(%d,%d,%d,%d)", x, y, (int)w, (int)h); glScissor(x, y, w, h); }
 static void glClearStencil_e(GLint s) { GLLOG("glClearStencil(%d)", s); glClearStencil(s); }
 static GLenum glGetError_e(void) { GLenum e = glGetError(); GLLOG("glGetError() -> 0x%x", (unsigned)e); return e; }
@@ -842,7 +1212,7 @@ static const so_default_dynlib gl_dynlib[] = {
   { "glCopyTexSubImage2D",               (uintptr_t)&glCopyTexSubImage2D },
   { "glDeleteBuffers",                   (uintptr_t)&glDeleteBuffers },
   { "glDeleteFramebuffers",              (uintptr_t)&glDeleteFramebuffers },
-  { "glDeleteProgram",                   (uintptr_t)&glDeleteProgram },
+  { "glDeleteProgram",                   (uintptr_t)&glDeleteProgram_e },
   { "glDeleteRenderbuffers",             (uintptr_t)&glDeleteRenderbuffers },
   { "glDeleteShader",                    (uintptr_t)&glDeleteShader },
   { "glDeleteTextures",                  (uintptr_t)&glDeleteTextures_e },
@@ -881,7 +1251,7 @@ static const so_default_dynlib gl_dynlib[] = {
   { "glStencilOp",                       (uintptr_t)&glStencilOp },
   { "glStencilOpSeparate",               (uintptr_t)&glStencilOpSeparate },
   { "glTexParameteriv",                  (uintptr_t)&glTexParameteriv },
-  { "glTexSubImage2D",                   (uintptr_t)&glTexSubImage2D },
+  { "glTexSubImage2D",                   (uintptr_t)&glTexSubImage2D_e },
   { "glUniform1fv",                      (uintptr_t)&glUniform1fv },
   { "glUniform1i",                       (uintptr_t)&glUniform1i },
   { "glUniform1iv",                      (uintptr_t)&glUniform1iv },

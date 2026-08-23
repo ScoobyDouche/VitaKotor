@@ -690,6 +690,7 @@ static void install_aurresget_hook(void) {
 // Floats arrive in core registers (softfp caller), hence uint32_t params. Both
 // hooked prologues are 8 clean bytes (push/add r7/str.w) with no PC-relative loads.
 static void log_screen_globals(const char *when);  // defined with the probes below
+static void gui_autoscale_if_needed(void *self, int w, int h);  // defined with ScaleExt below
 
 static void (*SWImgDraw_orig)(void *self, uint32_t f) = NULL;
 static void (*FlushBuf_orig)(void *self, uint32_t f) = NULL;
@@ -697,6 +698,58 @@ static const volatile int32_t *g_gui_buf_used = NULL;
 static unsigned g_flush_n = 0, g_flush_nonempty = 0;
 static int32_t g_flush_max_used = 0;
 static unsigned g_sw_n = 0, g_sw_gate_obj = 0, g_sw_gate_w = 0, g_sw_gate_h = 0, g_sw_pass = 0;
+
+/* Which widgets actually went through ScaleExtentForResolution.
+ *
+ * Two theories about the oversized minimap and the fog panel have now died on
+ * hardware -- the extent counters (log155: 1200 loaded, 2047 scaled) and the
+ * NPOT pad content (log156: resampled 81 times, boxes unchanged). The counter
+ * comparison was never evidence in the first place: ExtentLoad and ScaleExtent
+ * are tallies over DIFFERENT objects, one widget can be scaled repeatedly, and
+ * SetExtent installs extents that ExtentLoad never saw. A total tells you
+ * nothing about whether THIS widget was scaled.
+ *
+ * So record the identity, not the count. Every widget that passes through
+ * ScaleExtent goes in this set; any large image reports, once, whether its own
+ * pointer is in it. An element left at authored size inside a frame scaled by
+ * 0.7083 is 1.41x too big for that frame, which is precisely how both the
+ * minimap and the fog panel overflow. If the offending widget comes back
+ * scaled=NO, that is the bug and the fix is to scale it. If it comes back
+ * scaled=YES, the extent path is exonerated for good and the cause is in the
+ * draw itself. */
+#define GUI_PTRSET_SLOTS 1024              /* power of two; open addressing */
+typedef struct { uint32_t slot[GUI_PTRSET_SLOTS]; unsigned n, overflow; } GuiPtrSet;
+static GuiPtrSet g_gui_scaled;             /* widgets ScaleExtent has touched */
+static GuiPtrSet g_gui_reported;           /* big images already logged once */
+
+static unsigned gui_ptr_hash(uint32_t p) { return ((p >> 2) * 2654435761u) & (GUI_PTRSET_SLOTS - 1); }
+
+/* Returns 1 if p was ALREADY present. Insert-and-test in one pass so the draw
+ * path can use it directly as a once-only gate. */
+static int gui_ptrset_add(GuiPtrSet *s, uint32_t p) {
+  if (!p) return 1;
+  unsigned h = gui_ptr_hash(p);
+  for (unsigned i = 0; i < GUI_PTRSET_SLOTS; i++) {
+    unsigned k = (h + i) & (GUI_PTRSET_SLOTS - 1);
+    if (s->slot[k] == p) return 1;
+    if (!s->slot[k]) { s->slot[k] = p; s->n++; return 0; }
+  }
+  s->overflow++;                            /* full: report rather than lie */
+  return 1;
+}
+static int gui_ptrset_has(const GuiPtrSet *s, uint32_t p) {
+  unsigned h = gui_ptr_hash(p);
+  for (unsigned i = 0; i < GUI_PTRSET_SLOTS; i++) {
+    unsigned k = (h + i) & (GUI_PTRSET_SLOTS - 1);
+    if (s->slot[k] == p) return 1;
+    if (!s->slot[k]) return 0;
+  }
+  return 0;
+}
+static unsigned g_bigimg_logged = 0;
+#if GUI_AUTOSCALE_UNSCALED_IMAGES
+static unsigned g_autoscaled = 0;
+#endif
 
 static void SWImgDraw_probe(void *self, uint32_t f) {
   const uint32_t *o = (const uint32_t *)self;
@@ -707,6 +760,21 @@ static void SWImgDraw_probe(void *self, uint32_t f) {
   else if (!w)  g_sw_gate_w++;
   else if (!h)  g_sw_gate_h++;
   else          g_sw_pass++;
+  /* The boxes are big. Report each large image once, with the one fact that
+   * separates the two remaining theories. Capped, and the cap is printed --
+   * a capped counter read as a finding has cost this port two hardware runs. */
+  if (img && (int)w >= 200 && (int)h >= 200 && g_bigimg_logged < 200) {
+    uint32_t sp = (uint32_t)(uintptr_t)self;
+    if (!gui_ptrset_add(&g_gui_reported, sp)) {
+      g_bigimg_logged++;
+      log_printf("[gui] big image #%u self=0x%08x img=0x%08x w=%d h=%d scaled=%s"
+                 "  (scaled set %u entries, %u overflowed)",
+                 g_bigimg_logged, sp, (unsigned)img, (int)w, (int)h,
+                 gui_ptrset_has(&g_gui_scaled, sp) ? "YES" : "NO",
+                 g_gui_scaled.n, g_gui_scaled.overflow);
+    }
+    gui_autoscale_if_needed(self, (int)w, (int)h);
+  }
   if ((g_sw_n++ % 2400) == 0) {
     log_printf("[gui] SWImage::Draw n=%u gates objnull=%u w0=%u h0=%u PASS=%u "
                "(last img=0x%08x w=%d h=%d)",
@@ -817,6 +885,7 @@ static void SetExtent_probe(void *self, const void *ext) {
 // word still holding the sentinel was never written -- restore the caller's
 // original bytes there so the game sees exactly what it would have seen.
 #define EXT_SENTINEL 0x5A5A5A5A
+static unsigned g_sx_n = 0;      /* ScaleExtent calls, read by the totals line */
 static int (*ExtLoad_orig)(void *self, void *gff, void *st) = NULL;
 static unsigned g_xl_n = 0, g_xl_skipped = 0, g_xl_w0 = 0;
 
@@ -839,6 +908,9 @@ static int ExtLoad_probe(void *self, void *gff, void *st) {
                "skipped=%u w0=%u",
                g_xl_n, rc, (int)e[0], (int)e[1], (int)e[2], (int)e[3],
                unwritten, g_xl_skipped, g_xl_w0);
+  if ((g_xl_n % 240) == 0)
+    log_printf("[gui] extent totals: %u loaded, %u scaled  (a gap here is real, "
+               "both counters are lifetime)", g_xl_n, g_sx_n);
   g_xl_n++;
   return rc;
 }
@@ -980,19 +1052,58 @@ static void *LoadModel_probe(void *self, const void *resref, unsigned part) {
 // actually activate it -- measurement, not arithmetic guesswork.
 // CSWGuiObject keeps its extent at this+0x08 (SetExtent/ScaleExtent both use it).
 static void (*ScaleExt_orig)(void *self, uint32_t fscale) = NULL;
-static unsigned g_sx_n = 0;
 
 static void ScaleExt_probe(void *self, uint32_t fscale) {
   const int32_t *e = (const int32_t *)((const char *)self + 8);
   int32_t b[4] = {e[0], e[1], e[2], e[3]};
+  gui_ptrset_add(&g_gui_scaled, (uint32_t)(uintptr_t)self);
   ScaleExt_orig(self, fscale);
-  if (g_sx_n < 48) {
+  /* Cadence matched to ExtentLoad's on purpose. At a flat cap of 48 this went
+   * quiet at t=145s while ExtentLoad ran on to #2400, and comparing the two
+   * logged counts then "showed" 25 extents that were never scaled -- an
+   * artifact of the cap, not a finding. Whether some extents really do skip
+   * ScaleExtentForResolution is still open, and it matters: an element left at
+   * authored size inside a frame scaled to 0.7083 is 1.41x too big for it,
+   * which is what the minimap, the fog box and the save list all look like.
+   * The save rows load as {L=471 T=358..567 W=300 H=30} in a 768-tall layout;
+   * unscaled, T=567 falls off a 544-tall screen and lands on the buttons. */
+  if (g_sx_n < 64 || (g_sx_n % 240) == 0) {
     float sc; memcpy(&sc, &fscale, 4);
-    log_printf("[gui] ScaleExtent #%u {L=%d T=%d W=%d H=%d} x%.4f -> {L=%d T=%d W=%d H=%d}",
-               g_sx_n, (int)b[0], (int)b[1], (int)b[2], (int)b[3], sc,
+    log_printf("[gui] ScaleExtent #%u self=0x%08x {L=%d T=%d W=%d H=%d} x%.4f -> {L=%d T=%d W=%d H=%d}",
+               g_sx_n, (unsigned)(uintptr_t)self,
+               (int)b[0], (int)b[1], (int)b[2], (int)b[3], sc,
                (int)e[0], (int)e[1], (int)e[2], (int)e[3]);
   }
   g_sx_n++;
+}
+
+/* Hand a never-scaled image the resolution scale the game applies to every
+ * other widget. See GUI_AUTOSCALE_UNSCALED_IMAGES in config.h for why this is
+ * restricted to large, sub-screen-height images: the pillarbox wings come
+ * through at exactly the screen height already in device pixels, and a blanket
+ * rescale would wreck every widget that is already correct.
+ *
+ * Calls the original through the trampoline, so it does not re-enter the probe;
+ * the widget is added to the scaled set first so it can never be scaled twice
+ * however many times it is drawn. */
+static void gui_autoscale_if_needed(void *self, int w, int h) {
+#if GUI_AUTOSCALE_UNSCALED_IMAGES
+  if (!ScaleExt_orig || !g_scr_h) return;
+  int sh = (int)*g_scr_h;
+  if (sh <= 0 || h >= sh) return;            /* already device-space */
+  if (w < 200 || h < 200) return;            /* only the elements log157 flagged */
+  uint32_t sp = (uint32_t)(uintptr_t)self;
+  if (gui_ptrset_add(&g_gui_scaled, sp)) return;   /* already scaled, or seen */
+  float sc = (float)sh / 768.0f;             /* the factor the game uses itself */
+  uint32_t bits; memcpy(&bits, &sc, 4);
+  ScaleExt_orig(self, bits);
+  if (g_autoscaled < 64)
+    log_printf("[gui] autoscaled self=0x%08x %dx%d by x%.4f "
+               "(never went through ScaleExtentForResolution)", sp, w, h, sc);
+  g_autoscaled++;
+#else
+  (void)self; (void)w; (void)h;
+#endif
 }
 
 // log68 read the failing block's contents and they are UNWRITTEN: the bytes are

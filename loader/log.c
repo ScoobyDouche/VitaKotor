@@ -107,8 +107,43 @@ int log_jni_enabled(void) {
   return 1;
 }
 
+#if !LOG_DIAGNOSTICS
+/* Release quiet. Tags are literal prefixes of the format string, so this runs
+ * before any formatting: a suppressed line costs a handful of byte compares and
+ * nothing else. See LOG_DIAGNOSTICS in config.h.
+ *
+ * The keep-rule comes first on purpose. A line that reports a failure is worth
+ * more than the noise it sits in, and several of these tags carry both -- [GL]
+ * emits per-window statistics and shader compile failures alike. */
+static const char *const k_log_noisy[] = {
+  "[GL]", "[res]", "[JNI]", "[gui]", "[FS]", "[SDL]", "[snd?]", "[heap]",
+  "[big]", "[wd]", "[wd:t0]", "[wd:t1]", "[vgl]", "[input]", "[touch]",
+  "[load]", "[model]",
+};
+static const char *const k_log_keep[] = {
+  "fail", "FAIL", "error", "ERROR", "Error", "WARNING", "warning",
+  "MISSING", "missing", "abort", "ABORT", "CRASH", "unresolved",
+};
+
+static int log_suppressed(const char *fmt) {
+  if (!fmt || fmt[0] != '[') return 0;
+  for (unsigned i = 0; i < sizeof k_log_keep / sizeof k_log_keep[0]; i++)
+    if (strstr(fmt, k_log_keep[i])) return 0;
+  for (unsigned i = 0; i < sizeof k_log_noisy / sizeof k_log_noisy[0]; i++) {
+    const char *t = k_log_noisy[i];
+    size_t n = strlen(t);
+    if (!strncmp(fmt, t, n)) return 1;
+  }
+  return 0;
+}
+#endif
+
 void log_printf(const char *fmt, ...) {
   char line[1024];
+
+#if !LOG_DIAGNOSTICS
+  if (!g_panic && log_suppressed(fmt)) return;
+#endif
 
   // microsecond uptime stamp so ordering is unambiguous across threads
   uint64_t t = sceKernelGetProcessTimeWide();
