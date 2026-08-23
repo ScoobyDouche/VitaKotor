@@ -328,6 +328,20 @@ static void chan_finish(Chan *c) {
 static float g_lis_px = 0.0f, g_lis_py = 0.0f, g_lis_pz = 0.0f;
 static float g_lis_rx = 1.0f, g_lis_ry = 0.0f, g_lis_rz = 0.0f;   /* right vector */
 static unsigned g_lis_sets = 0, g_pos_sets = 0, g_mm_sets = 0;
+/* log159's first listener update carried fwd=(0,0,0) up=(0,0,0), so the cross
+ * product was degenerate and the right vector stayed at its (1,0,0) default --
+ * a stereo image nailed to a fixed world axis that never turns with the camera.
+ * Whether that persists is unknown, because the probe logged only the first
+ * call and then went silent, which was a bad probe.
+ *
+ * Until a valid basis arrives, do not pan at all. A centred image is merely
+ * missing information; panning off an arbitrary axis is confidently wrong, and
+ * on headphones that is far more disturbing than mono. */
+static int      g_lis_basis_ok = 0;
+static unsigned g_lis_degenerate = 0;
+/* Gain census: is attenuation reasonable, or is it burying everything? */
+static unsigned g_g3_n = 0, g_g3_loud = 0, g_g3_quiet = 0;
+static float    g_g3_min = 1.0f, g_g3_max = 0.0f, g_dist_max = 0.0f;
 
 /* Caller holds the lock. Returns linear gain and writes a pan in [-1,1]. */
 static float chan_3d_gain(const Chan *c, float *pan_out) {
@@ -346,9 +360,17 @@ static float chan_3d_gain(const Chan *c, float *pan_out) {
 
   if (c->occl > 0.0f) g *= (1.0f - (c->occl > 1.0f ? 1.0f : c->occl));
 
+  /* Census the spread so the next log can say whether this is sane. */
+  g_g3_n++;
+  if (g < g_g3_min) g_g3_min = g;
+  if (g > g_g3_max) g_g3_max = g;
+  if (d > g_dist_max) g_dist_max = d;
+  if (g >= 0.5f) g_g3_loud++; else if (g < 0.05f) g_g3_quiet++;
+
   /* Pan by projecting the direction onto the listener's right vector. At the
-   * listener's own position there is no direction, so stay centred. */
-  if (d > 0.0001f) {
+   * listener's own position there is no direction, so stay centred; and with no
+   * valid basis yet, panning would be off an arbitrary axis, so stay centred. */
+  if (g_lis_basis_ok && d > 0.0001f) {
     float p = (dx * g_lis_rx + dy * g_lis_ry + dz * g_lis_rz) / d;
     if (p < -1.0f) p = -1.0f; else if (p > 1.0f) p = 1.0f;
     *pan_out = p;
@@ -483,6 +505,7 @@ static unsigned g_ends_rescued = 0, g_ends_lost = 0;
  * count first and only then decide whether to re-home these. If the killed
  * total tracks the deficit, this is it. */
 static unsigned g_rel_calls = 0, g_rel_kill_live = 0, g_rel_kill_pend = 0;
+static unsigned g_play_calls = 0, g_play_badsnd = 0, g_play_nochan = 0;
 
 /* Stealing a voice must not silently swallow an END it still owes.
  *
@@ -868,12 +891,18 @@ have_pcm:;
                  "%u END on steal / %u lost, "
                  "%u release killed %u live / %u pending, "
                  "3D %u listener / %u pos / %u minmax, "
+                 "basis %s (%u degenerate), "
+                 "gain n=%u min=%.3f max=%.3f loud=%u quiet=%u maxdist=%.0f, "
+                 "playSound %u calls / %u badsnd / %u nochan, "
                  "chans %d used / %d playing / %d endPending of %d",
                  n, g_cache_hits, g_cache_miss, g_pcm_bytes / 1024, g_missing,
                  g_steals, g_steals_live, g_ends_fired, g_updates, g_played,
                  g_ends_rescued, g_ends_lost,
                  g_rel_calls, g_rel_kill_live, g_rel_kill_pend,
                  g_lis_sets, g_pos_sets, g_mm_sets,
+                 g_lis_basis_ok ? "OK" : "NONE", g_lis_degenerate,
+                 g_g3_n, g_g3_min, g_g3_max, g_g3_loud, g_g3_quiet, g_dist_max,
+                 g_play_calls, g_play_badsnd, g_play_nochan,
                  nused, nplaying, npend, g_nchannels);
   }
 
@@ -898,10 +927,16 @@ have_pcm:;
   return FMOD_OK;
 }
 
+/* g_played counts SUCCESSES, which cannot distinguish "the game stopped asking"
+ * from "the game asked and we turned it down" -- and log154 and log159 both show
+ * playSound flatlining exactly while the pool sits at 45 of 45. Count the calls
+ * themselves, and both ways one can fail. */
+
 static int Sys_playSound(void *self, void *sound, void *group, int paused, void **outch) {
   (void)self; (void)group;
+  g_play_calls++;
   if (outch) *outch = NULL;
-  if (!snd_valid(sound)) return FMOD_ERR_INVALID_PARAM;
+  if (!snd_valid(sound)) { g_play_badsnd++; return FMOD_ERR_INVALID_PARAM; }
   Snd *s = (Snd *)sound;
 
   audio_start();
@@ -921,7 +956,7 @@ static int Sys_playSound(void *self, void *sound, void *group, int paused, void 
     c->has_pos = 0;
   }
   unlock();
-  if (!c) return FMOD_ERR_INVALID_PARAM;
+  if (!c) { g_play_nochan++; return FMOD_ERR_INVALID_PARAM; }
   if (outch) *outch = c;
   if (g_played < 24)
     log_printf("[snd] playSound -> chan %d (%u ms, paused=%d)",
@@ -1125,17 +1160,26 @@ static int Sys_set3DListenerAttributes(void *self, int listener, const FmodVec *
     rz = up->x * fwd->y - up->y * fwd->x;
 #endif
     float len = sqrtf(rx * rx + ry * ry + rz * rz);
-    if (len > 0.0001f) { g_lis_rx = rx / len; g_lis_ry = ry / len; g_lis_rz = rz / len; }
+    if (len > 0.0001f) {
+      g_lis_rx = rx / len; g_lis_ry = ry / len; g_lis_rz = rz / len;
+      g_lis_basis_ok = 1;
+    } else {
+      g_lis_degenerate++;          /* zero fwd/up: keep the last good basis */
+    }
   }
   unlock();
-  /* Print the basis once: it is the one number here that cannot be checked
-   * without hardware, and a mirrored image is invisible in any counter. */
-  if (g_lis_sets == 0)
-    log_printf("[snd] listener basis: fwd=(%.2f,%.2f,%.2f) up=(%.2f,%.2f,%.2f) "
-               "-> right=(%.2f,%.2f,%.2f) [%s]",
+  /* Periodically, not once. The single first-call print in log159 caught the
+   * one update guaranteed to be uninitialised and then went blind, which said
+   * nothing about whether the basis is ever valid. */
+  if ((g_lis_sets % 8192) == 0)
+    log_printf("[snd] listener #%u: pos=(%.1f,%.1f,%.1f) fwd=(%.2f,%.2f,%.2f) "
+               "up=(%.2f,%.2f,%.2f) -> right=(%.2f,%.2f,%.2f) basis=%s "
+               "(%u degenerate) [%s]",
+               g_lis_sets, g_lis_px, g_lis_py, g_lis_pz,
                fwd ? fwd->x : 0.0f, fwd ? fwd->y : 0.0f, fwd ? fwd->z : 0.0f,
                up ? up->x : 0.0f, up ? up->y : 0.0f, up ? up->z : 0.0f,
                g_lis_rx, g_lis_ry, g_lis_rz,
+               g_lis_basis_ok ? "OK" : "NONE YET", g_lis_degenerate,
                AUDIO_3D_RIGHTHANDED ? "right-handed" : "left-handed");
   g_lis_sets++;
   return FMOD_OK;
