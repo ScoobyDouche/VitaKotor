@@ -413,6 +413,16 @@ static uintptr_t g_vap_max_off = 0;
 static unsigned  g_vap_over64k = 0;
 static unsigned g_bind_skipped_win = 0;   /* redundant binds we suppressed */
 static unsigned g_nontex2d_binds = 0;     /* cube/3D binds -- the envmap path */
+
+/* Live-texture census; the tallies live up here because the per-window stats
+ * line below reports them. TEXKIND_MAX and the maintenance helpers are further
+ * down with the rest of the texture-id bookkeeping. */
+#define TEXKIND_MAX  4096
+static uint32_t g_tex_bytes[TEXKIND_MAX];       /* per id, all mip levels */
+static uint64_t g_tex_live = 0, g_tex_peak = 0; /* bytes currently uploaded */
+static uint64_t g_tex_up = 0, g_tex_down = 0;   /* lifetime added / released */
+static unsigned g_tex_n_live = 0, g_tex_untracked = 0;
+
 static GLuint   g_cur_arraybuf = 0;      /* last glBindBuffer(GL_ARRAY_BUFFER) */
 
 static inline void draw_note_source(void) {
@@ -455,13 +465,17 @@ void gl_patch_on_swap(void) {
     if (o) log_printf("[GL]   draws by texture size (lifetime): %s", ab);
     log_printf("[GL]   per-window: clientArrayDraws=%u vboDraws=%u  texBinds=%u "
                "(skipped %u = %u%%) progSwitches=%u (skipped %u = %u%%) "
-               "bufferUploads=%u nonTex2DBinds=%u maxAttrOff=0x%x over64k=%u",
+               "bufferUploads=%u nonTex2DBinds=%u maxAttrOff=0x%x over64k=%u\n"
+               "[GL]   textures live: %u KB in %u ids (peak %u KB); "
+               "lifetime %u KB up / %u KB released, %u untracked ids",
                g_draw_client_win, g_draw_vbo_win, g_texbind_win, g_bind_skipped_win,
                g_texbind_win ? (g_bind_skipped_win * 100 / g_texbind_win) : 0,
                g_prog_win, g_prog_skipped_win,
                g_prog_win ? (g_prog_skipped_win * 100 / g_prog_win) : 0,
                g_bufdata_win, g_nontex2d_binds,
-               (unsigned)g_vap_max_off, g_vap_over64k);
+               (unsigned)g_vap_max_off, g_vap_over64k,
+               (unsigned)(g_tex_live >> 10), g_tex_n_live, (unsigned)(g_tex_peak >> 10),
+               (unsigned)(g_tex_up >> 10), (unsigned)(g_tex_down >> 10), g_tex_untracked);
     g_bind_skipped_win = g_prog_skipped_win = 0;
     g_arrays_win = g_elements_win = g_clears_win = 0;
     g_draw_client_win = g_draw_vbo_win = 0;
@@ -613,6 +627,53 @@ static void glActiveTexture_e(GLenum t) {
 #define TEXKIND_2D   1
 #define TEXKIND_CUBE 2
 static uint8_t  g_tex_kind[TEXKIND_MAX];
+
+/* ---- live texture census ---------------------------------------------------
+ * vitaGL's free pools fall from 79 MB vram / 87 MB ram at boot to single-digit
+ * vram and 57 MB ram after 49 minutes (log155), and the geometry corruption
+ * shows up late in exactly those long sessions. But vram is NOT a one-way
+ * drain -- it oscillates (1.3 MB free at t=185, 13.7 at t=547, 0.6 at t=2175,
+ * 7.0 at t=2717), so memory is genuinely being recycled and the pool is simply
+ * running at its ceiling. The ram pool is the one with a real trend, about
+ * 30 MB gone over the session.
+ *
+ * "The pool is full" and "we are leaking" look identical from a free-bytes
+ * counter, and they need opposite fixes. So count what is actually LIVE: bytes
+ * of texture we have uploaded and not yet seen deleted. If live bytes track the
+ * pool drain, the game is holding more and more texture and the fix is upstream
+ * eviction. If live bytes sit flat while the pools keep falling, vitaGL is not
+ * reclaiming what we delete and the fix is in the allocator.
+ *
+ * Keyed by texture id, which is exactly what glDeleteTextures gives back. A
+ * level-0 upload replaces the id's contents, so it resets the tally first and
+ * the mip levels that follow add onto it. Padded widths are charged at what is
+ * really allocated, not what the game asked for. */
+
+static void tex_charge(GLuint t, GLenum target, GLint level, GLsizei w, GLsizei h, GLenum fmt) {
+  if (!t || t >= TEXKIND_MAX) { g_tex_untracked++; return; }
+  /* A cube uploads six faces at the same id and level; only a 2D base level
+   * means "this id now holds a different image". */
+  if (target != GL_TEXTURE_2D) level = 1;
+  unsigned bpp = (fmt == GL_RGBA) ? 4u : (fmt == GL_RGB) ? 3u : 2u;
+  uint32_t add = (uint32_t)((w > 0 ? w : 0)) * (uint32_t)((h > 0 ? h : 0)) * bpp;
+  if (level == 0) {                       /* new base image: drop the old tally */
+    if (g_tex_bytes[t]) { g_tex_live -= g_tex_bytes[t]; g_tex_down += g_tex_bytes[t]; }
+    else                { g_tex_n_live++; }
+    g_tex_bytes[t] = 0;
+  }
+  g_tex_bytes[t] += add;
+  g_tex_live     += add;
+  g_tex_up       += add;
+  if (g_tex_live > g_tex_peak) g_tex_peak = g_tex_live;
+}
+
+static void tex_release(GLuint t) {
+  if (!t || t >= TEXKIND_MAX || !g_tex_bytes[t]) return;
+  g_tex_live -= g_tex_bytes[t];
+  g_tex_down += g_tex_bytes[t];
+  g_tex_bytes[t] = 0;
+  if (g_tex_n_live) g_tex_n_live--;
+}
 static GLuint   g_cur_cubetex = 0;
 
 static void tex_kind_set(GLuint t, uint8_t k) {
@@ -635,6 +696,7 @@ static void glDeleteTextures_e(GLsizei n, const GLuint *tex) {
       if (tex_kind_get(tex[i]) == TEXKIND_CUBE)
         log_printf("[GL] cube texture %u deleted", (unsigned)tex[i]);
       if (tex[i] && tex[i] < TEXKIND_MAX) g_tex_kind[tex[i]] = TEXKIND_NONE;
+      tex_release(tex[i]);
     }
   memset(g_bound2d, 0, sizeof g_bound2d);
   glDeleteTextures(n, tex);
@@ -776,10 +838,12 @@ static void glTexImage2D_e(GLenum tg, GLint l, GLint ifmt, GLsizei w, GLsizei h,
                  (unsigned)(tg - GL_TEXTURE_CUBE_MAP_POSITIVE_X), l, (int)w, (int)h,
                  (unsigned)ifmt, (unsigned)f, px ? "yes" : "NULL", faces);
     nc++;
+    tex_charge(g_cur_cubetex, tg, l, w, h, f);   /* cubes bind their own id */
     glTexImage2D(tg, l, ifmt, w, h, b, f, ty, px);
     return;                        // none of the 2D heuristics below apply
   }
-  if (tg != GL_TEXTURE_2D) { glTexImage2D(tg, l, ifmt, w, h, b, f, ty, px); return; }
+  if (tg != GL_TEXTURE_2D) { tex_charge(g_cur_tex, tg, l, w, h, f);
+                             glTexImage2D(tg, l, ifmt, w, h, b, f, ty, px); return; }
   // Square power-of-two base levels are the font atlases; naming the texture id
   // here is what lets the text-draw trace say whether a glyph quad used one.
   if (l == 0) {
@@ -850,6 +914,7 @@ static void glTexImage2D_e(GLenum tg, GLint l, GLint ifmt, GLsizei w, GLsizei h,
         }
       }
       log_printf("[GL] NPOT resample: %dx%d -> %dx%d (bpp=%d)", (int)w, (int)h, aw, (int)h, bpp);
+      tex_charge(g_cur_tex, tg, l, aw, h, f);
       glTexImage2D(tg, l, ifmt, aw, h, b, f, ty, pad);
       free(pad);
       return;
@@ -862,9 +927,11 @@ static void glTexImage2D_e(GLenum tg, GLint l, GLint ifmt, GLsizei w, GLsizei h,
     GLsizei aw = gl_rt_align_w(w);
     if (aw != w)
       log_printf("[GL] RT pad: color tex %dx%d -> %dx%d", (int)w, (int)h, (int)aw, (int)h);
+    tex_charge(g_cur_tex, tg, l, aw, h, f);
     glTexImage2D(tg, l, ifmt, aw, h, b, f, ty, px);
     return;
   }
+  tex_charge(g_cur_tex, tg, l, w, h, f);
   glTexImage2D(tg, l, ifmt, w, h, b, f, ty, px);
 }
 static void glTexParameteri_e(GLenum tg, GLenum p, GLint v) { GLLOG("glTexParameteri(0x%x,0x%x,%d)", (unsigned)tg, (unsigned)p, v); glTexParameteri(tg, p, v); }
