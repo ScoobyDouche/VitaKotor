@@ -354,6 +354,18 @@
 // Set to 1 if positional audio comes out mirrored.
 #define AUDIO_3D_RIGHTHANDED 0
 
+// Stream long audio assets instead of replacing them with timed silence.
+//
+// Music and long ambience decode to 14-24 MB of PCM, against a heap shared with
+// the game -- a 15 MB decode is what crashed a session mid-area once already.
+// Above STREAM_PCM_MAX an asset is now streamed: its compressed bytes stay
+// resident and a small ring of decoded PCM is refilled as it plays, so a track
+// costs about 1.5 MB and starts with no decode stall.
+//
+// Set to 0 to restore the previous behaviour exactly, where every such asset
+// became a correctly-timed silent placeholder and the score was never audible.
+#define AUDIO_STREAM_LONG_ASSETS 1
+
 // Upload textures as 16-bit instead of 32-bit.
 //
 // The live-texture census (log161) is emphatic that nothing leaks: 1,014,190 KB

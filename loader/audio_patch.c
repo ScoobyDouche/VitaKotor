@@ -64,6 +64,7 @@
 #include "config.h"
 #include "audio_patch.h"
 #include "audio_mp3.h"
+#include "audio_ring.h"
 #include "bigalloc.h"
 #include "sdl_patch.h"
 #include "log.h"
@@ -122,6 +123,27 @@
  * allocation the heap cannot take. Short VO/ambient (~1.3 MB) is unaffected. */
 #define STREAM_PCM_MAX   (6u * 1024u * 1024u)
 
+/* ---- incremental streams --------------------------------------------------
+ * Above STREAM_PCM_MAX an asset is streamed rather than silenced. It costs its
+ * compressed bytes (~1.4 MB for a music track) plus this ring, instead of the
+ * 14-24 MB the whole waveform would take.
+ *
+ * RING_FRAMES is the slack between the decoder and the mixer: 32768 frames is
+ * 0.74 s at 44.1 kHz and costs 128 KB at stereo. FEED_MAX_FRAMES bounds how much
+ * one grain may decode, so a refill can never overrun the output deadline -- the
+ * mixer consumes OUT_GRAIN (1024) frames per grain, so 4096 keeps the ring ahead
+ * with room to recover after a stall. */
+#define RING_FRAMES      32768u
+#define FEED_MAX_FRAMES  4096u
+
+typedef struct {
+  AudioMp3Stream *dec;
+  void     *src;        /* owned compressed ES from big_malloc; decoder reads it */
+  int16_t  *ring_buf;   /* RING_FRAMES * ch int16 units */
+  AudioRing ring;
+  int       loop;       /* honour FMOD_LOOP_NORMAL; the game sends LOOP_OFF */
+} Stream;
+
 /* ---- decoded-PCM cache ----------------------------------------------------
  * The game re-creates a Sound for the same asset constantly: in log110 ONE clip
  * was decoded 438 times and the whole run did 2569 decodes, ~12 a second. Each
@@ -143,6 +165,7 @@ typedef struct {
   int       is3d;                          /* created with FMOD_3D: attenuates */
   PcmEntry *ent;                           /* owns a reference */
   AudioPcm  pcm;                           /* borrowed copy of ent->pcm */
+  Stream   *st;                            /* non-NULL => streamed, pcm.pcm NULL */
 } Snd;
 
 /* The END callback the companion registers on every voice. All parameters are
@@ -257,6 +280,95 @@ static PcmEntry *cache_insert(unsigned len, uint32_t h, const AudioPcm *pcm) {
 
 static void cache_release(PcmEntry *e) {
   if (e && e->refs > 0) e->refs--;
+}
+
+/* ---- streaming ------------------------------------------------------------
+ * Live streaming decoders. Each holds one sceAudiodec handle for the life of a
+ * track, and the pool is fixed at InitLibrary. Keeping this strictly below
+ * AUDIO_MP3_DECODER_POOL guarantees a free slot for the short synchronous
+ * decodes -- VO and effects -- so a stream can never silence dialogue, even if
+ * one is somehow leaked.
+ *
+ * Mutated only under the mixer lock. */
+static int      g_stream_decoders = 0;
+static unsigned g_streams_open = 0;        /* lifetime count, for the log */
+static unsigned g_stream_underruns = 0;    /* mixer wanted a frame we lacked */
+
+/* The ring's decoder end. Looping is honoured but the game passes LOOP_OFF and
+ * drives its own music playlist -- looping here would mean a track could never
+ * end and the area's music would never change. */
+static unsigned stream_fill_cb(void *ctx, int16_t *dst, unsigned frames,
+                               int *eos_out) {
+  Stream *st = (Stream *)ctx;
+  unsigned got = audio_mp3_stream_read(st->dec, dst, frames);
+  if (!got && audio_mp3_stream_eos(st->dec)) {
+    if (st->loop) {
+      audio_mp3_stream_rewind(st->dec);
+      got = audio_mp3_stream_read(st->dec, dst, frames);
+      if (!got) *eos_out = 1;
+    } else {
+      *eos_out = 1;
+    }
+  }
+  return got;
+}
+
+/* Takes ownership of `src_owned` on success. `es`/`len` name the MP3 bytes
+ * inside it. Caller must hold NO lock: this allocates and touches hardware. */
+static Stream *stream_open(void *src_owned, const void *es, unsigned len,
+                           AudioPcm *fmt, int loop) {
+  int live;
+  lock();
+  live = g_stream_decoders;
+  unlock();
+  if (live >= AUDIO_MP3_STREAM_MAX) {
+    log_printf("[snd] stream decoder cap reached (%d of pool %d) -- not streaming this one",
+               live, AUDIO_MP3_DECODER_POOL);
+    return NULL;
+  }
+
+  Stream *st = (Stream *)calloc(1, sizeof *st);
+  if (!st) return NULL;
+
+  st->dec = audio_mp3_stream_open(es, len, fmt);
+  if (!st->dec) { free(st); return NULL; }
+
+  unsigned ch = (fmt && fmt->channels) ? fmt->channels : 1;
+  st->src      = src_owned;
+  st->loop     = loop;
+  st->ring_buf = (int16_t *)big_malloc((size_t)RING_FRAMES * ch * sizeof(int16_t));
+  if (!st->ring_buf) {
+    audio_mp3_stream_close(st->dec);
+    free(st);
+    return NULL;
+  }
+  audio_ring_init(&st->ring, st->ring_buf, RING_FRAMES, ch);
+
+  lock();
+  g_stream_decoders++;
+  g_streams_open++;
+  unlock();
+  return st;
+}
+
+/* Caller must hold NO lock, and must already have detached every channel and
+ * cleared the owning Snd's `st` under the lock -- see Snd_release.
+ *
+ * Both buffers go back through big_free: they came from big_malloc and at
+ * 1.4 MB always land in the pool, and only the game's imported free does the
+ * address-range check that tells pool pointers from newlib's. */
+static void stream_close(Stream *st) {
+  if (!st) return;
+  if (st->dec) {
+    audio_mp3_stream_close(st->dec);
+    st->dec = NULL;
+    lock();
+    g_stream_decoders--;                   /* the handle went back to the pool */
+    unlock();
+  }
+  big_free(st->ring_buf);
+  big_free(st->src);
+  free(st);
 }
 
 unsigned audio_cache_bytes(void) { return g_pcm_bytes; }
@@ -1036,9 +1148,15 @@ static int Snd_release(void *self) {
     }
   cache_release(s->ent);          /* samples stay cached for the next request */
   s->ent = NULL;
+  /* Detach the stream under the same lock the feeder runs under, so it cannot
+   * be mid-decode on a Stream we are about to free. Streams are never cached:
+   * each owns its decoder, ring and compressed bytes outright. */
+  Stream *st = s->st;
+  s->st = NULL;
   memset(&s->pcm, 0, sizeof s->pcm);
   s->used = 0;
   unlock();
+  stream_close(st);               /* outside the lock: frees memory, hits hardware */
   return FMOD_OK;
 }
 
