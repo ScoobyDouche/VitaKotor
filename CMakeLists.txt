@@ -24,7 +24,13 @@ set(VITA_MKSFOEX_FLAGS "-d ATTRIBUTE2=12")
 # softfp, so the RUNTIME port will need a softfp toolchain (rebuild vitaGL &
 # deps with -mfloat-abi=softfp) to match float arguments across the .so
 # boundary. That is a runtime-phase concern; this skeleton only needs to link.
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -g -D_GNU_SOURCE -Wl,-q -Wall -O2 -fno-optimize-sibling-calls")
+# -z max-page-size: vita-elf-create appends ~4.5 KB of SCE data into the slack
+# between the RX and RW segments, and with the default 4 KB alignment that slack
+# is one page -- so a build fails with "Cannot allocate N bytes for SCE data at
+# end of segment 0" as soon as .text lands in the wrong place. It did, over 32
+# bytes. At 64 KB the slack is a page of 64 KB rather than 4 KB, which is 14x
+# what the SCE data needs and is a floor rather than a coincidence.
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -g -D_GNU_SOURCE -Wl,-q -Wl,-z,max-page-size=0x10000 -Wall -O2 -fno-optimize-sibling-calls")
 set(CMAKE_CXX_FLAGS "${CMAKE_C_FLAGS} -std=c++11 -Wno-write-strings")
 
 add_executable(KOTOR
