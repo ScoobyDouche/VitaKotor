@@ -871,6 +871,28 @@ static unsigned g_ends_rescued = 0, g_ends_lost = 0;
 static unsigned g_rel_calls = 0, g_rel_kill_live = 0, g_rel_kill_pend = 0;
 static unsigned g_play_calls = 0, g_play_badsnd = 0, g_play_nochan = 0;
 
+/* Channel::stop is the ONE exit from a channel that clears it without raising
+ * END, and until now it was the one exit with no counter. That mattered: in
+ * log170-172 playSound ran 200-300 ahead of END delivery for the whole session,
+ * and there was no way to tell "the game stopped 250 sounds itself, which is
+ * normal and needs no END" from "we lost 250 ENDs, which wedges its voice
+ * pool". Every other path is already counted and every one of them reads zero,
+ * so if stops account for the gap our side is arithmetically clean and the leak
+ * is above us; if they do not, the remainder is ours and this is where to look.
+ *
+ * Split by what the channel was doing, because an explicit stop of a voice that
+ * had already finished is bookkeeping, while stopping one mid-play or with an
+ * END still owed is the game discarding a notification it asked for. */
+static unsigned g_stop_calls = 0, g_stop_live = 0, g_stop_pend = 0, g_stop_stale = 0;
+
+/* setPaused, split by direction. A channel the mixer skips is invisible in
+ * every other counter: mix_grain drops paused channels before it can advance
+ * or finish them, so one left paused never ends, never raises END, and is never
+ * stealable either -- chan_alloc only steals voices that are NOT playing, and
+ * paused does not clear playing. That is a permanent hold on a game voice with
+ * no trace at all today, and the census below now names it. */
+static unsigned g_pause_set = 0, g_pause_clr = 0;
+
 /* Stealing a voice must not silently swallow an END it still owes.
  *
  * KOTOR never polls FMOD to learn that a sound finished: FModAudioSystem reads
@@ -1272,64 +1294,6 @@ static int Sys_createSound(void *self, const char *name, unsigned mode,
   }
 
 have_pcm:;
-  /* Steady-state visibility. The first-24 caps hide exactly the phase that
-   * matters (combat), and without a hit/miss ratio there is no way to tell a
-   * working cache from a broken key. */
-  {
-    static unsigned n = 0;
-    /* g_played is the discriminator log4 lacked. Its END rate fell from ~127 per
-     * 128 createSound to 0 while createSound itself kept climbing, and both
-     * steal counters froze -- which is either "the game stopped calling
-     * playSound" or "sounds are played but never finish", and nothing logged
-     * could tell the two apart. A live channel census settles it alongside. */
-    int nused = 0, nplaying = 0, npend = 0;
-    lock();
-    for (int i = 0; i < MAX_CHANNELS; i++) {
-      if (!g_chan[i].used) continue;
-      nused++;
-      if (g_chan[i].playing)     nplaying++;
-      if (g_chan[i].end_pending) npend++;
-    }
-    unlock();
-    if ((++n & 127) == 0)
-      log_printf("[snd] stats: %u createSound, cache %u hit / %u miss, "
-                 "%u KB PCM held, %u decode fail, voices reused %u/%u (done/live), "
-                 "%u END sent over %u updates, %u playSound, "
-                 "%u END on steal / %u lost, "
-                 "%u release killed %u live / %u pending, "
-                 "3D %u listener / %u pos / %u minmax, "
-                 "basis %s (%u degenerate), "
-                 "gain n=%u min=%.3f max=%.3f loud=%u quiet=%u maxdist=%.0f "
-                 "(worst %.3f at d=%.1f, min/max %.1f/%.1f), "
-                 "playSound %u calls / %u badsnd / %u nochan, "
-                 "limiter gain %.3f (min %.3f), %u of %u grains over (peak %d = %.1fx), "
-                 "vol2d n=%u min=%.3f max=%.3f avg=%.3f, "
-                 "vol3d n=%u min=%.3f max=%.3f avg=%.3f, "
-                 "bus2d avg=%.3f over %u, bus3d avg=%.3f over %u, "
-                 "streams %u opened / %d live / %u underruns, "
-                 "decode %u us avg / %u us worst over %u grains (budget 21333), "
-                 "chans %d used / %d playing / %d endPending of %d",
-                 n, g_cache_hits, g_cache_miss, g_pcm_bytes / 1024, g_missing,
-                 g_steals, g_steals_live, g_ends_fired, g_updates, g_played,
-                 g_ends_rescued, g_ends_lost,
-                 g_rel_calls, g_rel_kill_live, g_rel_kill_pend,
-                 g_lis_sets, g_pos_sets, g_mm_sets,
-                 g_lis_basis_ok ? "OK" : "NONE", g_lis_degenerate,
-                 g_g3_n, g_g3_min, g_g3_max, g_g3_loud, g_g3_quiet, g_dist_max,
-                 g_g3_worst, g_g3_worst_d, g_g3_worst_mn, g_g3_worst_mx,
-                 g_play_calls, g_play_badsnd, g_play_nochan,
-                 g_lim_gain, g_lim_min, g_lim_clipped, g_lim_grains,
-                 (int)g_lim_peak, (double)g_lim_peak / 32767.0,
-                 g_vol_n2d, g_vol_min2d, g_vol_max2d,
-                 g_vol_n2d ? g_vol_sum2d / (float)g_vol_n2d : 0.0f,
-                 g_vol_n3d, g_vol_min3d, g_vol_max3d,
-                 g_vol_n3d ? g_vol_sum3d / (float)g_vol_n3d : 0.0f,
-                 g_mix_n2d ? g_mix_sum2d / (float)g_mix_n2d : 0.0f, g_mix_n2d,
-                 g_mix_n3d ? g_mix_sum3d / (float)g_mix_n3d : 0.0f, g_mix_n3d,
-                 g_streams_open, g_stream_decoders, g_stream_underruns,
-                 g_feed_n ? g_feed_us_tot / g_feed_n : 0u, g_feed_us_max, g_feed_n,
-                 nused, nplaying, npend, g_nchannels);
-  }
 
   lock();
   Snd *s = snd_alloc();
@@ -1474,6 +1438,10 @@ static int Ch_stop(void *self) {
   if (!chan_valid(self)) return FMOD_ERR_INVALID_PARAM;
   lock();
   Chan *c = (Chan *)self;
+  g_stop_calls++;
+  if (!c->used)          g_stop_stale++;   /* handle the game kept past recycling */
+  else if (c->playing)   g_stop_live++;    /* cut off mid-play */
+  else if (c->end_pending) g_stop_pend++;  /* an END it asked for and discarded */
   c->playing = 0;
   c->used    = 0;
   c->end_pending = 0;
@@ -1483,7 +1451,10 @@ static int Ch_stop(void *self) {
 }
 static int Ch_setPaused(void *self, int paused) {
   if (!chan_valid(self)) return FMOD_ERR_INVALID_PARAM;
+  lock();                       /* the mixer reads this flag on the audio thread */
   ((Chan *)self)->paused = paused ? 1 : 0;
+  if (paused) g_pause_set++; else g_pause_clr++;
+  unlock();
   return FMOD_OK;
 }
 static int Ch_setVolume(void *self, uint32_t v) {          /* softfp float */
@@ -1652,6 +1623,84 @@ static int Sys_set3DListenerAttributes(void *self, int listener, const FmodVec *
                AUDIO_3D_RIGHTHANDED ? "right-handed" : "left-handed");
   g_lis_sets++;
   return FMOD_OK;
+}
+
+/* One census line, on a clock.
+ *
+ * This used to fire every 128th createSound, which is a rate that collapses
+ * exactly when the thing it measures does: in log172 the interval stretched
+ * from 20 s to 60 s over the same window the game stopped playing sounds, so
+ * the record thinned out precisely where it needed to be dense. The watchdog
+ * already ticks on a fixed schedule; report from there instead, and count
+ * createSound as one of the figures rather than using it as the clock.
+ *
+ * Called from the watchdog thread, so everything here either reads a plain
+ * counter -- torn reads do not matter for a log line -- or takes the lock. */
+unsigned audio_play_count(void) { return g_play_calls; }
+
+void audio_log_stats(void) {
+  {
+    /* g_played is the discriminator log4 lacked. Its END rate fell from ~127 per
+     * 128 createSound to 0 while createSound itself kept climbing, and both
+     * steal counters froze -- which is either "the game stopped calling
+     * playSound" or "sounds are played but never finish", and nothing logged
+     * could tell the two apart. A live channel census settles it alongside. */
+    int nused = 0, nplaying = 0, npend = 0, npaused = 0;
+    lock();
+    for (int i = 0; i < MAX_CHANNELS; i++) {
+      if (!g_chan[i].used) continue;
+      nused++;
+      /* paused is counted APART from playing, not inside it. The mixer drops a
+       * paused channel before it can advance or finish, so one left paused is a
+       * voice that can never end and can never be stolen -- and until now it
+       * was reported as "playing", which is the one reading that hides it. */
+      if (g_chan[i].playing && g_chan[i].paused) npaused++;
+      else if (g_chan[i].playing)                nplaying++;
+      if (g_chan[i].end_pending)                 npend++;
+    }
+    unlock();
+      log_printf("[snd] stats: %u createSound, cache %u hit / %u miss, "
+                 "%u KB PCM held, %u decode fail, voices reused %u/%u (done/live), "
+                 "%u END sent over %u updates, %u playSound, "
+                 "%u END on steal / %u lost, "
+                 "%u release killed %u live / %u pending, "
+                 "3D %u listener / %u pos / %u minmax, "
+                 "basis %s (%u degenerate), "
+                 "gain n=%u min=%.3f max=%.3f loud=%u quiet=%u maxdist=%.0f "
+                 "(worst %.3f at d=%.1f, min/max %.1f/%.1f), "
+                 "playSound %u calls / %u badsnd / %u nochan, "
+                 "limiter gain %.3f (min %.3f), %u of %u grains over (peak %d = %.1fx), "
+                 "vol2d n=%u min=%.3f max=%.3f avg=%.3f, "
+                 "vol3d n=%u min=%.3f max=%.3f avg=%.3f, "
+                 "bus2d avg=%.3f over %u, bus3d avg=%.3f over %u, "
+                 "streams %u opened / %d live / %u underruns, "
+                 "decode %u us avg / %u us worst over %u grains (budget 21333), "
+                 "stop %u calls (%u live / %u pending / %u stale), "
+                 "paused %u set / %u cleared, "
+                 "chans %d used / %d playing / %d paused / %d endPending of %d",
+                 g_created, g_cache_hits, g_cache_miss, g_pcm_bytes / 1024, g_missing,
+                 g_steals, g_steals_live, g_ends_fired, g_updates, g_played,
+                 g_ends_rescued, g_ends_lost,
+                 g_rel_calls, g_rel_kill_live, g_rel_kill_pend,
+                 g_lis_sets, g_pos_sets, g_mm_sets,
+                 g_lis_basis_ok ? "OK" : "NONE", g_lis_degenerate,
+                 g_g3_n, g_g3_min, g_g3_max, g_g3_loud, g_g3_quiet, g_dist_max,
+                 g_g3_worst, g_g3_worst_d, g_g3_worst_mn, g_g3_worst_mx,
+                 g_play_calls, g_play_badsnd, g_play_nochan,
+                 g_lim_gain, g_lim_min, g_lim_clipped, g_lim_grains,
+                 (int)g_lim_peak, (double)g_lim_peak / 32767.0,
+                 g_vol_n2d, g_vol_min2d, g_vol_max2d,
+                 g_vol_n2d ? g_vol_sum2d / (float)g_vol_n2d : 0.0f,
+                 g_vol_n3d, g_vol_min3d, g_vol_max3d,
+                 g_vol_n3d ? g_vol_sum3d / (float)g_vol_n3d : 0.0f,
+                 g_mix_n2d ? g_mix_sum2d / (float)g_mix_n2d : 0.0f, g_mix_n2d,
+                 g_mix_n3d ? g_mix_sum3d / (float)g_mix_n3d : 0.0f, g_mix_n3d,
+                 g_streams_open, g_stream_decoders, g_stream_underruns,
+                 g_feed_n ? g_feed_us_tot / g_feed_n : 0u, g_feed_us_max, g_feed_n,
+                 g_stop_calls, g_stop_live, g_stop_pend, g_stop_stale,
+                 g_pause_set, g_pause_clr,
+                 nused, nplaying, npaused, npend, g_nchannels);
+  }
 }
 
 /* OpenSLES interface IDs are data objects the engine dereferences by address;

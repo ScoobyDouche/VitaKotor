@@ -21,4 +21,14 @@ unsigned audio_cache_bytes(void);
 // Sound still points at is kept.
 unsigned audio_cache_purge(void);
 
+// One [snd] stats census line. Driven by the watchdog's clock rather than by
+// createSound volume, because a volume-triggered summary thins out exactly when
+// the thing it measures stops -- which is what happened in log172.
+void audio_log_stats(void);
+
+// playSound calls that actually reached the mixer. The sound pipeline census in
+// main.c prints this beside the game's own PlaySound count: a gap between them
+// is the game refusing itself, which no counter on this side can see.
+unsigned audio_play_count(void);
+
 #endif
