@@ -63,10 +63,17 @@
 // RAM vitaGL must LEAVE UNCLAIMED. It takes everything else at vglInitExtended,
 // which runs before the game does, so anything we mean to allocate later has to
 // be inside this number or it will not be there. It was 16 MB when newlib held
-// 192; newlib now holds 160 and bigalloc wants up to 32 of the difference, so
-// this is 16 + 32. Leave the two in step: shrinking newlib without raising this
+// 192; newlib now holds 160 and bigalloc wants the difference, so this is
+// 16 + BIGALLOC. Leave the two in step: shrinking newlib without raising this
 // just hands the difference to vitaGL and the pool finds nothing.
-#define MEMORY_VITAGL_THRESHOLD_MB 48
+//
+// 48 -> 80 because vitaGL was not using it. Across log170-172 its RAM heap was
+// 122 MB and its free figure never once fell below 73.8 MB -- it holds about
+// 48 MB of a 122 MB claim, all session, in every session. Taking 32 MB of that
+// leaves it ~42 MB of headroom against a working set it has never exceeded,
+// and the pool commits segments lazily, so if the extra is never needed it
+// simply stays unclaimed instead of sitting idle inside vitaGL.
+#define MEMORY_VITAGL_THRESHOLD_MB 80
 
 // Big-allocation pool (bigalloc.c). Everything at or above BIGALLOC_MIN_BYTES is
 // served from segments of our own instead of newlib's arena, because mixing
@@ -79,12 +86,24 @@
 // pool's best-fit walk costs nothing.
 //
 // This budget is TAKEN FROM newlib, not added: vitaGL claims everything except
-// MEMORY_VITAGL_THRESHOLD_MB, so there is nothing spare. 160 + 32 is the old
-// 192. Both halves are provisional -- the [big] log line reports peak live and
-// fallback count, which is what says whether to move the line.
+// MEMORY_VITAGL_THRESHOLD_MB, so there is nothing spare.
+//
+// 32 -> 64 MB, and the [big] line is what says so. Peak live was 30, 31 and
+// 31 MB in log170, log171 and log172 -- the pool ran pinned against a 32 MB
+// ceiling for whole sessions, which means "peak 31" is the ceiling reporting
+// itself rather than a measurement of demand. What it turned away went to
+// newlib instead: 237, 622 and 648 fallbacks, of up to 4.3 MB each, mixed in
+// among the game's thousands of small long-lived objects. That is precisely
+// the mixing this pool exists to prevent, and log171 shows where it ends --
+// operator new failing on 1 MB with 46.8 MB free and a largest servable block
+// of 512 KB, bad_alloc, uncaught, dead.
+//
+// Segments are committed on demand, so this is a ceiling and not a reservation.
+// The fallback line now carries total bytes and worst single request, which is
+// what will say whether 64 is enough or still short.
 #define BIGALLOC_MIN_BYTES (256u * 1024u)
 #define BIGALLOC_SEG_MB    8
-#define BIGALLOC_MAX_SEGS  4
+#define BIGALLOC_MAX_SEGS  8
 
 // Multisampling. We shipped SCE_GXM_MULTISAMPLE_4X, which makes the GPU shade
 // and resolve 4x the fragments at 960x544 -- on a Vita that is a luxury, and it

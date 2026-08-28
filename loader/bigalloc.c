@@ -106,6 +106,17 @@ static int      s_inited;
 
 static size_t   s_live, s_peak;           /* payload bytes handed out */
 static unsigned s_nlive, s_nalloc, s_nfallback, s_nsegfail;
+/* What the pool turned away, not just how often.
+ *
+ * "%u fell back to malloc" was a count with no size on it, and sizing the pool
+ * from a count is guesswork: 622 refusals in log171 could be 622 x 300 KB or
+ * 622 x 4 MB, and those want different budgets. Every refusal here goes to
+ * newlib instead, which is the mixing this pool exists to prevent -- log171
+ * died with 46.8 MB free and a largest servable block of 512 KB. Record the
+ * bytes and the worst single request so the next log states the shortfall
+ * rather than implying one. */
+static uint32_t s_fb_max;
+static uint64_t s_fb_bytes;
 
 static Hdr *hdr_of(void *p)          { return (Hdr *)((unsigned char *)p - HDR_SZ); }
 static void *payload_of(Hdr *h)      { return (unsigned char *)h + HDR_SZ; }
@@ -188,7 +199,13 @@ void *bigalloc(size_t n) {
   Seg *s = NULL;
   Hdr *h = find_fit(need, &s);
   if (!h && seg_add()) h = find_fit(need, &s);
-  if (!h) { s_nfallback++; unlock(); return NULL; }
+  if (!h) {
+    s_nfallback++;
+    s_fb_bytes += need;
+    if (need > s_fb_max) s_fb_max = need;
+    unlock();
+    return NULL;
+  }
 
   split(s, h, need);
   h->inuse = 1;
@@ -316,8 +333,10 @@ void bigalloc_log(const char *why) {
   unlock();
 
   log_printf("[big] %s%u/%u MB live in %u blocks (peak %u MB), %u free blocks, "
-             "largest %u KB; %u served, %u fell back to malloc, %u segment fails",
+             "largest %u KB; %u served, %u fell back to malloc "
+             "(%u MB total, worst %u KB), %u segment fails",
              why ? why : "", (unsigned)(s_live >> 20), (unsigned)(cap >> 20), s_nlive,
              (unsigned)(s_peak >> 20), nfree, largest / 1024u,
-             s_nalloc, s_nfallback, s_nsegfail);
+             s_nalloc, s_nfallback,
+             (unsigned)(s_fb_bytes >> 20), s_fb_max / 1024u, s_nsegfail);
 }
