@@ -117,6 +117,9 @@ static volatile SceUID g_game_thid = -1;
 // no traceable calls, without a userland PC read.
 static uint64_t g_thread_last_run[GAME_THREADS_MAX];
 
+/* Defined with the sound probes further down; the watchdog is its clock. */
+static void sound_pipeline_census(void);
+
 static void *watchdog_thread(void *arg) {
   (void)arg;
   uint64_t last_run = 0;
@@ -164,6 +167,17 @@ static void *watchdog_thread(void *arg) {
     {
       static unsigned itick = 0;
       if (itick++ % 4 == 0) { input_probe_census(); sdl_input_census(); }
+    }
+    /* Sound, on the same clock and for the same reason. The pipeline line is
+     * short, so every fourth tick (12s); the stats line is long and used to
+     * arrive every 128th createSound, so every eighth (24s) keeps its old
+     * density without inheriting its habit of thinning out exactly when the
+     * game goes quiet. */
+    {
+      static unsigned stick = 0;
+      if (stick % 4 == 0) sound_pipeline_census();
+      if (stick % 8 == 0) audio_log_stats();
+      stick++;
     }
     log_printf("[vgl] free: vram %u/%u KB, ram %u/%u KB, phycont %u/%u KB",
                (unsigned)(vglMemFree(VGL_MEM_VRAM) / 1024u),
@@ -1855,6 +1869,46 @@ static void *ExoSoundInit_probe(void *self, unsigned a, unsigned b, int c, int d
 static void *(*SndSrcCtor_orig)(void *, const void *) = NULL;
 static void *(*SndSrcPlay_orig)(void *) = NULL;
 
+/* The sound pipeline, counted end to end.
+ *
+ * Every one of these probes printed its first 40 calls and then went silent --
+ * which in log170-172 was around t=50 s, i.e. before anything interesting had
+ * happened. So when the game stopped playing sounds at t=1030 in log172 the
+ * log could say that OUR playSound had gone to zero, and nothing whatever about
+ * why: the four layers above it had stopped reporting sixteen minutes earlier.
+ *
+ * Counting is free, so count always and keep the printing capped. The layers
+ * are, top to bottom:
+ *
+ *   CExoSoundSource::Play   the game deciding to play something
+ *   SoundSource::Demand     resolving the asset (NULL m_pRes = cannot proceed)
+ *   FMod::CreateSound       building the FMOD Sound   -> our createSound
+ *   FMod::PlaySound         asking FMOD for a voice   -> our playSound
+ *
+ * The gap between any two adjacent rows names the layer that stopped. The one
+ * that matters most is the last: if the game's PlaySound count runs ahead of
+ * the count that reached our mixer, the game is refusing itself for want of a
+ * free voice -- it has 24 2D + 16 3D of them -- and no counter on our side of
+ * the boundary can see that. If they track each other, the wedge is higher up. */
+static unsigned g_src_ctor = 0, g_src_play = 0, g_src_play_noint = 0;
+static unsigned g_demand = 0, g_demand_nores = 0, g_demand_fail = 0;
+static unsigned g_streaminit = 0, g_streaminit_fail = 0;
+static unsigned g_fmod_create = 0, g_fmod_createstream = 0;
+static unsigned g_fmod_play = 0, g_fmod_play_null = 0;
+
+static void sound_pipeline_census(void) {
+  log_printf("[snd?] pipeline: %u SoundSource ctor, %u Play (%u no internal), "
+             "%u Demand (%u no CRes / %u failed), %u StreamInit (%u failed), "
+             "%u CreateSound + %u CreateStream, %u PlaySound (%u returned null) "
+             "-> %u reached the mixer  [gap %d]",
+             g_src_ctor, g_src_play, g_src_play_noint,
+             g_demand, g_demand_nores, g_demand_fail,
+             g_streaminit, g_streaminit_fail,
+             g_fmod_create, g_fmod_createstream,
+             g_fmod_play, g_fmod_play_null, audio_play_count(),
+             (int)g_fmod_play - (int)audio_play_count());
+}
+
 static void *SndSrcCtor_probe(void *self, const void *resref) {
   static unsigned n = 0;
   if (n < 40) {
@@ -1864,7 +1918,7 @@ static void *SndSrcCtor_probe(void *self, const void *resref) {
       if (nm[i] && (nm[i] < 0x20 || nm[i] > 0x7e)) nm[i] = '.';
     log_printf("[snd?] CExoSoundSource(\"%s\") #%u", nm, n);
   }
-  n++;
+  n++; g_src_ctor++;
   return SndSrcCtor_orig(self, resref);
 }
 static void *SndSrcPlay_probe(void *self) {
@@ -1873,7 +1927,7 @@ static void *SndSrcPlay_probe(void *self) {
   if (n < 40)
     log_printf("[snd?] CExoSoundSource::Play() #%u m_pInternal=%p%s", n, internal,
                internal ? "" : "  <<< NULL internal, nothing can play");
-  n++;
+  n++; g_src_play++; if (!internal) g_src_play_noint++;
   return SndSrcPlay_orig(self);
 }
 
@@ -1884,14 +1938,14 @@ static void *SndDemand_probe(void *self) {
   if (n < 40)
     log_printf("[snd?] SoundSource::Demand #%u m_pRes=%p -> %p%s", n, res, rc,
                res ? "" : "  <<< no CRes, cannot reach CreateSound");
-  n++;
+  n++; g_demand++; if (!res) g_demand_nores++; if (!rc) g_demand_fail++;
   return rc;
 }
 static void *StreamInit_probe(void *self) {
   void *rc = StreamInit_orig(self);
   static unsigned n = 0;
   if (n < 40) log_printf("[snd?] StreamingSource::InitializeSource #%u -> %p", n, rc);
-  n++;
+  n++; g_streaminit++; if (!rc) g_streaminit_fail++;
   return rc;
 }
 static unsigned g_nclose = 0, g_nrelease = 0;   /* stream/sound teardown counts */
@@ -1902,7 +1956,7 @@ static void *FmodCreateSound_probe(void *self, char *name, int id, void *data,
   if (n < 40)
     log_printf("[snd?] FMod::CreateSound #%u \"%s\" id=%d data=%p size=%u (%d,%d)",
                n, name ? name : "?", id, data, size, e, f);
-  n++;
+  n++; g_fmod_create++;
   return FmodCreateSound_orig(self, name, id, data, size, e, f);
 }
 /* Churn detector.
@@ -1946,7 +2000,7 @@ static void *FmodCreateStream_probe(void *self, char *name, void *rw, int c, int
     log_printf("[snd?] FMod::CreateStream #%u \"%s\" rw=%p (%d,%d,%d,%d,%d)  "
                "[files open=%d, closes so far=%u]",
                n, name ? name : "?", rw, c, d, e, f, g, io_open_count(), g_nclose);
-  n++;
+  n++; g_fmod_createstream++;
   createstream_churn(name ? name : "?");
   return FmodCreateStream_orig(self, name, rw, c, d, e, f, g);
 }
@@ -1983,9 +2037,10 @@ static void *FmodReleaseSound_probe(void *self, int id) {
 
 static void *FmodPlaySound_probe(void *self, int id) {
   static unsigned n = 0;
-  if (n < 40) log_printf("[snd?] FMod::PlaySound #%u id=%d", n, id);
-  n++;
-  return FmodPlaySound_orig(self, id);
+  void *rc = FmodPlaySound_orig(self, id);
+  if (n < 40) log_printf("[snd?] FMod::PlaySound #%u id=%d -> %p", n, id, rc);
+  n++; g_fmod_play++; if (!rc) g_fmod_play_null++;
+  return rc;
 }
 
 // hook_named() resolves against libKOTOR; the FModAudioSystem methods live in the
