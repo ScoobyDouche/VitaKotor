@@ -41,8 +41,6 @@ so_module port_mod;
 so_module miniz_mod;
 so_module lzma_mod;
 
-SceTouchPanelInfo panelInfoFront, panelInfoBack;
-
 unsigned int _newlib_heap_size_user = MEMORY_NEWLIB_MB * 1024 * 1024;
 
 int debugPrintf(const char *text, ...) {
@@ -159,11 +157,8 @@ static void *watchdog_thread(void *arg) {
       }
     }
     /* Input census, every fourth tick (12s). Two lines: what the hardware is
-     * doing, and what the game consumed from SDL in the same window. log166 lost
-     * the camera (right stick) and touch while BUTTONS -- same joystick, same
-     * queue -- kept working, and nothing in the log could say whether the pad
-     * stopped reporting, SDL stopped delivering, or the game stopped listening.
-     * These two lines separate those three. */
+     * doing, and what the game consumed from SDL in the same window. This tells
+     * us whether a dead stick originated in the pad, SDL, or the game. */
     {
       static unsigned itick = 0;
       if (itick++ % 4 == 0) { input_probe_census(); sdl_input_census(); }
@@ -2413,11 +2408,8 @@ int main(int argc, char *argv[]) {
   sceKernelChangeThreadCpuAffinityMask(0, 0x40000);
 
   sceCtrlSetSamplingModeExt(SCE_CTRL_MODE_ANALOG_WIDE);
-  sceTouchSetSamplingState(SCE_TOUCH_PORT_FRONT, SCE_TOUCH_SAMPLING_STATE_START);
-  /* Back panel deliberately NOT sampled: it is where fingers rest while
-   * holding the console, and any sampling port becomes SDL finger events. */
-  sceTouchGetPanelInfo(SCE_TOUCH_PORT_FRONT, &panelInfoFront);
-  sceTouchGetPanelInfo(SCE_TOUCH_PORT_BACK, &panelInfoBack);
+  sceTouchSetSamplingState(SCE_TOUCH_PORT_FRONT, SCE_TOUCH_SAMPLING_STATE_STOP);
+  sceTouchSetSamplingState(SCE_TOUCH_PORT_BACK, SCE_TOUCH_SAMPLING_STATE_STOP);
 
   scePowerSetArmClockFrequency(444);
   scePowerSetBusClockFrequency(222);

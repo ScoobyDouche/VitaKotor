@@ -16,8 +16,7 @@ const so_default_dynlib *ime_get_dynlib(void);
 extern const int ime_dynlib_size;
 
 // Non-zero while the IME dialog owns the screen. The swap hook uses this to
-// composite the common dialog into the frame, and the touch pump uses it to
-// stop feeding the game finger events aimed at the keyboard.
+// composite the common dialog into the frame.
 int ime_dialog_active(void);
 
 // Poll the dialog and, once the user confirms, queue what they typed as

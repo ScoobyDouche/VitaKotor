@@ -1,17 +1,14 @@
-/* input_patch.h -- Vita front-touch -> SDL finger events (see input_patch.c) */
+/* input_patch.h -- Vita physical-controller setup and diagnostics. */
 #ifndef INPUT_PATCH_H
 #define INPUT_PATCH_H
 
-// Enable front-panel touch sampling. Call once, after SDL video is up.
-void input_touch_init(void);
+// Disable both touch panels after SDL video initialization.
+void input_init(void);
 
-// Sample the front touch panel and push SDL_FINGERDOWN/MOTION/UP events for any
-// state change. Call once per frame (from the swap hook, on the game thread).
-void input_touch_pump(void);
+// Sample raw pad health once per rendered frame; this does not feed the game.
+void input_probe_pump(void);
 
-// What the pad and panel are physically doing, and whether SDL accepted the
-// finger events we pushed. Call on a fixed clock (the watchdog), alongside
-// sdl_input_census: together they say which layer input died in.
+// Sample raw pad health. Call on a fixed clock alongside sdl_input_census.
 void input_probe_census(void);
 
 #endif

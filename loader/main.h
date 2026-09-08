@@ -3,7 +3,6 @@
 #ifndef __MAIN_H__
 #define __MAIN_H__
 
-#include <psp2/touch.h>
 #include "so_util.h"
 
 extern so_module kotor_mod;   // libKOTOR.so
@@ -15,7 +14,5 @@ void fatal_error(const char *fmt, ...);
 
 int ret0(void);
 int ret1(void);
-
-extern SceTouchPanelInfo panelInfoFront, panelInfoBack;
 
 #endif
