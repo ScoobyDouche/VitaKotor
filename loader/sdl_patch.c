@@ -62,8 +62,10 @@ static void SDL_GL_SwapWindow_hook(SDL_Window *w) {
   // The on-screen keyboard is a system common dialog: it is composited into the
   // back buffer by vglSwapBuffers, and only when we ask for it. Passing GL_TRUE
   // unconditionally would cost a sceCommonDialogUpdate every frame of the game.
+  uint64_t swap_begin = sceKernelGetProcessTimeWide();
   vglSwapBuffers(ime_dialog_active() ? GL_TRUE : GL_FALSE);
-  gl_patch_on_swap();  // periodic per-frame draw summary (see gl_patch.c)
+  uint64_t swap_end = sceKernelGetProcessTimeWide();
+  gl_patch_on_swap(swap_begin, swap_end);
   input_probe_pump();  // raw pad health only; SDL remains the gameplay input path
   ime_pump();          // collect what the on-screen keyboard produced
 }
@@ -116,12 +118,42 @@ static SDL_Thread *SDL_CreateThread_hook(SDL_ThreadFunction fn, const char *name
   return t;
 }
 
+static SceUID g_delay_mutex = -1;
+static unsigned g_delay_n = 0;
+static uint64_t g_delay_requested_us = 0, g_delay_actual_us = 0;
+static unsigned g_delay_max_us = 0;
+
+static void delay_lock(void) {
+  if (g_delay_mutex >= 0) sceKernelLockMutex(g_delay_mutex, 1, NULL);
+}
+static void delay_unlock(void) {
+  if (g_delay_mutex >= 0) sceKernelUnlockMutex(g_delay_mutex, 1);
+}
+
 static void SDL_Delay_hook(Uint32 ms) {
-  static volatile int n = 0;
-  int c = n++;
+  delay_lock();
+  unsigned c = g_delay_n++;
+  delay_unlock();
   if (c < 4 || (c & 1023) == 0)
-    log_printf("[sleep] SDL_Delay(%u) #%d LR=%p", (unsigned)ms, c, __builtin_return_address(0));
+    log_printf("[sleep] SDL_Delay(%u) #%u LR=%p", (unsigned)ms, c, __builtin_return_address(0));
+  uint64_t start = sceKernelGetProcessTimeWide();
   SDL_Delay(ms);
+  unsigned elapsed = (unsigned)(sceKernelGetProcessTimeWide() - start);
+  delay_lock();
+  g_delay_requested_us += (uint64_t)ms * 1000u;
+  g_delay_actual_us += elapsed;
+  if (elapsed > g_delay_max_us) g_delay_max_us = elapsed;
+  delay_unlock();
+}
+
+void sdl_perf_snapshot(sdl_perf_t *out) {
+  if (!out) return;
+  delay_lock();
+  out->delay_calls = g_delay_n;
+  out->delay_requested_us = g_delay_requested_us;
+  out->delay_actual_us = g_delay_actual_us;
+  out->delay_max_us = g_delay_max_us;
+  delay_unlock();
 }
 
 // --- input event tracing -------------------------------------------------
@@ -524,4 +556,8 @@ static const so_default_dynlib sdl_dynlib[] = {
   { "g_SDL_BufferGeometry_h",      (uintptr_t)&g_SDL_BufferGeometry_h },
 };
 const int sdl_dynlib_size = sizeof(sdl_dynlib);
-const so_default_dynlib *sdl_get_dynlib(void) { return sdl_dynlib; }
+const so_default_dynlib *sdl_get_dynlib(void) {
+  if (g_delay_mutex < 0)
+    g_delay_mutex = sceKernelCreateMutex("kotor_delay", 0, 0, NULL);
+  return sdl_dynlib;
+}

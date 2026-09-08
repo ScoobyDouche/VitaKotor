@@ -9,6 +9,8 @@
 #ifndef __SDL_PATCH_H__
 #define __SDL_PATCH_H__
 
+#include <stdint.h>
+
 #include "so_util.h"
 
 // Resolver entries this layer contributes (SDL_* funcs + g_SDL_BufferGeometry_*).
@@ -48,5 +50,14 @@ unsigned sdl_gamepad_mask(void);
 // call. Drive it from a clock, not from event volume: the failure we are chasing
 // is events NOT arriving, and a volume-triggered summary goes quiet exactly then.
 void sdl_input_census(void);
+
+typedef struct {
+  unsigned delay_calls;
+  uint64_t delay_requested_us, delay_actual_us;
+  unsigned delay_max_us;
+} sdl_perf_t;
+
+// Cumulative SDL_Delay timing used by the frame-hitch trace.
+void sdl_perf_snapshot(sdl_perf_t *out);
 
 #endif

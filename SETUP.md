@@ -141,12 +141,38 @@ SDK. Per the task, we clone and build it **from source**, overwriting that copy:
 
 ```bash
 cd ~/vitadev
-git clone https://github.com/Rinnegatamante/vitaGL     # HEAD 38d2f97
+git clone https://github.com/Rinnegatamante/vitaGL
 cd vitaGL
+git checkout 38d2f9704b6b241965ed7086aeaacd69f044f2c5
 make clean
-make LOG_ERRORS=1 -j$(nproc)   # produces libvitaGL.a
+git apply --unidiff-zero /path/to/VitaKotor/patches/vitaGL-packed-vbo-offset.patch
+make LOG_ERRORS=1 HAVE_SHADER_CACHE=1 -j$(nproc)   # produces libvitaGL.a
 make install                   # copies libvitaGL.a → $VITASDK/arm-vita-eabi/lib/
                                #        source/vitaGL.h → $VITASDK/arm-vita-eabi/include/
+```
+
+The packed-VBO patch is required for KOTOR. The game stores vertex attributes
+at offsets well above 64 KiB, while `SceGxmVertexAttribute::offset` is only
+16-bit. Its skinned layout also declares weights before position even though
+position starts earlier in memory. The patch chooses the lowest active memory
+offset, moves that full 32-bit base into the stream pointer, and leaves only the
+small non-negative within-vertex offset in each GXM attribute descriptor.
+
+`HAVE_SHADER_CACHE=1` is also required. KOTOR creates shader variants lazily,
+and compiling a group of five on the first explosion took 7.9 seconds on
+hardware. vitaGL stores the compiled GXP programs under
+`ux0:data/shader_cache/KOTR00001/`; later launches loaded the same group in 34
+ms. Delete that directory after changing the bundled shaders or compiler flags.
+The loader intentionally references the cache-only vitaGL symbol, so linking
+against an archive built without this flag fails rather than silently shipping
+the multi-second stalls again.
+
+For a Vita3K build, disable vitaGL's splash thread:
+
+```bash
+make clean
+make LOG_ERRORS=1 HAVE_SHADER_CACHE=1 NO_SPLASHSCREEN=1 -j$(nproc)
+make install
 ```
 
 > **`LOG_ERRORS=1` is required.** A flagless `make` fails to link the loader with

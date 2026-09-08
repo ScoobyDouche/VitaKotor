@@ -23,6 +23,15 @@ extern volatile int g_io_trace;
 int io_open_count(void);
 void io_obb_mount_done(void);
 
+typedef struct {
+  unsigned reads, hits, seeks;
+  uint64_t card_bytes, card_us;
+} io_perf_t;
+
+// Cumulative OBB I/O counters. A frame snapshot can distinguish cache-served
+// asset churn from real memory-card reads without tracing every file call.
+void io_perf_snapshot(io_perf_t *out);
+
 // Every thread the game creates, recorded by our pthread_create wrapper. `entry`
 // is the thread body's address -- feed it to addr2line against libKOTOR.so /
 // libandroid_port.so to name a blocked worker. The watchdog sweeps this list so a

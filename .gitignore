@@ -8,6 +8,7 @@ com.aspyr.swkotor/
 
 # Build output
 build/
+build-*/
 backups/
 *.vpk
 *.velf

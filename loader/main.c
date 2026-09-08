@@ -1453,6 +1453,31 @@ static unsigned g_ml_n = 0, g_lip_n = 0, g_la_n = 0;
 static void *(*UpdateScreen_orig)(uint32_t a, int b, int c) = NULL;
 static void *(*GameUpdate_orig)(void) = NULL;
 static unsigned g_us_n = 0, g_gu_n = 0;
+static uint64_t g_us_time = 0, g_gu_time = 0;
+static uint64_t g_us_active = 0, g_gu_active = 0;
+static volatile float *g_ai_update_time = NULL, *g_display_fps = NULL;
+static volatile int *g_movie_fps = NULL, *g_render_skip = NULL;
+static unsigned g_policy_seq = 0, g_selected_skip = 0;
+static float g_selector_ai_ms = 0.0f, g_last_ai_ms = 0.0f;
+static int g_new_present_group = 1;
+
+void engine_perf_snapshot(engine_perf_t *out, uint64_t now_us) {
+  if (!out) return;
+  out->game_calls = g_gu_n;
+  out->game_us = g_gu_time + (g_gu_active ? now_us - g_gu_active : 0);
+  out->screen_calls = g_us_n;
+  out->screen_us = g_us_time + (g_us_active ? now_us - g_us_active : 0);
+  out->policy_seq = g_policy_seq;
+  out->selected_skip = g_selected_skip;
+  out->selector_ai_ms = g_selector_ai_ms;
+  out->next_ai_ms = g_last_ai_ms;
+  out->display_fps = g_display_fps ? *g_display_fps : -1.0f;
+  out->movie_fps = g_movie_fps ? *g_movie_fps : -1;
+}
+
+void engine_perf_presented(void) {
+  g_new_present_group = 1;
+}
 
 static void *UpdateScreen_probe(uint32_t a, int b, int c) {
   if (g_us_n < 16 || (g_us_n % 200) == 0) {
@@ -1464,10 +1489,27 @@ static void *UpdateScreen_probe(uint32_t a, int b, int c) {
                (unsigned)sceKernelGetThreadId(), g_gu_n, g_ml_n);
   }
   g_us_n++;
-  return UpdateScreen_orig(a, b, c);
+  uint64_t start = sceKernelGetProcessTimeWide();
+  g_us_active = start;
+  void *rc = UpdateScreen_orig(a, b, c);
+  g_us_time += sceKernelGetProcessTimeWide() - start;
+  g_us_active = 0;
+  return rc;
 }
 
 static void *GameUpdate_probe(void) {
+  if (g_new_present_group) {
+    g_selector_ai_ms = g_last_ai_ms;
+    g_selected_skip = g_render_skip ? (unsigned)*g_render_skip : 0;
+    g_policy_seq++;
+    g_new_present_group = 0;
+  }
+#if DISABLE_ADAPTIVE_RENDER_SKIP
+  // SDL_main has already chosen the skip count and is about to run the primary
+  // update. Clearing it here makes that update render and lets SDL_main present
+  // it, instead of following it with up to ten no-present update iterations.
+  if (g_render_skip && *g_render_skip > 0) *g_render_skip = 0;
+#endif
   if ((g_gu_n % 200) == 0) {
     void *app = g_appmgr_ptr ? *(void **)g_appmgr_ptr : NULL;
     log_printf("[load] GameUpdate #%u appMgr=%p client=%p server=%p "
@@ -1478,7 +1520,13 @@ static void *GameUpdate_probe(void) {
                g_us_n, g_ml_n);
   }
   g_gu_n++;
-  return GameUpdate_orig();
+  uint64_t start = sceKernelGetProcessTimeWide();
+  g_gu_active = start;
+  void *rc = GameUpdate_orig();
+  g_gu_time += sceKernelGetProcessTimeWide() - start;
+  g_gu_active = 0;
+  if (g_ai_update_time) g_last_ai_ms = *g_ai_update_time;
+  return rc;
 }
 
 static void *MainLoop_probe(void *self) {
@@ -1952,7 +2000,10 @@ static void *FmodCreateSound_probe(void *self, char *name, int id, void *data,
     log_printf("[snd?] FMod::CreateSound #%u \"%s\" id=%d data=%p size=%u (%d,%d)",
                n, name ? name : "?", id, data, size, e, f);
   n++; g_fmod_create++;
-  return FmodCreateSound_orig(self, name, id, data, size, e, f);
+  unsigned previous_id = audio_sfx_context_push((unsigned)id);
+  void *rc = FmodCreateSound_orig(self, name, id, data, size, e, f);
+  audio_sfx_context_pop(previous_id);
+  return rc;
 }
 /* Churn detector.
  *
@@ -2122,6 +2173,17 @@ static void install_sound_probe(void) {
 static void install_load_probe(void) {
   g_appmgr_ptr = (void *)so_symbol(&kotor_mod, "g_pAppManager");
   log_printf("[load] g_pAppManager @ %p", g_appmgr_ptr);
+  g_ai_update_time = (volatile float *)so_symbol(&kotor_mod, "g_AIUpdateTime");
+  g_display_fps = (volatile float *)so_symbol(&kotor_mod, "displayFPS");
+  g_movie_fps = (volatile int *)so_symbol(&kotor_mod, "g_nSetMovieFrameRate");
+  g_render_skip = (volatile int *)so_symbol(&port_mod, "g_RenderSkip");
+  if (g_ai_update_time) g_last_ai_ms = *g_ai_update_time;
+  log_printf("[perf] policy globals: AI=%p renderSkip=%p displayFPS=%p movieFPS=%p",
+             (void *)g_ai_update_time, (void *)g_render_skip,
+             (void *)g_display_fps, (void *)g_movie_fps);
+#if DISABLE_ADAPTIVE_RENDER_SKIP
+  log_printf("[perf] adaptive render skip override: ON (selected value is logged, then cleared)");
+#endif
   // Let the JOYBUTTON log line report what libKOTOR did with the press. All
   // three are plain .bss globals in libKOTOR; a missing one just drops that
   // figure from the line.
@@ -2358,8 +2420,15 @@ static void *game_main_thread(void *arg) {
   log_printf(">>> game thread UID = 0x%08x", (unsigned)g_game_thid);
 
   log_printf(">>> init vitaGL on game thread");
+  /* This symbol exists only when vitaGL is built with HAVE_SHADER_CACHE=1.
+   * Referencing it makes an uncached archive fail at link time instead of
+   * silently reintroducing multi-second first-use shader stalls. */
+  extern char vgl_shader_cache_path[256];
+  log_printf(">>> vitaGL application shader cache storage = %p",
+             (void *)vgl_shader_cache_path);
   vglSetupRuntimeShaderCompiler(SHARK_OPT_UNSAFE, SHARK_ENABLE, SHARK_ENABLE, SHARK_ENABLE);
   vglInitExtended(0, SCREEN_W, SCREEN_H, MEMORY_VITAGL_THRESHOLD_MB * 1024 * 1024, GL_MSAA_MODE);
+  log_printf(">>> vitaGL application shader cache: %s", vgl_shader_cache_path);
 
   // vitaGL ignores the return of sceGxmShaderPatcherCreate (gxm.c:561), so a
   // failed patcher init is silent -- the global just stays NULL and the first

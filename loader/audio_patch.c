@@ -169,6 +169,7 @@ typedef struct {
 typedef struct {
   int      used, refs;
   unsigned stamp;                          /* for LRU eviction */
+  unsigned sound_id;                       /* stable FModAudioSystem SFX id */
   unsigned key_len;
   uint32_t key_hash;
   AudioPcm pcm;
@@ -209,6 +210,9 @@ static Chan     g_chan[MAX_CHANNELS];
 static PcmEntry g_cache[MAX_CACHE];
 static unsigned g_clock = 0;
 static unsigned g_cache_hits = 0, g_cache_miss = 0;
+#define SFX_CONTEXT_SLOTS 32
+static unsigned g_sfx_context_id[SFX_CONTEXT_SLOTS];
+static SceUID g_sfx_context_thread[SFX_CONTEXT_SLOTS];
 
 static SceUID   g_mutex   = -1;
 static SceUID   g_thread  = -1;
@@ -249,6 +253,13 @@ static PcmEntry *cache_find(unsigned len, uint32_t h) {
   return NULL;
 }
 
+static PcmEntry *cache_find_id(unsigned id) {
+  if (!id) return NULL;
+  for (int i = 0; i < MAX_CACHE; i++)
+    if (g_cache[i].used && g_cache[i].sound_id == id) return &g_cache[i];
+  return NULL;
+}
+
 /* Drop the least-recently-used unreferenced entry. Returns 0 if nothing can go. */
 static int cache_evict_one(void) {
   PcmEntry *best = NULL;
@@ -266,7 +277,7 @@ static int cache_evict_one(void) {
 }
 
 /* Takes ownership of *pcm on success (and frees nothing on failure). */
-static PcmEntry *cache_insert(unsigned len, uint32_t h, const AudioPcm *pcm) {
+static PcmEntry *cache_insert(unsigned id, unsigned len, uint32_t h, const AudioPcm *pcm) {
   unsigned bytes = pcm_bytes_of(pcm);
   /* Trim retained PCM toward the keep budget, best effort: stop as soon as
    * nothing more can go rather than failing. Referenced entries are unevictable
@@ -287,7 +298,7 @@ static PcmEntry *cache_insert(unsigned len, uint32_t h, const AudioPcm *pcm) {
   if (!slot) return NULL;
 
   slot->used = 1; slot->refs = 1; slot->stamp = ++g_clock;
-  slot->key_len = len; slot->key_hash = h; slot->pcm = *pcm;
+  slot->sound_id = id; slot->key_len = len; slot->key_hash = h; slot->pcm = *pcm;
   g_pcm_bytes += bytes;
   return slot;
 }
@@ -316,7 +327,8 @@ static int      g_stream_retire_n = 0;
 /* How long the audio thread spends decoding, and how much of that is inside the
  * lock. Decoding under the lock is what put the game thread to sleep waiting on
  * createSound: measure it rather than trust that moving it out was enough. */
-static unsigned g_feed_us_max = 0, g_feed_us_tot = 0, g_feed_n = 0;
+static unsigned g_feed_us_max = 0, g_feed_n = 0;
+static uint64_t g_feed_us_tot = 0;
 
 /* The ring's decoder end. Looping is honoured but the game passes LOOP_OFF and
  * drives its own music playlist -- looping here would mean a track could never
@@ -406,6 +418,35 @@ static void stream_close(Stream *st) {
 }
 
 unsigned audio_cache_bytes(void) { return g_pcm_bytes; }
+
+static unsigned *sfx_context_slot(void) {
+  SceUID thid = sceKernelGetThreadId();
+  lock();
+  for (unsigned i = 0; i < SFX_CONTEXT_SLOTS; i++) {
+    if (g_sfx_context_thread[i] == thid) { unlock(); return &g_sfx_context_id[i]; }
+  }
+  for (unsigned i = 0; i < SFX_CONTEXT_SLOTS; i++) {
+    if (!g_sfx_context_thread[i]) {
+      g_sfx_context_thread[i] = thid;
+      unlock();
+      return &g_sfx_context_id[i];
+    }
+  }
+  unlock();
+  return NULL;
+}
+
+unsigned audio_sfx_context_push(unsigned id) {
+  unsigned *slot = sfx_context_slot();
+  unsigned previous = slot ? *slot : 0;
+  if (slot) *slot = id;
+  return previous;
+}
+
+void audio_sfx_context_pop(unsigned previous_id) {
+  unsigned *slot = sfx_context_slot();
+  if (slot) *slot = previous_id;
+}
 
 /* Called from the new-handler when the heap is exhausted. Everything here is a
  * pure speed optimisation -- worst case the next createSound decodes again --
@@ -645,9 +686,11 @@ static void mix_grain(void) {
     }
     if (nfeed) {
       unsigned us = (unsigned)(sceKernelGetProcessTimeWide() - t0);
+      lock();
       if (us > g_feed_us_max) g_feed_us_max = us;
       g_feed_us_tot += us;
       g_feed_n++;
+      unlock();
     }
   }
 
@@ -1183,11 +1226,27 @@ static int Sys_createSound(void *self, const char *name, unsigned mode,
   AudioPcm pcm;
   int ok = 0, silent = 0;
 
-  /* Already decoded this exact asset? Share it and skip all the work. */
+  /* The companion's SFX buffer is transient and is sometimes reused before a
+   * later request for the same resource. Prefer its stable resource ID so a
+   * cached decode can be found without touching stale bytes. */
+  unsigned *context = (mode & FMOD_OPENMEMORY) ? sfx_context_slot() : NULL;
+  unsigned sound_id = context ? *context : 0;
+  lock();
+  PcmEntry *ent = cache_find_id(sound_id);
+  if (ent) { ent->refs++; ent->stamp = ++g_clock; }
+  unlock();
+  if (ent) { g_cache_hits++; big_free(owned); goto have_pcm; }
+
+  /* Content identity remains the fallback for streams and callers outside the
+   * FModAudioSystem wrapper. Only read the transient buffer after the ID miss. */
   uint32_t hkey = key_hash(buf, len);
   lock();
-  PcmEntry *ent = cache_find(len, hkey);
-  if (ent) { ent->refs++; ent->stamp = ++g_clock; }
+  ent = cache_find(len, hkey);
+  if (ent) {
+    ent->refs++;
+    ent->stamp = ++g_clock;
+    if (sound_id && !ent->sound_id) ent->sound_id = sound_id;
+  }
   unlock();
   if (ent) { g_cache_hits++; big_free(owned); goto have_pcm; }
   g_cache_miss++;
@@ -1199,7 +1258,7 @@ static int Sys_createSound(void *self, const char *name, unsigned mode,
    * when we cannot afford it hand back a correctly-timed SILENT sound: costs no
    * memory, keeps the game's pacing, and stops the retry loop dead.
    * Proper fix is incremental streaming; this makes it survivable meanwhile. */
-  if (mode & FMOD_CREATESTREAM) {
+  if (!ok && (mode & FMOD_CREATESTREAM)) {
     AudioPcm est;
     if (audio_mp3_probe(buf, len, &est)) {
       unsigned need = est.nsamples * est.channels * 2u;
@@ -1258,7 +1317,13 @@ static int Sys_createSound(void *self, const char *name, unsigned mode,
     }
   }
 
-  if (!ok) ok = audio_mp3_decode(buf, len, &pcm);
+  if (!ok) {
+    /* Header-only rejection prevents a corrupted transient SFX buffer from
+     * spending 100+ ms in the hardware decoder's byte-by-byte resync loop. */
+    AudioPcm probe;
+    if (!(mode & FMOD_OPENMEMORY) || audio_mp3_probe(buf, len, &probe))
+      ok = audio_mp3_decode(buf, len, &pcm);
+  }
 
   /* Decode failed outright. For a stream, still prefer timed silence over an
    * error for exactly the same reason as above. */
@@ -1282,7 +1347,7 @@ static int Sys_createSound(void *self, const char *name, unsigned mode,
   big_free(owned);
 
   lock();
-  ent = cache_insert(len, hkey, &pcm);
+  ent = cache_insert(sound_id, len, hkey, &pcm);
   unlock();
   if (!ent) {
     audio_pcm_free(&pcm);
@@ -1638,6 +1703,16 @@ static int Sys_set3DListenerAttributes(void *self, int listener, const FmodVec *
  * counter -- torn reads do not matter for a log line -- or takes the lock. */
 unsigned audio_play_count(void) { return g_play_calls; }
 
+void audio_perf_snapshot(audio_perf_t *out) {
+  if (!out) return;
+  lock();
+  out->feed_count = g_feed_n;
+  out->feed_us = g_feed_us_tot;
+  out->feed_max_us = g_feed_us_max;
+  out->underruns = g_stream_underruns;
+  unlock();
+}
+
 void audio_log_stats(void) {
   {
     /* g_played is the discriminator log4 lacked. Its END rate fell from ~127 per
@@ -1696,7 +1771,8 @@ void audio_log_stats(void) {
                  g_mix_n2d ? g_mix_sum2d / (float)g_mix_n2d : 0.0f, g_mix_n2d,
                  g_mix_n3d ? g_mix_sum3d / (float)g_mix_n3d : 0.0f, g_mix_n3d,
                  g_streams_open, g_stream_decoders, g_stream_underruns,
-                 g_feed_n ? g_feed_us_tot / g_feed_n : 0u, g_feed_us_max, g_feed_n,
+                 (unsigned)(g_feed_n ? g_feed_us_tot / g_feed_n : 0u),
+                 g_feed_us_max, g_feed_n,
                  g_stop_calls, g_stop_live, g_stop_pend, g_stop_stale,
                  g_pause_set, g_pause_clr,
                  nused, nplaying, npaused, npend, g_nchannels);

@@ -230,6 +230,23 @@ a bug report.
 | Hangs at the loading spinner | An `.obb` is missing, misnamed, or still copying |
 | Textures look wrong | Set `GL_FILTER_REDUNDANT_BINDS 0` in `loader/config.h` and rebuild |
 
+Builds require the vitaGL packed-VBO patch and shader cache documented in
+`SETUP.md`. Without
+it, the game's large vertex offsets truncate above 64 KiB and skinned layouts
+can underflow when shader attribute order differs from memory order, causing
+geometry to stretch or explode. Build vitaGL with `HAVE_SHADER_CACHE=1` so
+compiled variants persist under `ux0:data/shader_cache/KOTR00001/`; otherwise
+first-use effects can block for several seconds. Use `NO_SPLASHSCREEN=1` for
+Vita3K packages.
+
+Intermittent slow frames are reported as `[hitch]` lines in
+`ux0:data/kotor/log.txt`. Each line separates game-thread work from buffer-swap
+wait and includes that frame's draw, texture, buffer, OBB I/O, and audio decode
+activity, plus time inside the engine's `GameUpdate` and `UpdateScreen` calls.
+The trace is event-driven and rate-limited so it does not log every frame.
+KOTOR's adaptive render suppression is disabled by default because it amplified
+one expensive AI update into as many as eleven updates before presenting again.
+
 A "freeze" is usually not a freeze: the crash handler parks the app in place so
 the log survives. Check the end of `log.txt` for a `[CRASH]` block before
 assuming it hung.

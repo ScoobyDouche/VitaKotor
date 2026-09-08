@@ -352,6 +352,7 @@ static SharedFile g_sf[SF_MAX];
 static VFile      g_vf[VF_MAX];
 static SceUID     g_io_mutex = -1;
 static unsigned   g_vreads = 0, g_vseeks = 0, g_vhits = 0;
+static uint64_t   g_vread_bytes = 0, g_vread_us = 0;
 static int        g_vlive = 0;
 
 static void io_lock(void) {
@@ -434,6 +435,17 @@ static FILE *fopen_shared(const char *path, const char *mode) {
 }
 
 int io_open_count(void) { return g_files_open; }
+
+void io_perf_snapshot(io_perf_t *out) {
+  if (!out) return;
+  io_lock();
+  out->reads = g_vreads;
+  out->hits = g_vhits;
+  out->seeks = g_vseeks;
+  out->card_bytes = g_vread_bytes;
+  out->card_us = g_vread_us;
+  io_unlock();
+}
 
 /* Called once the archives are mounted. Stops recording and writes each cache
  * out; recording every read for the whole session would grow without bound. */
@@ -564,9 +576,12 @@ static size_t fread_diag(void *p, size_t sz, size_t n, FILE *f) {
     } else {
       /* 2. One positional read; no seek, no newlib buffer to invalidate. */
       if (sf->rpos != v->pos) g_vseeks++;      /* diagnostic only now */
+      uint64_t read_start = sceKernelGetProcessTimeWide();
       int rr = sceIoPread(sf->fd, p, (SceSize)want, (SceOff)v->pos);
+      g_vread_us += sceKernelGetProcessTimeWide() - read_start;
       if (rr < 0) { v->err = 1; rr = 0; }
       got = rr;
+      g_vread_bytes += (unsigned)got;
       sf->rpos = v->pos + got;
       if (got > 0) obbidx_record(sf->idx, v->pos, p, got);
       g_vreads++;
