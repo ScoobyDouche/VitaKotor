@@ -640,6 +640,81 @@ static unsigned g_flush_n = 0, g_flush_nonempty = 0;
 static int32_t g_flush_max_used = 0;
 static unsigned g_sw_n = 0, g_sw_gate_obj = 0, g_sw_gate_w = 0, g_sw_gate_h = 0, g_sw_pass = 0;
 
+/* KOTOR uses AurGUISetupViewport/AurGUICloseViewport as a nested GUI clipping
+ * stack, but glViewport is only a coordinate transform. Mirror this semantic
+ * GUI boundary to scissor while preserving any caller-owned scissor state. */
+#define GUI_VIEWPORT_STACK_MAX 16
+typedef struct {
+  GLboolean enabled;
+  GLint box[4];
+} GuiScissorState;
+
+static int (*AurGUISetupViewport_orig)(int x, int y, int w, int h,
+                                       const void *color, uint32_t clear,
+                                       uint32_t alpha) = NULL;
+static void (*AurGUICloseViewport_orig)(void) = NULL;
+static GuiScissorState g_gui_scissor_stack[GUI_VIEWPORT_STACK_MAX];
+static unsigned g_gui_scissor_depth = 0;
+static unsigned g_gui_scissor_bypass_depth = 0;
+
+static uintptr_t *find_jump_slot(so_module *mod, const char *name) {
+  for (int i = 0; i < mod->num_relplt; i++) {
+    Elf32_Rel *rel = &mod->relplt[i];
+    if (ELF32_R_TYPE(rel->r_info) != R_ARM_JUMP_SLOT) continue;
+    Elf32_Sym *sym = &mod->dynsym[ELF32_R_SYM(rel->r_info)];
+    if (strcmp(mod->dynstr + sym->st_name, name) != 0) continue;
+    return (uintptr_t *)(mod->text_base + rel->r_offset);
+  }
+  return NULL;
+}
+
+static void gui_scissor_restore(const GuiScissorState *state) {
+  glScissor(state->box[0], state->box[1], state->box[2], state->box[3]);
+  if (state->enabled) glEnable(GL_SCISSOR_TEST);
+  else                glDisable(GL_SCISSOR_TEST);
+}
+
+static int AurGUISetupViewport_scissor(int x, int y, int w, int h,
+                                       const void *color, uint32_t clear,
+                                       uint32_t alpha) {
+  if (g_gui_scissor_depth >= GUI_VIEWPORT_STACK_MAX) {
+    log_printf("[gui:viewport] stack overflow at depth=%u", g_gui_scissor_depth);
+    int rc = AurGUISetupViewport_orig(x, y, w, h, color, clear, alpha);
+    if (rc) g_gui_scissor_bypass_depth++;
+    return rc;
+  }
+
+  GuiScissorState *state = &g_gui_scissor_stack[g_gui_scissor_depth++];
+  state->enabled = glIsEnabled(GL_SCISSOR_TEST);
+  glGetIntegerv(GL_SCISSOR_BOX, state->box);
+  g_gl_gui_viewport_scope++;
+  int rc = AurGUISetupViewport_orig(x, y, w, h, color, clear, alpha);
+  if (!rc) {
+    g_gl_gui_viewport_scope--;
+    g_gui_scissor_depth--;
+    gui_scissor_restore(state);
+  }
+  return rc;
+}
+
+static void AurGUICloseViewport_scissor(void) {
+  if (g_gui_scissor_bypass_depth) {
+    AurGUICloseViewport_orig();
+    g_gui_scissor_bypass_depth--;
+    return;
+  }
+  if (!g_gui_scissor_depth) {
+    AurGUICloseViewport_orig();
+    return;
+  }
+
+  GuiScissorState state = g_gui_scissor_stack[g_gui_scissor_depth - 1];
+  AurGUICloseViewport_orig();
+  g_gl_gui_viewport_scope--;
+  g_gui_scissor_depth--;
+  gui_scissor_restore(&state);
+}
+
 /* Which widgets actually went through ScaleExtentForResolution.
  *
  * Two theories about the oversized minimap and the fog panel have now died on
@@ -2174,6 +2249,23 @@ static void install_load_probe(void) {
 }
 
 static void install_gui_probe(void) {
+  uintptr_t *setup_slot = find_jump_slot(&kotor_mod,
+      "_Z19AurGUISetupViewportiiiiRK6Vectorbf");
+  uintptr_t *close_slot = find_jump_slot(&kotor_mod,
+      "_Z19AurGUICloseViewportv");
+  if (setup_slot && close_slot) {
+    AurGUISetupViewport_orig = (int (*)(int, int, int, int, const void *, uint32_t, uint32_t))*setup_slot;
+    AurGUICloseViewport_orig = (void (*)(void))*close_slot;
+    uintptr_t setup_replacement = (uintptr_t)&AurGUISetupViewport_scissor;
+    uintptr_t close_replacement = (uintptr_t)&AurGUICloseViewport_scissor;
+    kuKernelCpuUnrestrictedMemcpy(setup_slot, &setup_replacement, sizeof setup_replacement);
+    kuKernelCpuUnrestrictedMemcpy(close_slot, &close_replacement, sizeof close_replacement);
+    log_printf("[gui:viewport] nested AurGUI clipping enabled via PLT");
+  } else {
+    log_printf("[gui:viewport] AurGUI PLT replacement FAILED setup=%p close=%p",
+               (void *)setup_slot, (void *)close_slot);
+  }
+
   uintptr_t db = so_symbol(&kotor_mod, "_Z18AurResGetDataBytesmPv");
   if (db) {
     ResDataBytes_orig = (void *(*)(unsigned long, void *))build_thumb_trampoline(db, thumb_patch_len(db));

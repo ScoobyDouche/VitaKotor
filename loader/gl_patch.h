@@ -20,4 +20,7 @@ void gl_patch_on_swap(uint64_t swap_begin_us, uint64_t swap_end_us);
  * Scoped this way the trace stays tiny instead of drowning the log. */
 extern int g_gl_text_draw;
 
+/* Scope for KOTOR's nested AurGUI viewport stack. */
+extern int g_gl_gui_viewport_scope;
+
 #endif

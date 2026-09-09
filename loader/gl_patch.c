@@ -353,11 +353,16 @@ static void glViewport_t(GLint x, GLint y, GLsizei w, GLsizei h) {
   if (g_gl_seq < GL_TRACE_LIMIT)  // silence with the rest of the per-call trace
     log_printf("[GL] glViewport(%d, %d, %d, %d)", x, y, (int)w, (int)h);
   glViewport(x, y, w, h);
+  if (g_gl_gui_viewport_scope) {
+    glScissor(x, y, w, h);
+    glEnable(GL_SCISSOR_TEST);
+  }
 }
 // Draw/clear accounting. The first few of each are logged in full; after that we
 // only count, and gl_patch_on_swap() prints a per-frame-window summary. Both the
 // "since last summary" and lifetime totals are tracked so a stuck render loop
 // (identical draw count every window) is distinguishable from an advancing one.
+int g_gl_gui_viewport_scope = 0;
 static int g_clear_n = 0, g_draw_n = 0;
 static unsigned g_arrays_win = 0, g_elements_win = 0, g_clears_win = 0;
 static unsigned g_arrays_tot = 0, g_elements_tot = 0;
