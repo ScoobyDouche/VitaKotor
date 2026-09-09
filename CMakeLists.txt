@@ -33,6 +33,10 @@ set(VITA_MKSFOEX_FLAGS "-d ATTRIBUTE2=12")
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -g -D_GNU_SOURCE -Wl,-q -Wl,-z,max-page-size=0x10000 -Wall -O2 -fno-optimize-sibling-calls")
 set(CMAKE_CXX_FLAGS "${CMAKE_C_FLAGS} -std=c++11 -Wno-write-strings")
 
+option(KOTOR_BINK_SHADER_TEST "Initialize the embedded Bink shaders while continuing to skip movies" OFF)
+option(KOTOR_BINK_LEGAL_VIDEO_TEST "Play silent legal.bik once while skipping all audio-bearing movies" OFF)
+option(KOTOR_BINK_OPENSL_TEST "Play short 01c.bik once through the existing Vita mixer" OFF)
+
 add_executable(KOTOR
   loader/main.c
   loader/so_util.c
@@ -47,6 +51,8 @@ add_executable(KOTOR
   loader/audio_patch.c
   loader/audio_mp3.c
   loader/audio_ring.c
+  $<$<BOOL:${KOTOR_BINK_OPENSL_TEST}>:loader/bink_audio_queue.c>
+  $<$<BOOL:${KOTOR_BINK_OPENSL_TEST}>:loader/opensl_patch.c>
   loader/bink_patch.c
   loader/fs_patch.c
   loader/sdl_patch.c
@@ -59,6 +65,19 @@ add_executable(KOTOR
   loader/bigalloc.c
   loader/log.c
 )
+
+if((KOTOR_BINK_SHADER_TEST AND KOTOR_BINK_LEGAL_VIDEO_TEST) OR
+   (KOTOR_BINK_SHADER_TEST AND KOTOR_BINK_OPENSL_TEST) OR
+   (KOTOR_BINK_LEGAL_VIDEO_TEST AND KOTOR_BINK_OPENSL_TEST))
+  message(FATAL_ERROR "Select only one Bink test mode")
+endif()
+if(KOTOR_BINK_SHADER_TEST)
+  target_compile_definitions(KOTOR PRIVATE BINK_MODE=1)
+elseif(KOTOR_BINK_LEGAL_VIDEO_TEST)
+  target_compile_definitions(KOTOR PRIVATE BINK_MODE=2)
+elseif(KOTOR_BINK_OPENSL_TEST)
+  target_compile_definitions(KOTOR PRIVATE BINK_MODE=3 KOTOR_USE_BINK_OPENSL=1)
+endif()
 
 target_link_libraries(KOTOR
   -Wl,--whole-archive pthread -Wl,--no-whole-archive

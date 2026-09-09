@@ -31,6 +31,7 @@
 #include "glsl_prep.h"
 #include "dynlib.h"
 #include "audio_patch.h"
+#include "bink_patch.h"
 #include "sdl_patch.h"
 #include "log.h"
 #include "loadscreen.h"
@@ -1041,6 +1042,8 @@ static void glTexImage2D_e(GLenum tg, GLint l, GLint ifmt, GLsizei w, GLsizei h,
   GLLOG("glTexImage2D(0x%x, l=%d, %dx%d, fmt=0x%x)", (unsigned)tg, l, (int)w, (int)h, (unsigned)f);
   g_texupload_frame++;
   if (w > 0 && h > 0) g_texupload_bytes_frame += (uint64_t)w * h * fmt_bpp(f);
+  if (f == GL_LUMINANCE && ty == GL_UNSIGNED_BYTE && w > 0 && h > 0)
+    bink_patch_note_texture_upload((unsigned)w, (unsigned)h);
   // The environment map is a real cube: kotor.vert declares u_texture2Sampler as
   // GL_SAMPLER_CUBE and the shiny-armour material is the USE_CUBEMAP variant.
   // Nothing in any log so far shows a single cube face being uploaded, so before

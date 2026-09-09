@@ -60,11 +60,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
-
 #include "config.h"
 #include "audio_patch.h"
 #include "audio_mp3.h"
 #include "audio_ring.h"
+#include "opensl_patch.h"
 #include "bigalloc.h"
 #include "sdl_patch.h"
 #include "log.h"
@@ -800,6 +800,10 @@ static void mix_grain(void) {
   }
   unlock();
 
+#ifdef KOTOR_USE_BINK_OPENSL
+  bink_opensl_mix(g_acc, OUT_GRAIN, OUT_RATE);
+#endif
+
   /* Peak limiter.
    *
    * The mix used to be a raw sum hard-clipped at full scale, with every channel
@@ -870,8 +874,29 @@ static void audio_start(void) {
   g_running = 1;
   g_thread = sceKernelCreateThread("kotor_snd", audio_thread, 0x10000100, 0x10000,
                                    0, 0, NULL);
-  if (g_thread >= 0) sceKernelStartThread(g_thread, 0, NULL);
+  if (g_thread < 0) {
+    log_printf("[snd] output thread create failed 0x%08X", (unsigned)g_thread);
+    g_running = 0;
+    sceAudioOutReleasePort(g_port);
+    g_port = -1;
+    return;
+  }
+  int rc = sceKernelStartThread(g_thread, 0, NULL);
+  if (rc < 0) {
+    log_printf("[snd] output thread start failed 0x%08X", (unsigned)rc);
+    g_running = 0;
+    sceKernelDeleteThread(g_thread);
+    g_thread = -1;
+    sceAudioOutReleasePort(g_port);
+    g_port = -1;
+    return;
+  }
   log_printf("[snd] output up: port=%d %dHz stereo grain=%d", g_port, OUT_RATE, OUT_GRAIN);
+}
+
+int audio_ensure_output(void) {
+  audio_start();
+  return g_running && g_port >= 0 && g_thread >= 0;
 }
 
 /* ---- handle helpers ------------------------------------------------------- */
@@ -1781,18 +1806,28 @@ void audio_log_stats(void) {
 
 /* OpenSLES interface IDs are data objects the engine dereferences by address;
  * a stable dummy address per IID is enough to satisfy relocation. */
+#ifndef KOTOR_USE_BINK_OPENSL
 static const uint32_t sl_iid_engine      = 0;
 static const uint32_t sl_iid_play        = 0;
 static const uint32_t sl_iid_volume      = 0;
 static const uint32_t sl_iid_bufferqueue = 0;
+#endif
 
 static const so_default_dynlib audio_dynlib[] = {
   // ---- OpenSLES (libandroid_port.so imports these directly) ----
+#ifdef KOTOR_USE_BINK_OPENSL
+  { "slCreateEngine",     (uintptr_t)&bink_slCreateEngine },
+  { "SL_IID_ENGINE",      (uintptr_t)&bink_sl_iid_engine },
+  { "SL_IID_PLAY",        (uintptr_t)&bink_sl_iid_play },
+  { "SL_IID_VOLUME",      (uintptr_t)&bink_sl_iid_volume },
+  { "SL_IID_BUFFERQUEUE", (uintptr_t)&bink_sl_iid_bufferqueue },
+#else
   { "slCreateEngine",     (uintptr_t)&fmod_stub },
   { "SL_IID_ENGINE",      (uintptr_t)&sl_iid_engine },
   { "SL_IID_PLAY",        (uintptr_t)&sl_iid_play },
   { "SL_IID_VOLUME",      (uintptr_t)&sl_iid_volume },
   { "SL_IID_BUFFERQUEUE", (uintptr_t)&sl_iid_bufferqueue },
+#endif
 
   // ---- FMOD C API ----
   { "FMOD_System_Create",       (uintptr_t)&Sys_Create },

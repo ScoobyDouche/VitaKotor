@@ -39,6 +39,10 @@ typedef struct {
 // Cumulative streaming-decoder work for correlation with slow frames.
 void audio_perf_snapshot(audio_perf_t *out);
 
+// Ensure the application's single sceAudioOut thread is ready. The custom Bink
+// OpenSL adapter shares this output rather than opening a second BGM port.
+int audio_ensure_output(void);
+
 // FModAudioSystem's wrapper knows the stable resource ID, but FMOD::createSound
 // receives only the transient buffer. Scope the ID around that nested call so
 // decoded SFX can be found without hashing memory the game may already reuse.

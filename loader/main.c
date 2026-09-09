@@ -363,10 +363,6 @@ static void mount_obbs(void) {
 // metrics parse (CAurFontInfo::ParseField) never runs, so GUI text does not yet
 // render. These guards keep the app ALIVE (no crash) through the whole boot;
 // getting actual text is a separate fix (populate CAurFontInfo / +0x38).
-#ifndef SCE_KERNEL_MEMBLOCK_TYPE_USER_RX
-#define SCE_KERNEL_MEMBLOCK_TYPE_USER_RX (0x0C20D050)
-#endif
-
 // Shared: reproduce CAurGUIStringInternal's fontInfo lookup. Returns the CAurFontInfo
 // pointer (may be null == font not loaded) without ever faulting.
 static void *gui_string_fontinfo(void *self) {
@@ -376,81 +372,6 @@ static void *gui_string_fontinfo(void *self) {
   void **vtbl = *(void ***)font;
   void *(*getFontInfo)(void *) = (void *(*)(void *))vtbl[14]; // vtable + 0x38
   return getFontInfo(font);
-}
-
-// Copy `len` position-independent thumb prologue bytes from orig_fn into a fresh
-// RX block, append LDR.W PC,[PC] -> orig_fn+len (thumb), and return a callable
-// thumb pointer. Both guarded methods share the same 8-byte prologue
-// (push{...}/add r7,sp,#12/stmdb) -- all PC-independent, so relocating is safe.
-// Returns 0 on failure.
-// How many bytes hook_thumb() will actually clobber at `addr`, rounded up to a
-// Thumb instruction boundary so the trampoline never resumes mid-instruction.
-//
-// hook_thumb writes 8 bytes (LDR PC,[PC] + target), but when (addr & 2) it first
-// drops a 2-byte NOP to 4-align the LDR -- 10 bytes total. Passing a flat 8 there
-// makes the trampoline resume INSIDE the target-address word: log54/55 crashed
-// exactly that way on CSWGuiImage::SetExtent (0x4abe5a, 2-mod-4), resuming on the
-// high halfword of &SetExtent_probe, which decoded as `strh r3,[r0,#8]` and wrote
-// to address 8 with r0=NULL -- FAR=0x8, FSR=0x8c7. Every hook before it happened
-// to be 0-mod-4, so this stayed latent.
-//
-// Thumb length rule: a halfword whose top 5 bits are 0b11101/11110/11111 starts a
-// 32-bit instruction, anything else is 16-bit.
-static size_t thumb_patch_len(uintptr_t addr) {
-  addr &= ~(uintptr_t)1;
-  size_t need = (addr & 2) ? 10 : 8;
-  size_t len = 0;
-  while (len < need) {
-    uint16_t hw = *(const uint16_t *)(addr + len);
-    len += ((hw & 0xF800) >= 0xE800) ? 4 : 2;
-  }
-  return len;
-}
-
-// NOTE: the resume sequence is `LDR.W PC,[PC]` followed by the target word, and a
-// Thumb literal load resolves its address as Align(PC,4) -- PC being the
-// instruction's address + 4. That rounds DOWN, so the LDR must itself sit on a
-// 4-byte boundary or it reads the word two bytes early: half the LDR encoding
-// glued to half the target address. The trampoline base is page-aligned, so this
-// bites whenever `len` is 2 mod 4 -- which thumb_patch_len returns for any hook
-// site that is 2-mod-4 and whose prologue happens to total 10 bytes.
-// CAppManager::CreateServer (+0x3fba22, len 10) hit it and jumped to 0xba2df000,
-// exactly the value this miscomputation predicts. A 2-byte NOP before the LDR
-// realigns it; len already 0 mod 4 is untouched, so existing hooks are unaffected.
-static uintptr_t build_thumb_trampoline(uintptr_t orig_fn, size_t len) {
-  orig_fn &= ~(uintptr_t)1;
-  size_t pad = (len & 2) ? 2 : 0;      // realign the LDR.W to a 4-byte boundary
-  size_t sz = len + pad + 8; // + LDR.W PC,[PC] (4) + target word (4)
-  SceKernelAllocMemBlockKernelOpt opt;
-  memset(&opt, 0, sizeof(opt));
-  opt.size = sizeof(opt);
-  SceUID blk = kuKernelAllocMemBlock("gui_tramp", SCE_KERNEL_MEMBLOCK_TYPE_USER_RX,
-                                     (sz + 0xfff) & ~(size_t)0xfff, &opt);
-  if (blk < 0) {
-    log_printf("[font] trampoline: AllocMemBlock(USER_RX) failed 0x%08x", (unsigned)blk);
-    return 0;
-  }
-  void *base = NULL;
-  int r = sceKernelGetMemBlockBase(blk, &base);
-  if (r < 0 || base == NULL) {
-    log_printf("[font] trampoline: GetMemBlockBase failed 0x%08x base=%p", (unsigned)r, base);
-    return 0;
-  }
-  uint8_t buf[32];
-  if (sz > sizeof buf) {
-    log_printf("[font] trampoline: len %u too large for buffer", (unsigned)len);
-    return 0;
-  }
-  memcpy(buf, (const void *)orig_fn, len);
-  uint16_t nop   = 0xbf00;                           // NOP (alignment filler)
-  uint32_t ldrpc = 0xf000f8df;                       // LDR.W PC, [PC]
-  uint32_t cont  = (uint32_t)(orig_fn + len) | 1u;    // resume mid-function, thumb
-  if (pad) memcpy(buf + len, &nop, sizeof nop);
-  memcpy(buf + len + pad, &ldrpc, sizeof ldrpc);
-  memcpy(buf + len + pad + sizeof ldrpc, &cont, sizeof cont);
-  kuKernelCpuUnrestrictedMemcpy(base, buf, sz);
-  kuKernelFlushCaches(base, sz);
-  return (uintptr_t)base | 1u;                        // thumb-callable
 }
 
 // ---- WrapStrings(int): layout -------------------------------------------------

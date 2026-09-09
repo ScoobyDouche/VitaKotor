@@ -277,6 +277,22 @@
 #define FRAME_HITCH_TRACE_MS   80
 #define FRAME_HITCH_LOG_GAP_MS 500
 
+// Bink integration modes. Shader-test initializes the companion's real YUV
+// shader but keeps MacPlayBinkGL on the proven skip path. Legal-video substitutes
+// the only shipped silent movie for the first request and skips every later one.
+// Audio-bearing playback is not exposed until its safety gates pass on hardware.
+#define BINK_MODE_SKIP        0
+#define BINK_MODE_SHADER_TEST 1
+#define BINK_MODE_LEGAL_VIDEO 2
+#define BINK_MODE_OPENSL_TEST 3
+#ifndef BINK_MODE
+#define BINK_MODE BINK_MODE_SKIP
+#endif
+#if BINK_MODE != BINK_MODE_SKIP && BINK_MODE != BINK_MODE_SHADER_TEST && \
+    BINK_MODE != BINK_MODE_LEGAL_VIDEO && BINK_MODE != BINK_MODE_OPENSL_TEST
+#error Unsupported BINK_MODE
+#endif
+
 // KOTOR's Android loop turns an AI update over 33/67/100/133 ms into
 // 2/4/7/11 complete GameUpdate calls before the next presentation. On Vita the
 // extra no-present updates amplify one slow frame into a stutter cascade. Clear

@@ -22,6 +22,7 @@
 #include "sdl_patch.h"
 #include "dynlib.h"   // g_game_threads registry (watchdog sweeps it)
 #include "fs_patch.h"
+#include "bink_patch.h"
 #include "gl_patch.h"
 #include "ime_patch.h"
 #include "input_patch.h"
@@ -66,6 +67,7 @@ static void SDL_GL_SwapWindow_hook(SDL_Window *w) {
   vglSwapBuffers(ime_dialog_active() ? GL_TRUE : GL_FALSE);
   uint64_t swap_end = sceKernelGetProcessTimeWide();
   gl_patch_on_swap(swap_begin, swap_end);
+  bink_patch_on_swap(swap_end);
   input_probe_pump();  // raw pad health only; SDL remains the gameplay input path
   ime_pump();          // collect what the on-screen keyboard produced
 }
