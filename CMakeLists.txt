@@ -51,8 +51,8 @@ add_executable(KOTOR
   loader/audio_patch.c
   loader/audio_mp3.c
   loader/audio_ring.c
-  $<$<BOOL:${KOTOR_BINK_OPENSL_TEST}>:loader/bink_audio_queue.c>
-  $<$<BOOL:${KOTOR_BINK_OPENSL_TEST}>:loader/opensl_patch.c>
+  loader/bink_audio_queue.c
+  loader/opensl_patch.c
   loader/bink_patch.c
   loader/fs_patch.c
   loader/sdl_patch.c
@@ -66,6 +66,8 @@ add_executable(KOTOR
   loader/log.c
 )
 
+target_compile_definitions(KOTOR PRIVATE KOTOR_USE_BINK_OPENSL=1)
+
 if((KOTOR_BINK_SHADER_TEST AND KOTOR_BINK_LEGAL_VIDEO_TEST) OR
    (KOTOR_BINK_SHADER_TEST AND KOTOR_BINK_OPENSL_TEST) OR
    (KOTOR_BINK_LEGAL_VIDEO_TEST AND KOTOR_BINK_OPENSL_TEST))
@@ -76,7 +78,7 @@ if(KOTOR_BINK_SHADER_TEST)
 elseif(KOTOR_BINK_LEGAL_VIDEO_TEST)
   target_compile_definitions(KOTOR PRIVATE BINK_MODE=2)
 elseif(KOTOR_BINK_OPENSL_TEST)
-  target_compile_definitions(KOTOR PRIVATE BINK_MODE=3 KOTOR_USE_BINK_OPENSL=1)
+  target_compile_definitions(KOTOR PRIVATE BINK_MODE=3)
 endif()
 
 target_link_libraries(KOTOR

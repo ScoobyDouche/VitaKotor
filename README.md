@@ -44,7 +44,7 @@ playthrough on.
 | Frame rate | ~30–38 fps typical, dips into the low 20s in dense scenes |
 | Session length | 59 min tested; nothing fatal, but sound thins out past ~40 |
 | Audio | Effects and voice work; long music tracks are silent |
-| Cutscenes | Not played — the video codec is stubbed out |
+| Cutscenes | Bink video and audio play; broad compatibility validation continues |
 | Input | Vita sticks and buttons — see [Controls](#controls) |
 | Saves | Work, stored on the Vita |
 
@@ -189,14 +189,19 @@ you a save. They are listed because you may hit them. Save regularly.
 - **Long music tracks are silent.** Anything over about 90 seconds is replaced
   with correctly-timed silence, so pacing stays right but the score does not
   play. Shorter music and combat stings do. Voice and effects are unaffected.
-- **Cutscenes are skipped.** The Bink video decoder is stubbed out, so FMVs are
-  passed over rather than played.
+- **Bink compatibility is not exhaustively tested.** Normal movie playback and
+  physical-button skipping are enabled. A 101-second 640x272, 44.1 kHz stereo
+  movie played at 29.97 fps and returned cleanly to gameplay on hardware; 48 kHz
+  movies and localized subtitle sidecars still need coverage.
 - **Both touch panels are disabled** deliberately; the port uses physical
   controls exclusively.
 - **No trophies.**
 
 ### Recently fixed
 
+- **Bink cutscenes were skipped.** The embedded decoder and YUV renderer now run,
+  with decoded movie PCM feeding the existing Vita mixer instead of opening a
+  competing audio output. Physical-button skip and cleanup work on hardware.
 - **Voice lines silent during in-game cutscenes** (v0.1.9.2). The MP3 decoder
   sized its output buffer by assuming every frame was the smallest one the
   format allows, which asked for 2.25x what a voice line actually needs — a

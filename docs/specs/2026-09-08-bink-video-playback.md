@@ -1,9 +1,9 @@
 # Bink video playback: embedded decoder findings and integration design
 
-Status: embedded video and one 44.1 kHz stereo A/V movie passed isolated hardware
-validation on 2026-09-09. A minimal OpenSL-compatible queue now feeds the existing
-48 kHz Vita mixer. Production still skips every movie pending representative
-movie, skip, subtitle, and repeated-play validation.
+Status: normal movie playback is enabled. Embedded video and one 44.1 kHz stereo
+A/V movie passed isolated hardware validation on 2026-09-09. A minimal
+OpenSL-compatible queue feeds the existing 48 kHz Vita mixer. Representative
+long-movie, skip, subtitle, 48 kHz, and repeated-play validation remains pending.
 
 ## Executive summary
 
@@ -19,14 +19,15 @@ pieces are compiled into `libandroid_port.so`:
 - Subtitle loading and drawing.
 - An OpenSL ES adapter for movie audio.
 
-The loader currently hooks the two entry points that activate this stack and
-replaces them with no-ops. `MacPlayBinkGL` marks each movie finished immediately,
-and `MacCreateBinkShaders` returns without creating the YUV shader. That was a
-safe bring-up decision, not a decoder limitation.
+The loader now leaves `MacCreateBinkShaders` active and wraps `MacPlayBinkGL` so
+every requested movie reaches the embedded player. The wrapper resets the audio
+pump state before each movie, drives the companion's internally locked pump on
+each decoded frame sequence, stops it before teardown, and records bounded
+performance and cleanup telemetry.
 
-Video-only playback and one audio/video playback gate now pass. The production
-default remains conservative because sixty-one of the sixty-two shipped movies
-contain audio and the broader movie/skip/subtitle matrix has not run yet.
+Video-only playback and one audio/video playback gate pass. Sixty-one of the
+sixty-two shipped movies contain audio, so the broader movie/skip/subtitle matrix
+still needs hardware coverage even though the production path is now active.
 
 The recommended sequence is:
 
@@ -41,18 +42,15 @@ The recommended sequence is:
 
 ## Current behavior
 
-`loader/bink_patch.c` currently installs these hooks:
+`loader/bink_patch.c` keeps a skip stub as a fail-safe, but production defaults to
+`BINK_MODE_PLAY`. The real embedded player receives each original movie path.
+OpenSL-compatible objects and a bounded zero-copy PCM queue are always compiled
+into normal builds and feed the existing Vita mixer rather than opening a second
+audio port.
 
-```c
-hook_addr(so_symbol(port_mod, "_Z13MacPlayBinkGLPKcbRbi"),
-          (uintptr_t)&MacPlayBinkGL_stub);
-hook_addr(so_symbol(port_mod, "_Z20MacCreateBinkShadersv"),
-          (uintptr_t)&bink_stub);
-```
-
-The movie stub logs the path, writes `1` to the supplied `finished` byte, and
-returns. The game therefore advances through its movie queue without decoding,
-drawing, or playing audio.
+If either required companion export is absent or the real-player trampoline
+cannot be installed, playback falls back to the skip stub so the game can still
+advance through its movie queue.
 
 `MacDecompress` must remain untouched. Despite the shared `Mac` prefix, it is the
 LZMA resource decompressor used by `.bzf` game data. Stubbing it previously broke
@@ -276,9 +274,9 @@ MacPlayBinkGL(char const *path, bool can_skip, bool &finished, int arg)
 The game initializes the referenced byte to zero, passes its address in `r2`, and
 stores it into the movie-player object after the call.
 
-The real function does not write that reference and its apparent return value is
-not used. The current stub writes `1` deliberately to implement skip behavior; it
-is not emulating the real completion contract.
+The real function does not write that reference and returns `void`. The fallback
+stub writes `1` deliberately to implement skip behavior; it is not emulating the
+real completion contract.
 
 On successful natural completion or permitted user skip, the real function:
 
@@ -330,8 +328,8 @@ On the first audio track, the Bink adapter calls `slCreateEngine`, reads the
 output engine pointer, and immediately calls through that object without checking
 the result.
 
-Production `SKIP` builds retain the inert bindings below because no movie enters
-the audio path:
+Earlier `SKIP` builds retained inert bindings because no movie entered the audio
+path:
 
 ```c
 { "slCreateEngine",     (uintptr_t)&fmod_stub },
@@ -345,8 +343,8 @@ the audio path:
 objects contain zero. An audio-bearing Bink movie therefore reaches a predictable
 null dereference.
 
-Simply removing the Bink hooks in production is still not safe until the remaining
-acceptance matrix passes.
+Simply removing the Bink hooks was not safe until the OpenSL-compatible object
+graph and mixer queue were implemented.
 
 VitaSDK has a full OpenSL implementation, but hardware testing rejected it:
 
@@ -509,8 +507,7 @@ Full audio/video support is acceptable when:
 - Does subtitle language zero select the intended English/no-sidecar behavior?
 - Are worker priority and clock-ID differences visible on long movies?
 
-The implementation tasks and validation gates are in
-`docs/plans/2026-09-08-bink-video-playback.md`.
+The implementation progress and remaining validation gates are recorded below.
 
 ## External reference: AvP-Gold-Vita
 
@@ -601,10 +598,10 @@ for this choice without committing to either movie-audio architecture.
 
 ## Implementation progress
 
-The first policy gate is implemented:
+The policy modes are implemented:
 
-- Default `BINK_MODE_SKIP` hooks both companion exports and preserves existing
-  movie-skip behavior.
+- Default `BINK_MODE_PLAY` enables every requested movie with mixer-backed audio.
+- `BINK_MODE_SKIP` remains available as a compile-time fallback.
 - `KOTOR_BINK_SHADER_TEST=ON` compiles with `BINK_MODE_SHADER_TEST`, leaves the
   real `MacCreateBinkShaders` untouched, and still hooks every
   `MacPlayBinkGL` call to the skip stub.
@@ -627,9 +624,14 @@ Hardware validation passed:
   mixer using the frame-sequence pump fix. The detailed measurements are in
   "Bink audio-pump wake failure" above.
 - No Bink compile or link failure was recorded and shader creation did not retry.
-- The requested `01A.bik` still logged through the movie-skip hook, proving the
-  OpenSL path remained unreachable in this test.
+- Production playback forwarded the original `01A.bik` path and ran for 101,044
+  ms before a physical-button skip. It presented 3,028 frames at 33/63 ms
+  average/max intervals, enqueued 6,199 stereo audio blocks, returned active
+  players to zero, retained file handles at `2 -> 2`, and resumed gameplay.
 
-The next package permits one real call, substituting silent `legal.bik` for the
-first requested movie, and skips every later movie. Its hardware procedure is
-tracked in the implementation plan.
+Production validation still required:
+
+- A representative 48 kHz movie.
+- Subtitle timing and language selection.
+- Several consecutive movies without leaked players, queues, handles, or
+  textures.

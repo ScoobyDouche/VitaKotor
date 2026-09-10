@@ -277,19 +277,20 @@
 #define FRAME_HITCH_TRACE_MS   80
 #define FRAME_HITCH_LOG_GAP_MS 500
 
-// Bink integration modes. Shader-test initializes the companion's real YUV
-// shader but keeps MacPlayBinkGL on the proven skip path. Legal-video substitutes
-// the only shipped silent movie for the first request and skips every later one.
-// Audio-bearing playback is not exposed until its safety gates pass on hardware.
+// Bink integration modes. Production uses the embedded player and routes decoded
+// PCM through the existing Vita mixer. The other modes retain isolated regression
+// gates for shader, silent-video, and single audio/video playback.
 #define BINK_MODE_SKIP        0
 #define BINK_MODE_SHADER_TEST 1
 #define BINK_MODE_LEGAL_VIDEO 2
 #define BINK_MODE_OPENSL_TEST 3
+#define BINK_MODE_PLAY        4
 #ifndef BINK_MODE
-#define BINK_MODE BINK_MODE_SKIP
+#define BINK_MODE BINK_MODE_PLAY
 #endif
 #if BINK_MODE != BINK_MODE_SKIP && BINK_MODE != BINK_MODE_SHADER_TEST && \
-    BINK_MODE != BINK_MODE_LEGAL_VIDEO && BINK_MODE != BINK_MODE_OPENSL_TEST
+    BINK_MODE != BINK_MODE_LEGAL_VIDEO && BINK_MODE != BINK_MODE_OPENSL_TEST && \
+    BINK_MODE != BINK_MODE_PLAY
 #error Unsupported BINK_MODE
 #endif
 

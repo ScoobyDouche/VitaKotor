@@ -88,10 +88,9 @@ arm-vita-eabi-readelf --dyn-syms -W apk/lib/armeabi-v7a/libKOTOR.so
 
 The loader builds cleanly to `build/KOTOR.vpk` (0 warnings) and **runs the game's
 `SDL_main` on hardware**. It so-loads `libKOTOR.so` + `libandroid_port.so`,
-relocates/resolves them, stubs audio (FMOD/OpenSLES) and Bink, wires libc/libm/
+implements the FMOD and Bink OpenSL paths over one Vita mixer, wires libc/libm/
 C++/pthread, inits vitaGL, builds the fake JNI tables (no `JNI_OnLoad`; entry is
-`SDL_main`), redirects the filesystem, and hands off to the game. Init reaches
-the SDL/JNI display-metrics probe and window/GL-context creation.
+`SDL_main`), redirects the filesystem, and hands off to the game.
 
 - **Runtime prerequisites:** copy `libKOTOR.so`, `libandroid_port.so`,
   `libminiz.so`, and `libLzmaLib.so` from `apk/lib/armeabi-v7a/` to
