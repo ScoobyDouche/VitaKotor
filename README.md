@@ -199,6 +199,11 @@ you a save. They are listed because you may hit them. Save regularly.
 
 ### Recently fixed
 
+- **Audio mixer lock contention:** the Vita mixer now snapshots active channels,
+  mixes outside the game-facing mutex, and batches FMOD completion scanning under
+  one lock. A real-Vita smoke test preserved working audio; the frame-rate effect
+  still needs a controlled A/B. See the
+  [investigation note](docs/specs/2026-09-12-audio-lock-contention.md).
 - **Bink cutscenes were skipped.** The embedded decoder and YUV renderer now run,
   with decoded movie PCM feeding the existing Vita mixer instead of opening a
   competing audio output. Physical-button skip and cleanup work on hardware.
