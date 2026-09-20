@@ -1,0 +1,184 @@
+diff --git a/source/custom_shaders.c b/source/custom_shaders.c
+index f1156e3..f0e3dd0 100644
+--- a/source/custom_shaders.c
++++ b/source/custom_shaders.c
+@@ -122,16 +122,61 @@ char vgl_file_cache_path[256];
+ 		} \
+ 	}
+ 
++// SceGxmVertexAttribute::offset is only 16 bits wide, but vertex_attrib_offsets[]
++// is a uint32_t and an app may legitimately draw from deep inside a large VBO
++// (packing many meshes into one buffer and pointing each draw at its own slice).
++// Assigning such an offset straight through silently truncates it mod 64 KB, so
++// the GPU fetches every attribute from the wrong vertex.
++// Rebase in that case: find the lowest enabled attribute offset, fold it into the
++// stream pointer, and store only the (small) intra-vertex remainder. Draws whose
++// offsets already fit are left byte-for-byte as before.
++#define compute_packed_vbo_base() \
++	uint32_t vbo_off_base = 0, vbo_off_max = 0, vbo_off_min = 0xFFFFFFFF; \
++	for (int i = 0; i < p->attr_num; i++) { \
++		uint8_t attr_idx = p->attr_map[i]; \
++		if (cur_vao->vertex_attrib_state & (1 << attr_idx)) { \
++			uint32_t o = cur_vao->vertex_attrib_offsets[attr_idx]; \
++			if (o > vbo_off_max) vbo_off_max = o; \
++			if (o < vbo_off_min) vbo_off_min = o; \
++		} \
++	} \
++	if (vbo_off_max > 0xFFFF) vbo_off_base = vbo_off_min;
++
+ #define handle_packed_vbo_attrib() \
+ 	if (cur_vao->vertex_attrib_state & (1 << attr_idx)) { \
+-		attributes[i].offset = cur_vao->vertex_attrib_offsets[attr_idx]; \
++		attributes[i].offset = cur_vao->vertex_attrib_offsets[attr_idx] - vbo_off_base; \
+ 	} else { \
+ 		disable_draw_attrib(i) \
+-	}	
++	}
++
++// The client-array twin of compute_packed_vbo_base(). attr_map[i] == i, so
++// attr_map[0] is attribute location 0 -- which is NOT necessarily the attribute
++// sitting lowest in the vertex. KOTOR's skinned layout is the counter-example:
++//   loc 2 a_position      +0x00   <- lowest in the vertex
++//   loc 3 a_normal        +0x0c
++//   loc 4 a_texCoord0     +0x18
++//   loc 0 a_matrixWeights +0x20   <- attr_map[0]
++//   loc 1 a_matrixIndices +0x30
++// Basing on attr_map[0] then subtracts a LARGER offset from a smaller one:
++// a_position gets 0x00 - 0x20 = 0xFFFFFFE0, which lands in a uint16 offset
++// field as 65504, and the GPU fetches positions from 64 KB into the stream.
++// The memcpy is wrong in the same way -- it starts at attr_map[0]'s address, so
++// the position bytes, which live *before* it, are never copied at all.
++// Base on the lowest enabled offset instead. When attr_map[0] already is the
++// lowest -- every non-skinned layout here -- min equals it and nothing changes.
++#define compute_packed_cli_base() \
++	uint32_t cli_off_base = cur_vao->vertex_attrib_offsets[p->attr_map[0]]; \
++	for (int i = 0; i < p->attr_num; i++) { \
++		uint8_t attr_idx = p->attr_map[i]; \
++		if (cur_vao->vertex_attrib_state & (1 << attr_idx)) { \
++			uint32_t o = cur_vao->vertex_attrib_offsets[attr_idx]; \
++			if (o < cli_off_base) cli_off_base = o; \
++		} \
++	}
+ 
+ #define handle_packed_attrib() \
+ 	if (cur_vao->vertex_attrib_state & (1 << attr_idx)) { \
+-		attributes[i].offset = cur_vao->vertex_attrib_offsets[attr_idx] - cur_vao->vertex_attrib_offsets[p->attr_map[0]]; \
++		attributes[i].offset = cur_vao->vertex_attrib_offsets[attr_idx] - cli_off_base; \
+ 	} else { \
+ 		disable_draw_attrib(i) \
+ 	}
+@@ -839,7 +884,8 @@ void _glMultiDrawArrays_CustomShadersIMPL(SceGxmPrimitiveType gxm_p, uint16_t *i
+ 	// Gathering real attribute data pointers
+ 	if (is_packed) {
+ 		if (target_vbo) {
+-			ptrs[0] = (void *)target_vbo->ptr + lowest * streams[0].stride;
++			compute_packed_vbo_base();
++			ptrs[0] = (void *)target_vbo->ptr + vbo_off_base + lowest * streams[0].stride;
+ 			target_vbo->last_frame = vgl_framecount;
+ 			for (int i = 0; i < p->attr_num; i++) {
+ 				uint8_t attr_idx = p->attr_map[i];
+@@ -847,8 +893,9 @@ void _glMultiDrawArrays_CustomShadersIMPL(SceGxmPrimitiveType gxm_p, uint16_t *i
+ 				handle_packed_vbo_attrib();
+ 			}
+ 		} else {
++			compute_packed_cli_base();
+ 			ptrs[0] = gpu_alloc_mapped_temp((highest - lowest) * streams[0].stride);
+-			vgl_fast_memcpy(ptrs[0], (void *)cur_vao->vertex_attrib_offsets[p->attr_map[0]] + lowest * streams[0].stride, (highest - lowest) * streams[0].stride);		
++			vgl_fast_memcpy(ptrs[0], (void *)cli_off_base + lowest * streams[0].stride, (highest - lowest) * streams[0].stride);
+ 			for (int i = 0; i < p->attr_num; i++) {
+ 				uint8_t attr_idx = p->attr_map[i];
+ 				attributes[i].regIndex = p->attr[attr_idx].regIndex;
+@@ -1066,7 +1113,8 @@ GLboolean _glDrawArrays_CustomShadersIMPL(GLint first, GLsizei count, GLboolean
+ 	// Gathering real attribute data pointers
+ 	if (is_packed) {
+ 		if (target_vbo) {
+-			ptrs[0] = (void *)target_vbo->ptr + first * streams[0].stride;
++			compute_packed_vbo_base();
++			ptrs[0] = (void *)target_vbo->ptr + vbo_off_base + first * streams[0].stride;
+ 			target_vbo->last_frame = vgl_framecount;
+ 			for (int i = 0; i < p->attr_num; i++) {
+ 				uint8_t attr_idx = p->attr_map[i];
+@@ -1074,14 +1122,15 @@ GLboolean _glDrawArrays_CustomShadersIMPL(GLint first, GLsizei count, GLboolean
+ 				handle_packed_vbo_attrib();
+ 			}
+ 		} else {
++			compute_packed_cli_base();
+ #ifdef SAFER_DRAW_SPEEDHACK
+ 			if (count * streams[0].stride > SAFE_DRAW_SIZE_THRESHOLD) {
+-				ptrs[0] = (void *)cur_vao->vertex_attrib_offsets[p->attr_map[0]] + first * streams[0].stride;
++				ptrs[0] = (void *)cli_off_base + first * streams[0].stride;
+ 			} else
+ #endif
+ 			{
+ 				ptrs[0] = gpu_alloc_mapped_temp(count * streams[0].stride);
+-				vgl_fast_memcpy(ptrs[0], (void *)cur_vao->vertex_attrib_offsets[p->attr_map[0]] + first * streams[0].stride, count * streams[0].stride);
++				vgl_fast_memcpy(ptrs[0], (void *)cli_off_base + first * streams[0].stride, count * streams[0].stride);
+ 			}
+ 			for (int i = 0; i < p->attr_num; i++) {
+ 				uint8_t attr_idx = p->attr_map[i];
+@@ -1341,7 +1390,8 @@ GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, ui
+ 	// Gathering real attribute data pointers
+ 	if (is_packed) {
+ 		if (target_vbo) {
+-			ptrs[0] = (void *)target_vbo->ptr;
++			compute_packed_vbo_base();
++			ptrs[0] = (void *)target_vbo->ptr + vbo_off_base;
+ 			target_vbo->last_frame = vgl_framecount;
+ 			for (int i = 0; i < p->attr_num; i++) {
+ 				uint8_t attr_idx = p->attr_map[i];
+@@ -1349,14 +1399,15 @@ GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, ui
+ 				handle_packed_vbo_attrib();
+ 			}
+ 		} else {
++			compute_packed_cli_base();
+ #ifdef SAFER_DRAW_SPEEDHACK
+ 			if (top_idx * streams[0].stride > SAFE_DRAW_SIZE_THRESHOLD) {
+-				ptrs[0] = (void *)cur_vao->vertex_attrib_offsets[p->attr_map[0]];
++				ptrs[0] = (void *)cli_off_base;
+ 			} else
+ #endif
+ 			{
+ 				ptrs[0] = gpu_alloc_mapped_temp(top_idx * streams[0].stride);
+-				vgl_fast_memcpy(ptrs[0], (void *)cur_vao->vertex_attrib_offsets[p->attr_map[0]], top_idx * streams[0].stride);
++				vgl_fast_memcpy(ptrs[0], (void *)cli_off_base, top_idx * streams[0].stride);
+ 			}
+ 			for (int i = 0; i < p->attr_num; i++) {
+ 				uint8_t attr_idx = p->attr_map[i];
+@@ -2180,6 +2231,19 @@ void glLinkProgram(GLuint progr) {
+ 			}
+ 		}
+ 
++		// VitaKotor: a failed compile leaves shader->prog NULL, and
++		// set_default_attrib_binding() immediately calls
++		// sceGxmProgramGetParameterCount(p->vshader->prog) -> null deref at
++		// FAR=0x24 inside SceGxm. This guard has to sit *here*, before that
++		// macro: the copy further down (before the re-link check) is already
++		// past the deref and never gets to run.
++		if (!p->vshader->prog || !p->fshader->prog) {
++			vgl_log("%s:%d: %s: shader compile FAILED (vs_prog=%p fs_prog=%p) -- link skipped.\n",
++				__FILE__, __LINE__, __func__, (void *)p->vshader->prog, (void *)p->fshader->prog);
++			glsl_sema_mode = VGL_MODE_POSTPONED;
++			return;
++		}
++
+ 		// Setting progressive default attribute bindings
+ 		set_default_attrib_binding();
+ 
+@@ -2193,6 +2257,17 @@ void glLinkProgram(GLuint progr) {
+ 		glsl_sema_mode = VGL_MODE_POSTPONED;
+ 	}
+ 
++	// VitaKotor: guard against a shader that failed to compile (prog == NULL).
++	// Upstream vitaGL assumes compilation succeeded and then calls
++	// sceGxmProgramGetParameterCount(p->fshader->prog) below -> null deref
++	// (FAR=0x24) inside SceGxm. Bail out (and log) instead of crashing so the
++	// game survives a bad shader and we can see the shark compile error.
++	if (!p->vshader->prog || !p->fshader->prog) {
++		vgl_log("%s:%d: %s: shader compile FAILED (vs_prog=%p fs_prog=%p) -- link skipped.\n",
++			__FILE__, __LINE__, __func__, (void *)p->vshader->prog, (void *)p->fshader->prog);
++		return;
++	}
++
+ 	if (p->status == PROG_LINKED) {
+ 		vgl_log("%s:%d: %s: A program has been re-linked. vitaGL doesn't support re-linking, glitches may happen.\n", __FILE__, __LINE__, __func__);
+ 		return;

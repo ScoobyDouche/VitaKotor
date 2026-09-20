@@ -157,6 +157,13 @@ make install                   # copies libvitaGL.a → $VITASDK/arm-vita-eabi/l
 > Always `make clean` when changing flags, or you get a half-and-half archive
 > whose objects disagree about the feature macros.
 
+> **Apply `patches/vitagl-vbo-offset-64k.patch` before building.** vitaGL
+> truncates vertex-attribute offsets over 64 KB, which corrupts geometry on the
+> larger models. It is linked statically, so this patch is part of the shipped
+> binary rather than an optional extra — a build without it is not the build
+> that was released. `patches/README.md` has the reasoning and the exact
+> sequence.
+
 Build completed with exit 0 (only benign warnings). Verified the installed
 `$VITASDK/arm-vita-eabi/lib/libvitaGL.a` matches the freshly-built artifact.
 
