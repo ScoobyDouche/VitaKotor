@@ -13,6 +13,12 @@ void *Android_JNI_GetEnv(void);
 // the real entry (SDL_main) runs.
 void jni_setup(void);
 
+// The language the game asks for through ASLPlat_GetCurrentLanguage(). On
+// Android that call reaches Java and returns the device locale; here there is
+// nobody to ask, so main() resolves it from swkotor.ini and hands it over
+// before jni_setup(). Values are the INI_LANG_* ids in ini.h.
+void jni_set_language(int id);
+
 // Accessors for the fake JavaVM* / JNIEnv* (needed when we invoke the entry).
 void *jni_get_vm(void);
 void *jni_get_env(void);

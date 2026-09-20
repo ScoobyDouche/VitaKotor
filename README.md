@@ -144,6 +144,25 @@ keyboard. Tap the name box to bring it up, type, and confirm. *(New in v0.1.9.1.
 On v0.1.9 and earlier there is no way to enter a name at all, which leaves
 character creation with no way forward.)*
 
+## Language
+
+The game ships its text in five languages, and the Android release picked one
+from the phone's locale. There is no locale to read on the Vita, so the port
+reads it from `ux0:data/kotor/swkotor.ini` instead. Add a `Language` line to the
+`[Game Options]` section:
+
+```ini
+[Game Options]
+Language=fr
+```
+
+`en` (the default), `fr`, `it`, `de` and `es`. Anything else, or no line at all,
+gives you English. If the section is not in your ini yet, add it.
+
+This changes the on-screen text and the main-menu artwork. **Voice-over stays
+English** in every language — the game data only ever shipped one set of
+recordings, so this is what the retail releases did too.
+
 ## Known issues
 
 ### Intermittent

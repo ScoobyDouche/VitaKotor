@@ -22,6 +22,7 @@
 #include "dynlib.h"
 #include "loadscreen.h"
 #include "jni_patch.h"
+#include "ini.h"
 #include "audio_patch.h"
 #include "bink_patch.h"
 #include "fs_patch.h"
@@ -2058,6 +2059,52 @@ static void hook_named_port(const char *sym, uintptr_t probe, void **orig,
 // Dump the persisted ini so the log records the "Sound Init" value the game is
 // about to read, independent of whatever the ctor probe reports. Read-only --
 // we are still diagnosing, not fixing.
+// Read an ini into `buf` as NUL-terminated text. Returns the byte count, or a
+// negative sceIo error. The file is a few KB of settings, so it is read whole
+// rather than streamed; a longer one is truncated at the buffer, which only
+// costs us keys past the cut.
+static int slurp_ini(const char *path, char *buf, int size) {
+  SceUID fd = sceIoOpen(path, SCE_O_RDONLY, 0);
+  if (fd < 0) return fd;
+  int n = sceIoRead(fd, buf, size - 1);
+  sceIoClose(fd);
+  if (n < 0) return n;
+  buf[n] = '\0';
+  return n;
+}
+
+// The two spellings seen on real cards. ux0 is case-insensitive, but which one
+// the game creates has varied between installs, so both are tried and the
+// first that opens wins.
+static const char *const kIniPaths[] = {
+  "ux0:data/kotor/swkotor.ini",
+  "ux0:data/kotor/swKotor.ini",
+};
+#define INI_PATH_COUNT ((int)(sizeof(kIniPaths) / sizeof(kIniPaths[0])))
+
+// Resolve [Game Options] Language and hand it to the JNI layer, which is where
+// the game will come looking for it (ASLPlat_GetCurrentLanguage). Absent file,
+// absent key and unrecognised code all mean English -- the same thing the
+// engine falls back to for an out-of-range id, so no path here can leave the
+// game hunting for resources that are not in the OBB.
+static void resolve_language(void) {
+  char buf[4097];
+  for (int i = 0; i < INI_PATH_COUNT; i++) {
+    if (slurp_ini(kIniPaths[i], buf, sizeof(buf)) <= 0) continue;
+    char code[16];
+    if (!ini_get(buf, "Game Options", "Language", code, sizeof(code))) break;
+    int id = ini_language_id(code);
+    log_printf("[lang] %s: [Game Options] Language=%s -> id %d%s",
+               kIniPaths[i], code, id,
+               (id == INI_LANG_EN && strcmp(code, "en") != 0)
+                 ? "  (unrecognised, using English)" : "");
+    jni_set_language(id);
+    return;
+  }
+  log_printf("[lang] no [Game Options] Language key -> id %d (English)",
+             INI_LANG_EN);
+}
+
 static void dump_ini(const char *path) {
   SceIoStat st;
   memset(&st, 0, sizeof(st));
@@ -2066,13 +2113,9 @@ static void dump_ini(const char *path) {
     return;
   }
   log_printf("[snd?] ini PRESENT: %s size=%lld", path, (long long)st.st_size);
-  SceUID fd = sceIoOpen(path, SCE_O_RDONLY, 0);
-  if (fd < 0) { log_printf("[snd?]   open failed: 0x%08x", (unsigned)fd); return; }
   char buf[2049];
-  int n = sceIoRead(fd, buf, sizeof(buf) - 1);
-  sceIoClose(fd);
+  int n = slurp_ini(path, buf, sizeof(buf));
   if (n <= 0) { log_printf("[snd?]   read failed/empty: %d", n); return; }
-  buf[n] = '\0';
   // Line-by-line so the log stays readable and CRLF does not wreck it.
   char *p = buf;
   while (*p) {
@@ -2088,8 +2131,7 @@ static void dump_ini(const char *path) {
 }
 
 static void install_sound_probe(void) {
-  dump_ini("ux0:data/kotor/swkotor.ini");
-  dump_ini("ux0:data/kotor/swKotor.ini");
+  for (int i = 0; i < INI_PATH_COUNT; i++) dump_ini(kIniPaths[i]);
   // The one global that can suppress all of sound. GameInit is its only writer,
   // so read it before (should be .bss 0) and again right after GameInit returns.
   g_pDisableSound = (int *)so_symbol(&kotor_mod, "g_bDisableSound");
@@ -2488,6 +2530,10 @@ int main(int argc, char *argv[]) {
 
   // NOTE: vitaGL is initialised on the game thread (see game_main_thread), not
   // here -- GXM context must live on the thread that issues GL calls.
+
+  // Read the language out of swkotor.ini before the JNI tables go up: the
+  // game polls getCurrentLanguage from its first frame onwards.
+  resolve_language();
 
   // Build the fake JNI tables (this build has no JNI_OnLoad; see RECON-JNI.md).
   jni_setup();

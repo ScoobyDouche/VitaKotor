@@ -30,11 +30,19 @@
 #include "main.h"
 #include "config.h"
 #include "jni_patch.h"
+#include "ini.h"
 #include "so_util.h"
 #include "log.h"
 
 static char fake_vm[0x1000];
 static char fake_env[0x1000];
+
+// Set from swkotor.ini before jni_setup(); see jni_set_language in the header.
+static int g_language = INI_LANG_EN;
+
+void jni_set_language(int id) {
+  g_language = id;
+}
 
 // Install a shim at JNI function-table index i (byte offset i*4).
 #define ENV(i, fn) (((uintptr_t *)fake_env)[(i)] = (uintptr_t)(fn))
@@ -163,6 +171,10 @@ static int CallStaticIntMethodV(void *env, void *cls, void *mid, va_list a) {
   int r = 0;
   if (!strcmp(n, "GetScreenWidthPixel"))       r = 960;
   else if (!strcmp(n, "GetScreenHeightPixel")) r = 544;
+  // The engine indexes its language tables with this and treats anything
+  // outside 1..4 as English, so the 0 this used to return was a silent
+  // hard-wiring of English rather than a neutral default.
+  else if (!strcmp(n, "getCurrentLanguage"))   r = g_language;
   LOG_JNI("CallStaticIntMethod(id=%s) -> %d", n, r);
   return r;
 }
