@@ -40,6 +40,30 @@ int ini_get(const char *text, const char *section, const char *key,
 #define INI_LANG_IT 2
 #define INI_LANG_DE 3
 #define INI_LANG_ES 4
+/* Write `text` back out with `key` set to `value` inside `[section]`, into
+ * `out` (always NUL-terminated when outsz > 0).
+ *
+ * Returns the length the result needs, excluding the NUL, the way snprintf
+ * does: a return >= outsz means the text was truncated and MUST NOT be written
+ * to the card. Pass outsz 0 to size the buffer without writing anything.
+ *
+ * The file is the user's, so everything outside the one line that changes
+ * comes back byte for byte -- comments, section order, spacing, and the key's
+ * own spelling and indentation. Only a stale inline comment on the rewritten
+ * line goes, since it describes the value being replaced.
+ *
+ * An existing key is replaced in place; an existing section without the key
+ * gains it directly under the header; a missing section is appended. Line
+ * endings follow whatever the file already uses, defaulting to CRLF -- what
+ * the engine writes -- when there is nothing to copy. */
+size_t ini_set(const char *text, const char *section, const char *key,
+               const char *value, char *out, size_t outsz);
+
 int ini_language_id(const char *code);
+
+/* The inverse: the code to write back for an id, for anything that has picked
+ * a language and now has to say so in the file. Never NULL -- an id outside
+ * 1..4 is English, matching ini_language_id's own fallback. */
+const char *ini_language_code(int id);
 
 #endif
