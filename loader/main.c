@@ -2096,6 +2096,8 @@ static const char *g_ini_path     = NULL;   // NULL until an ini is found
 static int         g_lang_id      = INI_LANG_EN;
 static int         g_lang_have_key = 0;
 
+int loader_language(void) { return g_lang_id; }
+
 static void resolve_language(void) {
   char buf[4097];
   for (int i = 0; i < INI_PATH_COUNT; i++) {

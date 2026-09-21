@@ -20,8 +20,12 @@
  * next entry's offset; and its LZMA stream is five bytes of properties with the
  * usual eight-byte length field omitted.
  *
- * Reading the language-specific dialog.tlk means the hints come out in
- * whatever language the installed game data uses, with no table to maintain.
+ * Which dialog.tlk is read is what makes the boot screen speak the language the
+ * user picked: the archive carries all five (dialog.tlk, dialogfr.tlk,
+ * dialogit.tlk, dialogde.tlk, dialoges.tlk) and the engine's own table picks
+ * between them by the same id ini.h defines. The word "LOADING" comes from the
+ * same file for the same reason -- it is StrRef 42493 in every one of them, so
+ * the boot screen never has to carry a translation this port invented.
  *
  * Every failure is silent and total: no hints, and the boot screen simply shows
  * its own lines instead. */
@@ -37,10 +41,17 @@ typedef int (*LzmaUncompressFn)(unsigned char *dest, size_t *destLen,
                                 const unsigned char *src, size_t *srcLen,
                                 const unsigned char *props, size_t propsSize);
 
-/* Read the hints out of main.obb, decompressing with `lzma`. Returns how many
- * were loaded, 0 on any failure. Call once, early; costs a few hundred
- * milliseconds of card I/O. */
-int hints_load(LzmaUncompressFn lzma);
+/* Read the hints out of main.obb, decompressing with `lzma`, in the language
+ * `lang` (an INI_LANG_* id). Returns how many were loaded, 0 on any failure.
+ * Call once, early; costs a few hundred milliseconds of card I/O.
+ *
+ * A language whose table is missing falls back to English rather than leaving
+ * the screen blank. */
+int hints_load(LzmaUncompressFn lzma, int lang);
+
+/* The game's own word for "Loading", in whatever language hints_load() read,
+ * or NULL if it could not be resolved. Valid until hints_free(). */
+const char *hints_loading(void);
 
 /* How many hints are available, and one of them. hints_get() returns NULL for
  * an out-of-range index. */

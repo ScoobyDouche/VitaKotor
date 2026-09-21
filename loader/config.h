@@ -200,6 +200,13 @@
 #define FONT_TGA_ENTRY            "override/dialogfont16x16b.tga"
 #define LOGO_TGA_ENTRY            "override/and_main_logo.tga"
 
+// The game's own word for "Loading", which the boot screen shows in place of a
+// translation this port would otherwise have had to invent. Verified against
+// every table that ships in main.obb: 42493 is "Loading" in dialog.tlk,
+// "Chargement en cours" in dialogfr, "Caricamento" in dialogit, "Ladt" (with
+// the umlaut) in dialogde and "Cargando" in dialoges. The font atlas is a full
+// 256-glyph CP1252 set, so the accented spellings draw correctly.
+#define LOADING_STRREF            42493
 
 // ---- boot-time language picker (see langsel.h) ------------------------------
 //

@@ -1,10 +1,12 @@
 /* hints.c -- see hints.h. */
 
 #include <vitasdk.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "hints.h"
+#include "ini.h"
 #include "config.h"
 #include "log.h"
 #include "obbzip.h"
@@ -17,6 +19,7 @@
 static char  *g_arena;
 static unsigned g_used;
 static const char *g_hint[MAX_HINTS];
+static char  g_loading[64];   /* the game's own word for "Loading" */
 static int    g_n;
 
 static unsigned rd16(const unsigned char *p) { return p[0] | (p[1] << 8); }
@@ -181,9 +184,29 @@ void hints_free(void) {
   g_arena = NULL;
   g_used = 0;
   g_n = 0;
+  g_loading[0] = '\0';
 }
 
-int hints_load(LzmaUncompressFn lzma) {
+const char *hints_loading(void) {
+  return g_loading[0] ? g_loading : NULL;
+}
+
+/* One string out of an open TLK. The entry table is fixed-width records from
+ * byte 20, each carrying an offset into the string block and a length. */
+static int tlk_string(ObbZip *z, unsigned long long tlk, unsigned stroff,
+                      unsigned nstr, unsigned strref, char *out, unsigned outsz) {
+  if (strref >= nstr) return 0;
+  unsigned char ent[40];
+  if (!obbzip_pread(z, tlk + 20 + (unsigned long long)strref * 40, ent, sizeof ent))
+    return 0;
+  unsigned so = rd32(ent + 28), sz = rd32(ent + 32);
+  if (!sz || sz >= outsz) return 0;
+  if (!obbzip_pread(z, tlk + stroff + so, out, sz)) return 0;
+  out[sz] = '\0';
+  return (int)sz;
+}
+
+int hints_load(LzmaUncompressFn lzma, int lang) {
   uint64_t t0 = sceKernelGetProcessTimeWide();
   unsigned char *key = NULL, *bzf = NULL, *tda = NULL;
   unsigned *refs = NULL;
@@ -225,16 +248,27 @@ int hints_load(LzmaUncompressFn lzma) {
   int nref = twoda_strrefs(tda, tda_len, refs, MAX_HINTS);
   if (nref <= 0) { log_printf("[hints] loadscreenhints held no StrRefs"); goto done; }
 
-  /* dialog.tlk is 5.4 MB; read only the records we need. */
+  /* The table for the chosen language, falling back to the English one. Each
+   * is 5+ MB, so only the records we actually want are read. */
+  char tlkname[32];
+  if (lang == INI_LANG_EN)
+    strcpy(tlkname, "dialog.tlk");
+  else
+    snprintf(tlkname, sizeof tlkname, "dialog%s.tlk", ini_language_code(lang));
+
   unsigned long long tlk = 0;
   unsigned tlk_len = 0;
-  if (!obbzip_locate(z, "dialog.tlk", &tlk, &tlk_len)) {
-    log_printf("[hints] no dialog.tlk");
-    goto done;
+  if (!obbzip_locate(z, tlkname, &tlk, &tlk_len)) {
+    log_printf("[hints] no %s -- falling back to English", tlkname);
+    strcpy(tlkname, "dialog.tlk");
+    if (!obbzip_locate(z, tlkname, &tlk, &tlk_len)) {
+      log_printf("[hints] no dialog.tlk either");
+      goto done;
+    }
   }
   unsigned char head[20];
   if (!obbzip_pread(z, tlk, head, sizeof head) || memcmp(head, "TLK V3.0", 8) != 0) {
-    log_printf("[hints] dialog.tlk header is not TLK V3.0");
+    log_printf("[hints] %s header is not TLK V3.0", tlkname);
     goto done;
   }
   unsigned nstr = rd32(head + 12), stroff = rd32(head + 16);
@@ -244,18 +278,22 @@ int hints_load(LzmaUncompressFn lzma) {
 
   char buf[512];
   for (int i = 0; i < nref && g_n < MAX_HINTS; i++) {
-    if (refs[i] >= nstr) continue;
-    unsigned char ent[40];
-    if (!obbzip_pread(z, tlk + 20 + (unsigned long long)refs[i] * 40, ent, sizeof ent))
-      continue;
-    unsigned so = rd32(ent + 28), sz = rd32(ent + 32);
-    if (!sz || sz >= sizeof buf) continue;
-    if (!obbzip_pread(z, tlk + stroff + so, buf, sz)) continue;
-    arena_put(buf, sz);
+    int sz = tlk_string(z, tlk, stroff, nstr, refs[i], buf, sizeof buf);
+    if (sz > 0) arena_put(buf, (unsigned)sz);
   }
 
-  log_printf("[hints] %d of %d StrRefs resolved from %s in %ums (%u of %u bytes)",
-             g_n, nref, path,
+  /* The boot screen's own heading, from the same table rather than from a
+   * translation this port would have had to invent. */
+  if (tlk_string(z, tlk, stroff, nstr, LOADING_STRREF, g_loading,
+                 sizeof g_loading) > 0)
+    log_printf("[hints] StrRef %d (\"Loading\") in %s is \"%s\"",
+               LOADING_STRREF, tlkname, g_loading);
+  else
+    log_printf("[hints] StrRef %d not in %s -- the boot screen keeps its own word",
+               LOADING_STRREF, tlkname);
+
+  log_printf("[hints] %d of %d StrRefs resolved from %s (%s) in %ums (%u of %u bytes)",
+             g_n, nref, path, tlkname,
              (unsigned)((sceKernelGetProcessTimeWide() - t0) / 1000),
              g_used, (unsigned)ARENA_SIZE);
 

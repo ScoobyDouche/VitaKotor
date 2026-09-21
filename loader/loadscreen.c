@@ -42,15 +42,19 @@ static float    g_logo_s0, g_logo_t0, g_logo_s1, g_logo_t1, g_logo_aspect;
 static int      g_nhint  = 0;
 static unsigned g_seed   = 0;
 
-/* Shown before the game's own hints. The boot screen is the only place the port
- * can explain itself, and the first line is the one most likely to be read. */
-static const char *const g_tip[] = {
+/* Shown once, before the game's own hints, and only on the boot it is actually
+ * about: a cold cache, where the wait is roughly twice as long and a first-time
+ * user has every reason to think the console has hung.
+ *
+ * It stays English while the hints around it follow the chosen language,
+ * because unlike them it is this port's own sentence rather than something
+ * with a translation sitting in the game data. Confining it to the one boot
+ * where it explains something is the honest fix: every later boot opens on the
+ * game's own hints, in the user's own language, and nobody has to take a
+ * translation invented here on trust. */
+static const char *const kColdTip =
   "First boot after copying the game data is slower: the archive index is "
-  "being built. Later boots skip it.",
-  "The bar estimates from how long your last boot took, so it is a guess "
-  "until the game takes the screen.",
-};
-#define TIP_COUNT ((int)(sizeof g_tip / sizeof g_tip[0]))
+  "being built. Later boots skip it.";
 #endif
 
 /* Filled rectangles via scissor+clear: no shaders, no buffers, no textures, and
@@ -193,7 +197,8 @@ static void art_load(void) {
   obbzip_close(z);
 
   if (font_ready())
-    g_nhint = hints_load((LzmaUncompressFn)so_symbol(&lzma_mod, "LzmaUncompress"));
+    g_nhint = hints_load((LzmaUncompressFn)so_symbol(&lzma_mod, "LzmaUncompress"),
+                         loader_language());
 
   log_printf("[loadscreen] ready in %ums (art %s, logo %s, font %s, %d hints)",
              (unsigned)((sceKernelGetProcessTimeWide() - t0) / 1000),
@@ -201,18 +206,20 @@ static void art_load(void) {
              font_ready() ? "yes" : "no", g_nhint);
 }
 
-/* Which line to show right now: a loader tip first, then the game's own hints.
- * The screen freezes partway through the boot, so putting the port's own
- * explanation first is the only way to be sure it is ever read. */
+/* Which line to show right now: on a cold boot the port's one explanation,
+ * then the game's own hints.
+ *
+ * The screen freezes at the game's first GL call -- about three slots into a
+ * warm boot -- so slots are scarce and spending one of them is a real cost.
+ * That is affordable on a cold boot, which runs about twice as long and is the
+ * only one the explanation is true of; on a warm boot it would be spending a
+ * scarce slot to say nothing, in the wrong language. */
 static const char *current_line(unsigned elapsed_s) {
   unsigned slot = elapsed_s / LOADSCREEN_HINT_SECONDS;
-  /* Only the first slot is ours. The screen freezes at the game's first GL
-   * call -- about three slots into a warm boot -- so spending more than one on
-   * the port would crowd out the hints entirely on exactly the boots that are
-   * short enough not to need explaining. */
-  if (slot == 0) return g_tip[g_seed % (unsigned)TIP_COUNT];
+  unsigned own = g_warm ? 0u : 1u;      /* slots the port keeps for itself */
+  if (slot < own) return kColdTip;
   if (g_nhint <= 0) return NULL;
-  return hints_get((int)((g_seed + slot - 1) % (unsigned)g_nhint));
+  return hints_get((int)((g_seed + slot - own) % (unsigned)g_nhint));
 }
 
 /* One textured quad, in screen pixels. Each caller gets its own vertex storage
@@ -284,8 +291,12 @@ static void art_draw(float frac) {
   }
 
   if (font_ready()) {
-    float lx = (float)ART_SX(ART_LOAD_CX) - font_measure("LOADING", -1) * 0.5f;
-    font_draw("LOADING", -1, lx, (float)ART_SY(ART_LOAD_Y), 1.0f,
+    /* The game's own word, in the game's own language. Only if the hints did
+     * not load at all does the screen fall back to the English one. */
+    const char *word = hints_loading();
+    if (!word) word = "LOADING";
+    float lx = (float)ART_SX(ART_LOAD_CX) - font_measure(word, -1) * 0.5f;
+    font_draw(word, -1, lx, (float)ART_SY(ART_LOAD_Y), 1.0f,
               0.588f, 0.667f, 0.784f, 1.0f);
 
     const char *line = current_line(elapsed_s);
