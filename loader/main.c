@@ -23,6 +23,7 @@
 #include "loadscreen.h"
 #include "jni_patch.h"
 #include "ini.h"
+#include "langsel.h"
 #include "audio_patch.h"
 #include "bink_patch.h"
 #include "fs_patch.h"
@@ -2087,10 +2088,19 @@ static const char *const kIniPaths[] = {
 // absent key and unrecognised code all mean English -- the same thing the
 // engine falls back to for an out-of-range id, so no path here can leave the
 // game hunting for resources that are not in the OBB.
+// What resolve_language() worked out, kept for the picker: which file to write
+// back to, what the game is currently being told, and whether that came from a
+// real key or from the English default -- which is what decides whether a
+// first-time user gets asked at all.
+static const char *g_ini_path     = NULL;   // NULL until an ini is found
+static int         g_lang_id      = INI_LANG_EN;
+static int         g_lang_have_key = 0;
+
 static void resolve_language(void) {
   char buf[4097];
   for (int i = 0; i < INI_PATH_COUNT; i++) {
     if (slurp_ini(kIniPaths[i], buf, sizeof(buf)) <= 0) continue;
+    g_ini_path = kIniPaths[i];
     char code[16];
     if (!ini_get(buf, "Game Options", "Language", code, sizeof(code))) break;
     int id = ini_language_id(code);
@@ -2098,11 +2108,101 @@ static void resolve_language(void) {
                kIniPaths[i], code, id,
                (id == INI_LANG_EN && strcmp(code, "en") != 0)
                  ? "  (unrecognised, using English)" : "");
+    g_lang_id = id;
+    g_lang_have_key = 1;
     jni_set_language(id);
     return;
   }
   log_printf("[lang] no [Game Options] Language key -> id %d (English)",
              INI_LANG_EN);
+}
+
+// Anything bigger than this is not a settings file, and rewriting whatever it
+// actually is would be worse than not saving the language.
+#define INI_MAX_BYTES (256 * 1024)
+
+// Read the whole ini, or NULL when there is nothing readable to build on --
+// which ini_set treats as "create the file", so a missing ini is not an error
+// here. slurp_ini's fixed 4 KB is right for reading one key and wrong for a
+// rewrite: truncating at 4 KB and writing that back would delete settings.
+static char *read_whole_ini(const char *path) {
+  SceIoStat st;
+  memset(&st, 0, sizeof(st));
+  if (sceIoGetstat(path, &st) < 0) return NULL;
+  if (st.st_size <= 0 || st.st_size >= INI_MAX_BYTES) {
+    if (st.st_size >= INI_MAX_BYTES)
+      log_printf("[lang] %s is %lld bytes -- refusing to rewrite it",
+                 path, (long long)st.st_size);
+    return NULL;
+  }
+  SceUID fd = sceIoOpen(path, SCE_O_RDONLY, 0);
+  if (fd < 0) return NULL;
+  char *text = malloc((size_t)st.st_size + 1);
+  int n = text ? sceIoRead(fd, text, (unsigned)st.st_size) : -1;
+  sceIoClose(fd);
+  if (n < 0) { free(text); return NULL; }
+  text[n] = '\0';
+  return text;
+}
+
+// Save the picked language into swkotor.ini.
+//
+// The file belongs to the user and to the engine, which rewrites it whenever
+// options are saved, so this changes the one line and hands back everything
+// else untouched (see ini_set). It lands via a temp file: an interrupted write
+// then costs the new setting and never the file that was already there.
+static void write_language(int id) {
+  const char *code = ini_language_code(id);
+  const char *path = g_ini_path ? g_ini_path : kIniPaths[0];
+
+  char *text = read_whole_ini(path);
+  const char *base = text ? text : "";
+
+  size_t need = ini_set(base, "Game Options", "Language", code, NULL, 0);
+  char *out = malloc(need + 1);
+  if (!out) {
+    free(text);
+    log_printf("[lang] out of memory writing %s", path);
+    return;
+  }
+  ini_set(base, "Game Options", "Language", code, out, need + 1);
+  free(text);
+
+  char tmp[256];
+  snprintf(tmp, sizeof(tmp), "%s.new", path);
+  SceUID fd = sceIoOpen(tmp, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
+  int wrote = (fd >= 0) ? sceIoWrite(fd, out, (unsigned)need) : -1;
+  if (fd >= 0) sceIoClose(fd);
+  free(out);
+
+  if (wrote != (int)need) {
+    log_printf("[lang] could not write %s (%d of %u bytes) -- %s unchanged",
+               tmp, wrote, (unsigned)need, path);
+    sceIoRemove(tmp);
+    return;
+  }
+
+  sceIoRemove(path);                      // FAT will not rename onto a live name
+  int r = sceIoRename(tmp, path);
+  if (r < 0) {
+    log_printf("!!! [lang] wrote %s but could not rename it to %s (0x%08x)",
+               tmp, path, (unsigned)r);
+    return;
+  }
+  log_printf("[lang] saved [Game Options] Language=%s to %s", code, path);
+}
+
+// Offer the picker and act on what comes back. Deliberately called from the
+// game thread before loadscreen_begin(): vitaGL is up by then, and the time a
+// user spends reading a menu must not land inside the boot-duration estimate
+// the progress bar persists, or the next boot's bar is pure fiction.
+static void offer_language_picker(void) {
+  int picked = g_lang_id;
+  if (!langsel_run(g_lang_id, g_lang_have_key, &picked)) return;
+  g_lang_id = picked;
+  g_lang_have_key = 1;
+  jni_set_language(picked);               // no game code has run yet
+  write_language(picked);
 }
 
 static void dump_ini(const char *path) {
@@ -2429,6 +2529,8 @@ static void *game_main_thread(void *arg) {
   // above, and the bar draws from this thread via the archive read path.
   // A prebuilt .idx means the mount replays from cache and startup is about a
   // minute shorter, so the bar needs the matching estimate.
+  offer_language_picker();
+
   int warm = 0;
   { SceUID t = sceIoOpen(DATA_PATH "/main.obb.idx", SCE_O_RDONLY, 0);
     if (t >= 0) { warm = 1; sceIoClose(t); } }
@@ -2455,6 +2557,12 @@ int main(int argc, char *argv[]) {
   sceKernelChangeThreadCpuAffinityMask(0, 0x40000);
 
   sceCtrlSetSamplingModeExt(SCE_CTRL_MODE_ANALOG_WIDE);
+
+  // Start watching for the language picker's L trigger the moment the pad can
+  // be read. The picker itself is not reached for several seconds yet, and all
+  // of them are black screen, so the trigger has to be latched across the whole
+  // wait rather than sampled once at the end of it.
+  langsel_watch_begin();
   sceTouchSetSamplingState(SCE_TOUCH_PORT_FRONT, SCE_TOUCH_SAMPLING_STATE_START);
   /* Back panel deliberately NOT sampled: it is where fingers rest while
    * holding the console, and any sampling port becomes SDL finger events. */

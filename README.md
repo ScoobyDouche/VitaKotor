@@ -148,8 +148,29 @@ character creation with no way forward.)*
 
 The game ships its text in five languages, and the Android release picked one
 from the phone's locale. There is no locale to read on the Vita, so the port
-reads it from `ux0:data/kotor/swkotor.ini` instead. Add a `Language` line to the
-`[Game Options]` section:
+asks you instead.
+
+**The first time you run it**, a short list comes up before the loading screen:
+
+```
+                       CHOOSE A LANGUAGE
+
+                         > ENGLISH
+                           FRANCAIS
+                           ITALIANO
+                           DEUTSCH
+                           ESPANOL
+```
+
+Up and down to move. The bottom of the screen names the buttons — confirm is
+whichever button your console uses to confirm, and the other one leaves things
+alone. Your choice is saved and you are not asked again. **To change it later,
+press L while the game is starting** — any time from launching it until the
+loading screen appears, while the screen is still black — and the list comes
+back.
+
+The choice is written to `ux0:data/kotor/swkotor.ini`, and you can equally set
+it there by hand:
 
 ```ini
 [Game Options]

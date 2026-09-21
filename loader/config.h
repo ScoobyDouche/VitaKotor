@@ -200,6 +200,44 @@
 #define FONT_TGA_ENTRY            "override/dialogfont16x16b.tga"
 #define LOGO_TGA_ENTRY            "override/and_main_logo.tga"
 
+
+// ---- boot-time language picker (see langsel.h) ------------------------------
+//
+// The language is bound at startup and the game's own menus are its data, so
+// the only place to ask is before the game runs. The picker draws with the same
+// font the boot screen uses, in the window after vitaGL comes up and before
+// loadscreen_begin() starts its clock.
+//
+// Set to 0 to go back to swkotor.ini being the only way to choose: the picker
+// is the first thing to rule out if a boot regresses before the bar appears.
+#define LANGSEL_ENABLE            1
+
+// Give up and boot when the pad has not moved at all for this long. This is the
+// safety net, not a convenience: on a first run the picker is between the user
+// and the game, so it must never be possible for a pad that is not reaching us
+// to leave the console sitting on this screen forever.
+#define LANGSEL_IDLE_TIMEOUT_S    60
+
+// How often the L watcher peeks at the pad while the screen is still black.
+// This is what makes "hold L while the game starts" mean the whole of startup
+// instead of one unannounced instant: 20ms is far below the shortest deliberate
+// press, and the thread sleeps through the rest of it.
+#define LANGSEL_WATCH_MS          20
+
+// Layout, in screen pixels (960x544), top-down like the font's own y argument.
+// Five rows of 16px glyphs at scale 2 leave room for a title above and two
+// lines of instructions below without anything needing to scroll.
+#define LANGSEL_TITLE_Y           70
+#define LANGSEL_TITLE_SCALE       2.0f
+#define LANGSEL_ROWS_Y            160
+#define LANGSEL_ROW_STEP          52
+#define LANGSEL_ROW_SCALE         2.0f
+#define LANGSEL_HL_W              420   // wider than the longest name, so the
+#define LANGSEL_HL_H              44    // highlight reads as a row, not a label
+#define LANGSEL_HL_PAD            6
+#define LANGSEL_HINT_Y            452
+#define LANGSEL_FOOTER_Y          486
+
 // How many times to dump the game's GL state after it takes over. The art can
 // only draw while the loader owns GL outright; once the game starts issuing GL
 // the loadscreen stops for good (see loadscreen.h). These probes record what

@@ -45,6 +45,7 @@ add_executable(KOTOR
   loader/font.c
   loader/jni_patch.c
   loader/ini.c
+  loader/langsel.c
   loader/audio_patch.c
   loader/audio_mp3.c
   loader/audio_ring.c
