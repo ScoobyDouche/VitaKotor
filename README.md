@@ -44,8 +44,8 @@ playthrough on.
 | Frame rate | ~30–38 fps typical, dips into the low 20s in dense scenes |
 | Session length | 59 min tested; nothing fatal, but sound thins out past ~40 |
 | Audio | Effects and voice work; long music tracks are silent |
-| Cutscenes | Bink video and audio play; broad compatibility validation continues |
-| Input | Vita sticks and buttons — see [Controls](#controls) |
+| Cutscenes | Bink movies play with sound; tap or press a button to skip |
+| Input | Touchscreen, sticks and buttons — see [Controls](#controls) |
 | Saves | Work, stored on the Vita |
 
 `main` is usually ahead of the newest [release](../../releases); the issue list
@@ -130,8 +130,11 @@ face buttons follow the familiar layout: Cross accepts, Circle cancels, Square
 is X, and Triangle is Y. L and R are the shoulder actions; Start opens the
 game's pause path. Select is currently reserved.
 
-Both touch panels are disabled. Menus, dialogue, combat and exploration use the
-same physical gamepad handling and button prompts built into the Android game.
+The front touchscreen works too, and you can mix it freely with the buttons:
+tap menu items, dialogue choices and the on-screen combat buttons directly.
+Some actions, like a normal attack, are easiest to reach by touch, since the
+Vita has no L2/R2 for the Android layout's triggers. The rear touch panel is
+off, so holding the console never taps anything.
 
 **Typing a name** — your character's, or a save's — opens the Vita's on-screen
 keyboard. Select the name field and confirm to bring it up, then type and accept. *(New in v0.1.9.1.
@@ -185,10 +188,10 @@ recordings, so this is what the retail releases did too.
 None of these is reliable enough to reproduce on demand, and none of them costs
 you a save. They are listed because you may hit them. Save regularly.
 
-- **Input stopped responding once in an older touch-enabled build.** Around 50
-  minutes in, the camera stick and touch input stopped doing anything while the
-  game kept running. The controller-only path has not reproduced it yet, but
-  needs the same long-session validation. Relaunching clears it.
+- **Input stopped responding once in an older build.** Around 50 minutes in,
+  the camera stick and touch input stopped doing anything while the game kept
+  running. It has not been seen since, but touch and buttons together have not
+  had a long session yet. Relaunching clears it.
 
 - **World geometry can tear into diagonal streaks.** Seen twice — once at about
   44 minutes, and again at 37 minutes on Taris: walls and floors smear, getting
@@ -229,12 +232,9 @@ you a save. They are listed because you may hit them. Save regularly.
 - **Long music tracks are silent.** Anything over about 90 seconds is replaced
   with correctly-timed silence, so pacing stays right but the score does not
   play. Shorter music and combat stings do. Voice and effects are unaffected.
-- **Bink compatibility is not exhaustively tested.** Normal movie playback and
-  physical-button skipping are enabled. A 101-second 640x272, 44.1 kHz stereo
-  movie played at 29.97 fps and returned cleanly to gameplay on hardware; 48 kHz
-  movies and localized subtitle sidecars still need coverage.
-- **Both touch panels are disabled** deliberately; the port uses physical
-  controls exclusively.
+- **Not every movie has been checked.** The ones played so far run with
+  sound and hand back to the game cleanly; 48 kHz movies and localized
+  subtitles have not been specifically tested.
 - **No trophies.**
 
 ### Recently fixed
@@ -244,9 +244,10 @@ you a save. They are listed because you may hit them. Save regularly.
   one lock. A real-Vita smoke test preserved working audio; the frame-rate effect
   still needs a controlled A/B. See the
   [investigation note](docs/specs/2026-09-12-audio-lock-contention.md).
-- **Bink cutscenes were skipped.** The embedded decoder and YUV renderer now run,
-  with decoded movie PCM feeding the existing Vita mixer instead of opening a
-  competing audio output. Physical-button skip and cleanup work on hardware.
+- **Movies were skipped.** Bink cutscenes now play, video and sound, confirmed
+  on hardware. Tapping the screen or pressing a button skips them.
+- **Touchscreen is back.** It had been switched off in favour of the gamepad
+  mapping; now both work at the same time.
 - **Voice lines silent during in-game cutscenes** (v0.1.9.2). The MP3 decoder
   sized its output buffer by assuming every frame was the smallest one the
   format allows, which asked for 2.25x what a voice line actually needs — a

@@ -166,9 +166,12 @@ populates `gamepadButtonById` with Android indices before `SDL_main`: A/B/X/Y ar
 maps to the game's own `BACKBUTTON_AS_GAMEPAD_PAUSE_ID` value, 255. Sticks
 already use the expected axis order and are passed through unchanged.
 
-Both touch panels are stopped at process startup and again after SDL creates the
-window. No finger events are synthesized; physical controls are the only
-gameplay input path. The Vita IME remains available for character and save names.
+Touch and the gamepad run side by side. `input_patch.c` reads the front panel
+with `sceTouchPeek` each frame and pushes `SDL_FINGERDOWN`/`MOTION`/`UP` events,
+because Vita SDL2 produces no finger events of its own here. The rear panel is
+stopped after SDL creates the window, since SDL re-enables it and it sits under
+the player's fingers. While the Vita IME is up, the panel belongs to it and no
+finger events are forwarded.
 
 **Text entry — the Vita on-screen keyboard.** Editable fields ask the platform
 for a keyboard via `ASLPlat_ShowVirtualKeyboard`, which on Android is a tail
