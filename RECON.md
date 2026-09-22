@@ -47,7 +47,8 @@ libGLESv2.so  libOpenSLES.so  libm.so  libc.so
   (`libandroid_port.so` imports `slCreateEngine` + `SL_IID_*`).
 - **Bink video** (`MacPlayBinkGL`, `MacCreateBinkShaders`, `MacDecompress`) is
   **implemented inside `libandroid_port.so`** — the companion decodes and draws
-  it; we only owe it GL + file I/O.
+  it. The loader supplies GL, OBB file I/O, and a minimal OpenSL-compatible PCM
+  queue feeding the existing Vita mixer.
 
 ---
 
@@ -119,7 +120,7 @@ categorized below into the three requested buckets.
 | **Audio (FMOD)** | `FMOD_System_Create`, `FMOD::System/Channel/Sound/ChannelControl::*` (~34) **+** `slCreateEngine`, `SL_IID_ENGINE/PLAY/VOLUME/BUFFERQUEUE` | **HIGH RISK — the hardest part.** Two paths: **(1)** so-load `libfmod.so` (resolves the 34 FMOD symbols) and implement a **minimal OpenSLES engine** (the 5 `sl*`/`SL_IID_*` symbols) backed by `sceAudioOut` — gtasa does exactly this. **(2)** If FMOD's ARM output won't drive our fake OpenSL, reimplement `FModAudioSystem` (30 methods, all in the companion — would require *not* loading the companion's audio path) over `sceAudio`. Start with path (1). |
 | **Asset manager over OBB** | `AAsset*` (+ `ObbFile::*` inside companion) | **Medium.** The game data lives in `main.53.*.obb` / `patch.53.*.obb` (both are ZIPs, already present in `com.aspyr.swkotor/`). Point the reference `AAssetManager` impl at a mounted OBB path. |
 | **JNI shim** | `Android_JNI_GetEnv` (+ any `JNI_OnLoad` expectations) | **Low.** Fake `JNIEnv` with the handful of methods the game calls (mostly for cloud-save / analytics, which can be no-op'd). |
-| **Bink video** | `MacPlayBinkGL`, `MacCreateBinkShaders`, `MacDecompress` | **Low direct cost** — implemented *inside* `libandroid_port.so`; it needs only GL + file I/O from us. Validate the intro movies render; fall back to skipping cutscenes if the codec misbehaves. |
+| **Bink video** | `MacPlayBinkGL`, `MacCreateBinkShaders`, `MacDecompress` | **Implemented.** The embedded decoder and YUV renderer run directly; a bounded OpenSL-compatible queue feeds movie PCM into the existing Vita mixer. A 101-second 44.1 kHz movie and physical skip passed on hardware. |
 | **Input** | touch/gamepad globals (`current_touch_x/y`, `ios_gamepad_analog*`, `gamepadConnected`) | **Low.** These are data globals the companion reads; feed them from `sceCtrl`/`sceTouch` via SDL2. |
 
 ---
@@ -150,8 +151,8 @@ categorized below into the three requested buckets.
 **Phase 4 — Input & polish.**
 8. Map `sceCtrl`/`sceTouch` → the companion's input globals; on-screen touch for
    the mobile UI.
-9. Bink cutscenes; JNI cloud-save/analytics no-ops; save-path redirection to
-   `ux0:data/kotor/`.
+9. Bink cutscenes, save-path redirection, and JNI cloud-save/analytics no-ops are
+   implemented; continue compatibility and long-session validation.
 
 **Risk register:** Audio (FMOD/OpenSL) ≫ Bink codec > OBB asset paths > GL gaps.
 Memory is also a concern — the Vita gives ~340 MB (+ extra via

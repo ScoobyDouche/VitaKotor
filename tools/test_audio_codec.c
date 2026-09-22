@@ -280,6 +280,26 @@ static void container(const char *path, int want_hw, const char *what) {
   free(d);
 }
 
+static void transient_memory_regressions(void) {
+  unsigned char wav[48] = {
+    'R','I','F','F',40,0,0,0,'W','A','V','E','f','m','t',' ',
+    16,0,0,0,1,0,1,0,0x22,0x56,0,0,0x44,0xac,0,0,
+    1,0,8,0,'d','a','t','a',4,0,0,0,128,129,127,128
+  };
+  memcpy(wav, "STALEPTR", 8);
+  AudioPcm p;
+  CHECK(audio_mp3_probe(wav, sizeof wav, &p),
+        "WAVE with reused first eight bytes was rejected");
+  CHECK(p.rate == 22050 && p.channels == 1 && p.nsamples == 4,
+        "reused-header WAVE parsed as %u Hz %u ch %u frames",
+        p.rate, p.channels, p.nsamples);
+
+  unsigned char garbage[1024] = {0};
+  garbage[100] = 0xff; garbage[101] = 0xfb; garbage[102] = 0x10; garbage[103] = 0;
+  CHECK(!audio_mp3_probe(garbage, sizeof garbage, &p),
+        "large garbage buffer with one MPEG-like header was accepted");
+}
+
 int main(int argc, char **argv) {
   const char *root = argc > 1 ? argv[1] : "com.aspyr.swkotor/main.obb";
   char p[512];
@@ -300,6 +320,9 @@ int main(int argc, char **argv) {
   container(p, 1, "58-byte fake RIFF wrapping real MP3");
   snprintf(p, sizeof p, "%s/streamsounds/al_vx_forcfield2.wav", root);
   container(p, 0, "470-byte prefix + real PCM");
+
+  printf("transient in-memory SFX regressions\n");
+  transient_memory_regressions();
 
   printf(fails ? "\n%d CHECK(S) FAILED\n" : "\nall checks passed\n", fails);
   return fails ? 1 : 0;

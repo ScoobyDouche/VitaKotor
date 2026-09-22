@@ -43,8 +43,6 @@ so_module port_mod;
 so_module miniz_mod;
 so_module lzma_mod;
 
-SceTouchPanelInfo panelInfoFront, panelInfoBack;
-
 unsigned int _newlib_heap_size_user = MEMORY_NEWLIB_MB * 1024 * 1024;
 
 int debugPrintf(const char *text, ...) {
@@ -161,11 +159,8 @@ static void *watchdog_thread(void *arg) {
       }
     }
     /* Input census, every fourth tick (12s). Two lines: what the hardware is
-     * doing, and what the game consumed from SDL in the same window. log166 lost
-     * the camera (right stick) and touch while BUTTONS -- same joystick, same
-     * queue -- kept working, and nothing in the log could say whether the pad
-     * stopped reporting, SDL stopped delivering, or the game stopped listening.
-     * These two lines separate those three. */
+     * doing, and what the game consumed from SDL in the same window. This tells
+     * us whether a dead stick originated in the pad, SDL, or the game. */
     {
       static unsigned itick = 0;
       if (itick++ % 4 == 0) { input_probe_census(); sdl_input_census(); }
@@ -370,10 +365,6 @@ static void mount_obbs(void) {
 // metrics parse (CAurFontInfo::ParseField) never runs, so GUI text does not yet
 // render. These guards keep the app ALIVE (no crash) through the whole boot;
 // getting actual text is a separate fix (populate CAurFontInfo / +0x38).
-#ifndef SCE_KERNEL_MEMBLOCK_TYPE_USER_RX
-#define SCE_KERNEL_MEMBLOCK_TYPE_USER_RX (0x0C20D050)
-#endif
-
 // Shared: reproduce CAurGUIStringInternal's fontInfo lookup. Returns the CAurFontInfo
 // pointer (may be null == font not loaded) without ever faulting.
 static void *gui_string_fontinfo(void *self) {
@@ -383,81 +374,6 @@ static void *gui_string_fontinfo(void *self) {
   void **vtbl = *(void ***)font;
   void *(*getFontInfo)(void *) = (void *(*)(void *))vtbl[14]; // vtable + 0x38
   return getFontInfo(font);
-}
-
-// Copy `len` position-independent thumb prologue bytes from orig_fn into a fresh
-// RX block, append LDR.W PC,[PC] -> orig_fn+len (thumb), and return a callable
-// thumb pointer. Both guarded methods share the same 8-byte prologue
-// (push{...}/add r7,sp,#12/stmdb) -- all PC-independent, so relocating is safe.
-// Returns 0 on failure.
-// How many bytes hook_thumb() will actually clobber at `addr`, rounded up to a
-// Thumb instruction boundary so the trampoline never resumes mid-instruction.
-//
-// hook_thumb writes 8 bytes (LDR PC,[PC] + target), but when (addr & 2) it first
-// drops a 2-byte NOP to 4-align the LDR -- 10 bytes total. Passing a flat 8 there
-// makes the trampoline resume INSIDE the target-address word: log54/55 crashed
-// exactly that way on CSWGuiImage::SetExtent (0x4abe5a, 2-mod-4), resuming on the
-// high halfword of &SetExtent_probe, which decoded as `strh r3,[r0,#8]` and wrote
-// to address 8 with r0=NULL -- FAR=0x8, FSR=0x8c7. Every hook before it happened
-// to be 0-mod-4, so this stayed latent.
-//
-// Thumb length rule: a halfword whose top 5 bits are 0b11101/11110/11111 starts a
-// 32-bit instruction, anything else is 16-bit.
-static size_t thumb_patch_len(uintptr_t addr) {
-  addr &= ~(uintptr_t)1;
-  size_t need = (addr & 2) ? 10 : 8;
-  size_t len = 0;
-  while (len < need) {
-    uint16_t hw = *(const uint16_t *)(addr + len);
-    len += ((hw & 0xF800) >= 0xE800) ? 4 : 2;
-  }
-  return len;
-}
-
-// NOTE: the resume sequence is `LDR.W PC,[PC]` followed by the target word, and a
-// Thumb literal load resolves its address as Align(PC,4) -- PC being the
-// instruction's address + 4. That rounds DOWN, so the LDR must itself sit on a
-// 4-byte boundary or it reads the word two bytes early: half the LDR encoding
-// glued to half the target address. The trampoline base is page-aligned, so this
-// bites whenever `len` is 2 mod 4 -- which thumb_patch_len returns for any hook
-// site that is 2-mod-4 and whose prologue happens to total 10 bytes.
-// CAppManager::CreateServer (+0x3fba22, len 10) hit it and jumped to 0xba2df000,
-// exactly the value this miscomputation predicts. A 2-byte NOP before the LDR
-// realigns it; len already 0 mod 4 is untouched, so existing hooks are unaffected.
-static uintptr_t build_thumb_trampoline(uintptr_t orig_fn, size_t len) {
-  orig_fn &= ~(uintptr_t)1;
-  size_t pad = (len & 2) ? 2 : 0;      // realign the LDR.W to a 4-byte boundary
-  size_t sz = len + pad + 8; // + LDR.W PC,[PC] (4) + target word (4)
-  SceKernelAllocMemBlockKernelOpt opt;
-  memset(&opt, 0, sizeof(opt));
-  opt.size = sizeof(opt);
-  SceUID blk = kuKernelAllocMemBlock("gui_tramp", SCE_KERNEL_MEMBLOCK_TYPE_USER_RX,
-                                     (sz + 0xfff) & ~(size_t)0xfff, &opt);
-  if (blk < 0) {
-    log_printf("[font] trampoline: AllocMemBlock(USER_RX) failed 0x%08x", (unsigned)blk);
-    return 0;
-  }
-  void *base = NULL;
-  int r = sceKernelGetMemBlockBase(blk, &base);
-  if (r < 0 || base == NULL) {
-    log_printf("[font] trampoline: GetMemBlockBase failed 0x%08x base=%p", (unsigned)r, base);
-    return 0;
-  }
-  uint8_t buf[32];
-  if (sz > sizeof buf) {
-    log_printf("[font] trampoline: len %u too large for buffer", (unsigned)len);
-    return 0;
-  }
-  memcpy(buf, (const void *)orig_fn, len);
-  uint16_t nop   = 0xbf00;                           // NOP (alignment filler)
-  uint32_t ldrpc = 0xf000f8df;                       // LDR.W PC, [PC]
-  uint32_t cont  = (uint32_t)(orig_fn + len) | 1u;    // resume mid-function, thumb
-  if (pad) memcpy(buf + len, &nop, sizeof nop);
-  memcpy(buf + len + pad, &ldrpc, sizeof ldrpc);
-  memcpy(buf + len + pad + sizeof ldrpc, &cont, sizeof cont);
-  kuKernelCpuUnrestrictedMemcpy(base, buf, sz);
-  kuKernelFlushCaches(base, sz);
-  return (uintptr_t)base | 1u;                        // thumb-callable
 }
 
 // ---- WrapStrings(int): layout -------------------------------------------------
@@ -725,6 +641,81 @@ static const volatile int32_t *g_gui_buf_used = NULL;
 static unsigned g_flush_n = 0, g_flush_nonempty = 0;
 static int32_t g_flush_max_used = 0;
 static unsigned g_sw_n = 0, g_sw_gate_obj = 0, g_sw_gate_w = 0, g_sw_gate_h = 0, g_sw_pass = 0;
+
+/* KOTOR uses AurGUISetupViewport/AurGUICloseViewport as a nested GUI clipping
+ * stack, but glViewport is only a coordinate transform. Mirror this semantic
+ * GUI boundary to scissor while preserving any caller-owned scissor state. */
+#define GUI_VIEWPORT_STACK_MAX 16
+typedef struct {
+  GLboolean enabled;
+  GLint box[4];
+} GuiScissorState;
+
+static int (*AurGUISetupViewport_orig)(int x, int y, int w, int h,
+                                       const void *color, uint32_t clear,
+                                       uint32_t alpha) = NULL;
+static void (*AurGUICloseViewport_orig)(void) = NULL;
+static GuiScissorState g_gui_scissor_stack[GUI_VIEWPORT_STACK_MAX];
+static unsigned g_gui_scissor_depth = 0;
+static unsigned g_gui_scissor_bypass_depth = 0;
+
+static uintptr_t *find_jump_slot(so_module *mod, const char *name) {
+  for (int i = 0; i < mod->num_relplt; i++) {
+    Elf32_Rel *rel = &mod->relplt[i];
+    if (ELF32_R_TYPE(rel->r_info) != R_ARM_JUMP_SLOT) continue;
+    Elf32_Sym *sym = &mod->dynsym[ELF32_R_SYM(rel->r_info)];
+    if (strcmp(mod->dynstr + sym->st_name, name) != 0) continue;
+    return (uintptr_t *)(mod->text_base + rel->r_offset);
+  }
+  return NULL;
+}
+
+static void gui_scissor_restore(const GuiScissorState *state) {
+  glScissor(state->box[0], state->box[1], state->box[2], state->box[3]);
+  if (state->enabled) glEnable(GL_SCISSOR_TEST);
+  else                glDisable(GL_SCISSOR_TEST);
+}
+
+static int AurGUISetupViewport_scissor(int x, int y, int w, int h,
+                                       const void *color, uint32_t clear,
+                                       uint32_t alpha) {
+  if (g_gui_scissor_depth >= GUI_VIEWPORT_STACK_MAX) {
+    log_printf("[gui:viewport] stack overflow at depth=%u", g_gui_scissor_depth);
+    int rc = AurGUISetupViewport_orig(x, y, w, h, color, clear, alpha);
+    if (rc) g_gui_scissor_bypass_depth++;
+    return rc;
+  }
+
+  GuiScissorState *state = &g_gui_scissor_stack[g_gui_scissor_depth++];
+  state->enabled = glIsEnabled(GL_SCISSOR_TEST);
+  glGetIntegerv(GL_SCISSOR_BOX, state->box);
+  g_gl_gui_viewport_scope++;
+  int rc = AurGUISetupViewport_orig(x, y, w, h, color, clear, alpha);
+  if (!rc) {
+    g_gl_gui_viewport_scope--;
+    g_gui_scissor_depth--;
+    gui_scissor_restore(state);
+  }
+  return rc;
+}
+
+static void AurGUICloseViewport_scissor(void) {
+  if (g_gui_scissor_bypass_depth) {
+    AurGUICloseViewport_orig();
+    g_gui_scissor_bypass_depth--;
+    return;
+  }
+  if (!g_gui_scissor_depth) {
+    AurGUICloseViewport_orig();
+    return;
+  }
+
+  GuiScissorState state = g_gui_scissor_stack[g_gui_scissor_depth - 1];
+  AurGUICloseViewport_orig();
+  g_gl_gui_viewport_scope--;
+  g_gui_scissor_depth--;
+  gui_scissor_restore(&state);
+}
 
 /* Which widgets actually went through ScaleExtentForResolution.
  *
@@ -1460,6 +1451,31 @@ static unsigned g_ml_n = 0, g_lip_n = 0, g_la_n = 0;
 static void *(*UpdateScreen_orig)(uint32_t a, int b, int c) = NULL;
 static void *(*GameUpdate_orig)(void) = NULL;
 static unsigned g_us_n = 0, g_gu_n = 0;
+static uint64_t g_us_time = 0, g_gu_time = 0;
+static uint64_t g_us_active = 0, g_gu_active = 0;
+static volatile float *g_ai_update_time = NULL, *g_display_fps = NULL;
+static volatile int *g_movie_fps = NULL, *g_render_skip = NULL;
+static unsigned g_policy_seq = 0, g_selected_skip = 0;
+static float g_selector_ai_ms = 0.0f, g_last_ai_ms = 0.0f;
+static int g_new_present_group = 1;
+
+void engine_perf_snapshot(engine_perf_t *out, uint64_t now_us) {
+  if (!out) return;
+  out->game_calls = g_gu_n;
+  out->game_us = g_gu_time + (g_gu_active ? now_us - g_gu_active : 0);
+  out->screen_calls = g_us_n;
+  out->screen_us = g_us_time + (g_us_active ? now_us - g_us_active : 0);
+  out->policy_seq = g_policy_seq;
+  out->selected_skip = g_selected_skip;
+  out->selector_ai_ms = g_selector_ai_ms;
+  out->next_ai_ms = g_last_ai_ms;
+  out->display_fps = g_display_fps ? *g_display_fps : -1.0f;
+  out->movie_fps = g_movie_fps ? *g_movie_fps : -1;
+}
+
+void engine_perf_presented(void) {
+  g_new_present_group = 1;
+}
 
 static void *UpdateScreen_probe(uint32_t a, int b, int c) {
   if (g_us_n < 16 || (g_us_n % 200) == 0) {
@@ -1471,10 +1487,27 @@ static void *UpdateScreen_probe(uint32_t a, int b, int c) {
                (unsigned)sceKernelGetThreadId(), g_gu_n, g_ml_n);
   }
   g_us_n++;
-  return UpdateScreen_orig(a, b, c);
+  uint64_t start = sceKernelGetProcessTimeWide();
+  g_us_active = start;
+  void *rc = UpdateScreen_orig(a, b, c);
+  g_us_time += sceKernelGetProcessTimeWide() - start;
+  g_us_active = 0;
+  return rc;
 }
 
 static void *GameUpdate_probe(void) {
+  if (g_new_present_group) {
+    g_selector_ai_ms = g_last_ai_ms;
+    g_selected_skip = g_render_skip ? (unsigned)*g_render_skip : 0;
+    g_policy_seq++;
+    g_new_present_group = 0;
+  }
+#if DISABLE_ADAPTIVE_RENDER_SKIP
+  // SDL_main has already chosen the skip count and is about to run the primary
+  // update. Clearing it here makes that update render and lets SDL_main present
+  // it, instead of following it with up to ten no-present update iterations.
+  if (g_render_skip && *g_render_skip > 0) *g_render_skip = 0;
+#endif
   if ((g_gu_n % 200) == 0) {
     void *app = g_appmgr_ptr ? *(void **)g_appmgr_ptr : NULL;
     log_printf("[load] GameUpdate #%u appMgr=%p client=%p server=%p "
@@ -1485,7 +1518,13 @@ static void *GameUpdate_probe(void) {
                g_us_n, g_ml_n);
   }
   g_gu_n++;
-  return GameUpdate_orig();
+  uint64_t start = sceKernelGetProcessTimeWide();
+  g_gu_active = start;
+  void *rc = GameUpdate_orig();
+  g_gu_time += sceKernelGetProcessTimeWide() - start;
+  g_gu_active = 0;
+  if (g_ai_update_time) g_last_ai_ms = *g_ai_update_time;
+  return rc;
 }
 
 static void *MainLoop_probe(void *self) {
@@ -1959,7 +1998,10 @@ static void *FmodCreateSound_probe(void *self, char *name, int id, void *data,
     log_printf("[snd?] FMod::CreateSound #%u \"%s\" id=%d data=%p size=%u (%d,%d)",
                n, name ? name : "?", id, data, size, e, f);
   n++; g_fmod_create++;
-  return FmodCreateSound_orig(self, name, id, data, size, e, f);
+  unsigned previous_id = audio_sfx_context_push((unsigned)id);
+  void *rc = FmodCreateSound_orig(self, name, id, data, size, e, f);
+  audio_sfx_context_pop(previous_id);
+  return rc;
 }
 /* Churn detector.
  *
@@ -2271,6 +2313,17 @@ static void install_sound_probe(void) {
 static void install_load_probe(void) {
   g_appmgr_ptr = (void *)so_symbol(&kotor_mod, "g_pAppManager");
   log_printf("[load] g_pAppManager @ %p", g_appmgr_ptr);
+  g_ai_update_time = (volatile float *)so_symbol(&kotor_mod, "g_AIUpdateTime");
+  g_display_fps = (volatile float *)so_symbol(&kotor_mod, "displayFPS");
+  g_movie_fps = (volatile int *)so_symbol(&kotor_mod, "g_nSetMovieFrameRate");
+  g_render_skip = (volatile int *)so_symbol(&port_mod, "g_RenderSkip");
+  if (g_ai_update_time) g_last_ai_ms = *g_ai_update_time;
+  log_printf("[perf] policy globals: AI=%p renderSkip=%p displayFPS=%p movieFPS=%p",
+             (void *)g_ai_update_time, (void *)g_render_skip,
+             (void *)g_display_fps, (void *)g_movie_fps);
+#if DISABLE_ADAPTIVE_RENDER_SKIP
+  log_printf("[perf] adaptive render skip override: ON (selected value is logged, then cleared)");
+#endif
   // Let the JOYBUTTON log line report what libKOTOR did with the press. All
   // three are plain .bss globals in libKOTOR; a missing one just drops that
   // figure from the line.
@@ -2340,6 +2393,23 @@ static void install_load_probe(void) {
 }
 
 static void install_gui_probe(void) {
+  uintptr_t *setup_slot = find_jump_slot(&kotor_mod,
+      "_Z19AurGUISetupViewportiiiiRK6Vectorbf");
+  uintptr_t *close_slot = find_jump_slot(&kotor_mod,
+      "_Z19AurGUICloseViewportv");
+  if (setup_slot && close_slot) {
+    AurGUISetupViewport_orig = (int (*)(int, int, int, int, const void *, uint32_t, uint32_t))*setup_slot;
+    AurGUICloseViewport_orig = (void (*)(void))*close_slot;
+    uintptr_t setup_replacement = (uintptr_t)&AurGUISetupViewport_scissor;
+    uintptr_t close_replacement = (uintptr_t)&AurGUICloseViewport_scissor;
+    kuKernelCpuUnrestrictedMemcpy(setup_slot, &setup_replacement, sizeof setup_replacement);
+    kuKernelCpuUnrestrictedMemcpy(close_slot, &close_replacement, sizeof close_replacement);
+    log_printf("[gui:viewport] nested AurGUI clipping enabled via PLT");
+  } else {
+    log_printf("[gui:viewport] AurGUI PLT replacement FAILED setup=%p close=%p",
+               (void *)setup_slot, (void *)close_slot);
+  }
+
   uintptr_t db = so_symbol(&kotor_mod, "_Z18AurResGetDataBytesmPv");
   if (db) {
     ResDataBytes_orig = (void *(*)(unsigned long, void *))build_thumb_trampoline(db, thumb_patch_len(db));
@@ -2507,8 +2577,15 @@ static void *game_main_thread(void *arg) {
   log_printf(">>> game thread UID = 0x%08x", (unsigned)g_game_thid);
 
   log_printf(">>> init vitaGL on game thread");
+  /* This symbol exists only when vitaGL is built with HAVE_SHADER_CACHE=1.
+   * Referencing it makes an uncached archive fail at link time instead of
+   * silently reintroducing multi-second first-use shader stalls. */
+  extern char vgl_shader_cache_path[256];
+  log_printf(">>> vitaGL application shader cache storage = %p",
+             (void *)vgl_shader_cache_path);
   vglSetupRuntimeShaderCompiler(SHARK_OPT_UNSAFE, SHARK_ENABLE, SHARK_ENABLE, SHARK_ENABLE);
   vglInitExtended(0, SCREEN_W, SCREEN_H, MEMORY_VITAGL_THRESHOLD_MB * 1024 * 1024, GL_MSAA_MODE);
+  log_printf(">>> vitaGL application shader cache: %s", vgl_shader_cache_path);
 
   // vitaGL ignores the return of sceGxmShaderPatcherCreate (gxm.c:561), so a
   // failed patcher init is silent -- the global just stays NULL and the first
@@ -2565,11 +2642,8 @@ int main(int argc, char *argv[]) {
   // of them are black screen, so the trigger has to be latched across the whole
   // wait rather than sampled once at the end of it.
   langsel_watch_begin();
-  sceTouchSetSamplingState(SCE_TOUCH_PORT_FRONT, SCE_TOUCH_SAMPLING_STATE_START);
-  /* Back panel deliberately NOT sampled: it is where fingers rest while
-   * holding the console, and any sampling port becomes SDL finger events. */
-  sceTouchGetPanelInfo(SCE_TOUCH_PORT_FRONT, &panelInfoFront);
-  sceTouchGetPanelInfo(SCE_TOUCH_PORT_BACK, &panelInfoBack);
+  sceTouchSetSamplingState(SCE_TOUCH_PORT_FRONT, SCE_TOUCH_SAMPLING_STATE_STOP);
+  sceTouchSetSamplingState(SCE_TOUCH_PORT_BACK, SCE_TOUCH_SAMPLING_STATE_STOP);
 
   scePowerSetArmClockFrequency(444);
   scePowerSetBusClockFrequency(222);

@@ -75,8 +75,31 @@ int audio_mp3_init_library(void) {
   return 1;
 }
 
+static int mp3_frame_header(const unsigned char *d, unsigned len,
+                            unsigned *frame_len, unsigned *signature) {
+  static const unsigned br1[16] = { 0,32,40,48,56,64,80,96,112,128,160,192,224,256,320,0 };
+  static const unsigned br2[16] = { 0, 8,16,24,32,40,48,56, 64, 80, 96,112,128,144,160,0 };
+  static const unsigned rates[4][3] = {
+    { 11025, 12000, 8000 }, { 0, 0, 0 }, { 22050, 24000, 16000 }, { 44100, 48000, 32000 }
+  };
+  if (len < 4 || d[0] != 0xFF || (d[1] & 0xE0) != 0xE0) return 0;
+  unsigned ver = (d[1] >> 3) & 3, layer = (d[1] >> 1) & 3;
+  unsigned bri = (d[2] >> 4) & 0xF, sri = (d[2] >> 2) & 3;
+  if (ver == 1 || layer != 1 || bri == 0 || bri == 0xF || sri == 3) return 0;
+  unsigned rate = rates[ver][sri];
+  unsigned kbps = (ver == 3) ? br1[bri] : br2[bri];
+  unsigned bytes = ((ver == 3 ? 144000u : 72000u) * kbps) / rate + ((d[2] >> 1) & 1);
+  if (bytes < 4 || bytes > len) return 0;
+  if (frame_len) *frame_len = bytes;
+  if (signature) *signature = (ver << 8) | sri;
+  return 1;
+}
+
 /* Locate the first MPEG audio sync word, skipping a fake RIFF header and/or an
- * ID3v2 tag. Returns the byte offset, or -1 if this is not MPEG audio at all. */
+ * ID3v2 tag. Nontrivial buffers require two consecutive compatible frames: a
+ * reused SFX buffer can contain a random sync-like word, and feeding that false
+ * positive to sceAudiodec costs 100+ ms before failing. Tiny UI sounds may
+ * legitimately contain only one frame. Returns the byte offset, or -1. */
 static int find_sync(const unsigned char *d, unsigned len) {
   unsigned start = 0;
   if (len > 10 && !memcmp(d, "ID3", 3)) {
@@ -87,14 +110,16 @@ static int find_sync(const unsigned char *d, unsigned len) {
     start = 58;                              /* KOTOR's fixed fake header */
   }
   if (start >= len) start = 0;
-  /* Scan forward for a plausible frame header: sync + Layer III + valid rate. */
+  /* Scan forward for a plausible frame header and, where possible, its next. */
   for (unsigned i = start; i + 4 <= len && i < start + 8192; i++) {
-    if (d[i] != 0xFF || (d[i + 1] & 0xE0) != 0xE0) continue;
-    unsigned ver = (d[i + 1] >> 3) & 3, layer = (d[i + 1] >> 1) & 3;
-    unsigned bri = (d[i + 2] >> 4) & 0xF, sri = (d[i + 2] >> 2) & 3;
-    if (ver == 1 || layer != 1) continue;    /* reserved version / not Layer III */
-    if (bri == 0 || bri == 0xF || sri == 3) continue;
-    return (int)i;
+    unsigned frame_len = 0, sig = 0;
+    if (!mp3_frame_header(d + i, len - i, &frame_len, &sig)) continue;
+    if (len <= 512) return (int)i;
+    unsigned next_sig = 0;
+    if (i + frame_len + 4 <= len &&
+        mp3_frame_header(d + i + frame_len, len - i - frame_len, NULL, &next_sig) &&
+        next_sig == sig)
+      return (int)i;
   }
   return -1;
 }
@@ -263,7 +288,10 @@ static int adpcm_ima_decode(const unsigned char *d, unsigned len, unsigned ch,
 
 /* Where the real RIFF starts, or -1 if there is not one. */
 static int wav_riff_at(const unsigned char *d, unsigned len) {
-  if (len >= 44 && !memcmp(d, "RIFF", 4) && !memcmp(d + 8, "WAVE", 4)) return 0;
+  /* FModAudioSystem owns the first eight bytes of some transient SFX buffers.
+   * They can be reused while the standard WAVE signature and chunks at +8 stay
+   * intact. RIFF size is not used by the parser, so WAVE is sufficient. */
+  if (len >= 44 && !memcmp(d + 8, "WAVE", 4)) return 0;
   if (len >= WAV_JUNK_PREFIX + 44 &&
       !memcmp(d + WAV_JUNK_PREFIX, "RIFF", 4) &&
       !memcmp(d + WAV_JUNK_PREFIX + 8, "WAVE", 4)) return WAV_JUNK_PREFIX;

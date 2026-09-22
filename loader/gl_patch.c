@@ -26,9 +26,13 @@
 
 #include "so_util.h"
 #include "config.h"
+#include "main.h"
 #include "gl_patch.h"
 #include "glsl_prep.h"
 #include "dynlib.h"
+#include "audio_patch.h"
+#include "bink_patch.h"
+#include "sdl_patch.h"
 #include "log.h"
 #include "loadscreen.h"
 
@@ -111,6 +115,7 @@ static GLuint glCreateShader_t(GLenum type) {
   log_printf("[GL] glCreateShader(0x%x) -> %u", (unsigned)type, (unsigned)id);  // init vitashark
   return id;
 }
+
 static void glShaderSource_t(GLuint sh, GLsizei count, const GLchar *const *str, const GLint *len) {
   log_printf("[GL] glShaderSource(sh=%u, count=%d) ===begin dump===", (unsigned)sh, count);
   // Dump the define header (str[0]) line-by-line -- its concrete macro values
@@ -291,12 +296,17 @@ static void glReleaseShaderCompiler_t(void) {
 }
 static GLuint   g_cur_prog = 0;           /* redundant program-switch shadow */
 static unsigned g_prog_skipped_win = 0;
+static unsigned g_links_frame = 0;
+static uint64_t g_link_us_frame = 0;
 
 static void glLinkProgram_t(GLuint p) {
   extern GLboolean is_shark_online;
   log_printf("[GL] glLinkProgram(%u) ... shark_online=%d", (unsigned)p,
              (int)is_shark_online);
+  uint64_t link_start = sceKernelGetProcessTimeWide();
   glLinkProgram(p);
+  g_link_us_frame += sceKernelGetProcessTimeWide() - link_start;
+  g_links_frame++;
   g_cur_prog = 0;             /* relinking can change what this id draws with */
   GLint ok = 0;
   glGetProgramiv(p, GL_LINK_STATUS, &ok);
@@ -343,18 +353,24 @@ static void glViewport_t(GLint x, GLint y, GLsizei w, GLsizei h) {
   if (g_gl_seq < GL_TRACE_LIMIT)  // silence with the rest of the per-call trace
     log_printf("[GL] glViewport(%d, %d, %d, %d)", x, y, (int)w, (int)h);
   glViewport(x, y, w, h);
+  if (g_gl_gui_viewport_scope) {
+    glScissor(x, y, w, h);
+    glEnable(GL_SCISSOR_TEST);
+  }
 }
 // Draw/clear accounting. The first few of each are logged in full; after that we
 // only count, and gl_patch_on_swap() prints a per-frame-window summary. Both the
 // "since last summary" and lifetime totals are tracked so a stuck render loop
 // (identical draw count every window) is distinguishable from an advancing one.
+int g_gl_gui_viewport_scope = 0;
 static int g_clear_n = 0, g_draw_n = 0;
 static unsigned g_arrays_win = 0, g_elements_win = 0, g_clears_win = 0;
 static unsigned g_arrays_tot = 0, g_elements_tot = 0;
+static unsigned g_clears_frame = 0;
 static void glClear_t(GLbitfield mask) {
   if (g_clear_n < 5) log_printf("[GL] glClear(0x%x) #%d", (unsigned)mask, g_clear_n);
   g_clear_n++;
-  g_clears_win++;
+  g_clears_win++; g_clears_frame++;
   glClear(mask);
 }
 // Text-draw trace: g_gl_text_draw is raised around the game's GUI-string Draw, so
@@ -399,16 +415,21 @@ static void tex_note_draw(unsigned tex) {
  * next tuning step is chosen from data rather than guessed. */
 static unsigned g_draw_client_win = 0, g_draw_vbo_win = 0;
 static unsigned g_prog_win = 0, g_texbind_win = 0, g_bufdata_win = 0;
-/* Attribute-offset high-water mark, for the geometry corruption. The exploding
- * characters were SceGxmVertexAttribute::offset being a uint16_t -- any VBO
- * offset >= 64 KB truncated mod 65536 and the GPU fetched each attribute from a
- * different vertex of the same buffer, drawing a recognisable model with long
- * spikes. That is fixed in this tree's vitaGL and the fix is confirmed present
- * in the linked library, but the photos of the late-session corruption show
- * spikes rather than the diagonal smear the README describes, so watch the
- * boundary instead of assuming it. If corruption arrives in the same window
- * maxAttrOff first passes 64 KB, that is the answer; if offsets never approach
- * it, the whole family is ruled out and the search moves to texture eviction. */
+static unsigned g_arrays_frame = 0, g_elements_frame = 0;
+static unsigned g_draw_client_frame = 0, g_draw_vbo_frame = 0;
+static unsigned g_prog_frame = 0, g_prog_skipped_frame = 0;
+static unsigned g_texbind_frame = 0, g_bind_skipped_frame = 0;
+static unsigned g_bufdata_frame = 0, g_texupload_frame = 0;
+static uint64_t g_bufdata_bytes_frame = 0, g_texupload_bytes_frame = 0;
+/* Attribute-offset high-water mark, for the geometry corruption. vitaGL used
+ * shader attribute zero as a packed VBO's base even when another active
+ * attribute started earlier in the vertex. KOTOR's skinned layout exposes it:
+ * weights are shader attribute 0 at +0x20, while position is attribute 2 at
+ * +0x00. Position-base underflow then lands in GXM's 16-bit attribute offset;
+ * large absolute offsets also truncate in that field. The vitaGL patch uses the
+ * lowest active memory offset as the stream base, leaving only 0x00..0x30 in
+ * the attribute descriptors. Keep the high-water counters as a regression
+ * witness for packed models above 64 KiB. */
 static uintptr_t g_vap_max_off = 0;
 static unsigned  g_vap_over64k = 0;
 static unsigned g_bind_skipped_win = 0;   /* redundant binds we suppressed */
@@ -435,7 +456,8 @@ static uint64_t g_tex16_saved = 0;          /* bytes NOT spent, lifetime */
 static GLuint   g_cur_arraybuf = 0;      /* last glBindBuffer(GL_ARRAY_BUFFER) */
 
 static inline void draw_note_source(void) {
-  if (g_cur_arraybuf) g_draw_vbo_win++; else g_draw_client_win++;
+  if (g_cur_arraybuf) { g_draw_vbo_win++; g_draw_vbo_frame++; }
+  else { g_draw_client_win++; g_draw_client_frame++; }
 }
 
 static void glDrawArrays_t(GLenum mode, GLint first, GLsizei count) {
@@ -446,7 +468,7 @@ static void glDrawArrays_t(GLenum mode, GLint first, GLsizei count) {
     log_printf("[textdraw#%d] glDrawArrays(mode=0x%x, count=%d) tex=%u",
                g_textdraw_n++, (unsigned)mode, (int)count, g_cur_tex);
   tex_note_draw(g_cur_tex);
-  g_draw_n++; g_arrays_win++; g_arrays_tot++; draw_note_source();
+  g_draw_n++; g_arrays_win++; g_arrays_frame++; g_arrays_tot++; draw_note_source();
   glDrawArrays(mode, first, count);
 }
 static void glDrawElements_t(GLenum mode, GLsizei count, GLenum type, const void *idx) {
@@ -457,17 +479,116 @@ static void glDrawElements_t(GLenum mode, GLsizei count, GLenum type, const void
     log_printf("[textdraw#%d] glDrawElements(mode=0x%x, count=%d) tex=%u",
                g_textdraw_n++, (unsigned)mode, (int)count, g_cur_tex);
   tex_note_draw(g_cur_tex);
-  g_draw_n++; g_elements_win++; g_elements_tot++; draw_note_source();
+  g_draw_n++; g_elements_win++; g_elements_frame++; g_elements_tot++; draw_note_source();
   glDrawElements(mode, count, type, idx);
 }
-void gl_patch_on_swap(void) {
+void gl_patch_on_swap(uint64_t swap_begin_us, uint64_t swap_end_us) {
   static unsigned frame = 0;
+  static uint64_t prev_swap_end = 0, timing_sum = 0, timing_max = 0;
+  static unsigned timing_n = 0, over50 = 0, over80 = 0;
+  static uint64_t last_hitch_log = 0;
+  static unsigned hitch_suppressed = 0, hitch_suppressed_max = 0;
+  static io_perf_t prev_io;
+  static audio_perf_t prev_audio;
+  static engine_perf_t prev_engine;
+  static sdl_perf_t prev_sdl;
+  static unsigned policy_seen = 0;
+  static unsigned skip_groups[6];
+  io_perf_t io;
+  audio_perf_t audio;
+  engine_perf_t engine;
+  sdl_perf_t sdl;
+  io_perf_snapshot(&io);
+  audio_perf_snapshot(&audio);
+  engine_perf_snapshot(&engine, swap_begin_us);
+  sdl_perf_snapshot(&sdl);
   frame++;
+
+  if (engine.policy_seq != policy_seen) {
+    unsigned bucket = engine.selected_skip == 0 ? 0 : engine.selected_skip == 1 ? 1 :
+                      engine.selected_skip == 3 ? 2 : engine.selected_skip == 6 ? 3 :
+                      engine.selected_skip == 10 ? 4 : 5;
+    skip_groups[bucket]++;
+    policy_seen = engine.policy_seq;
+  }
+
+  if (prev_swap_end) {
+    uint64_t work_us = swap_begin_us - prev_swap_end;
+    uint64_t swap_us = swap_end_us - swap_begin_us;
+    uint64_t total_us = swap_end_us - prev_swap_end;
+    timing_sum += total_us;
+    if (total_us > timing_max) timing_max = total_us;
+    timing_n++;
+    if (total_us >= 50000u) over50++;
+    if (total_us >= 80000u) over80++;
+
+#if FRAME_HITCH_TRACE_MS > 0
+    if (total_us >= (uint64_t)FRAME_HITCH_TRACE_MS * 1000u) {
+      if (!last_hitch_log || swap_end_us - last_hitch_log >=
+                              (uint64_t)FRAME_HITCH_LOG_GAP_MS * 1000u) {
+        unsigned feed_n = audio.feed_count - prev_audio.feed_count;
+        uint64_t feed_us = audio.feed_us - prev_audio.feed_us;
+        log_printf("[hitch] f=%u total=%u.%u ms (work=%u.%u swap=%u.%u) "
+                   "draw A/E=%u/%u client/vbo=%u/%u clear=%u "
+                   "tex=%u(%u KB) binds=%u/%u prog=%u/%u buf=%u(%u KB) "
+                   "link=%u(%u ms) | OBB card=%u/%u KB in %u ms cache=%u seek=%u "
+                     "open=%d | audio feed=%u/%llu us lifetimeMax=%u underrun=%u "
+                    "| engine game=%u/%u ms screen=%u/%u ms "
+                    "policy ai=%.1f skip=%u next=%.1f fps=%.1f movie=%d "
+                     "delay=%u/%u/%u ms lifetimeMax=%u ms "
+                    "rateLimited=%u(max %u.%u ms)",
+                   frame, (unsigned)(total_us / 1000u), (unsigned)(total_us % 1000u) / 100u,
+                   (unsigned)(work_us / 1000u), (unsigned)(work_us % 1000u) / 100u,
+                   (unsigned)(swap_us / 1000u), (unsigned)(swap_us % 1000u) / 100u,
+                   g_arrays_frame, g_elements_frame, g_draw_client_frame, g_draw_vbo_frame,
+                   g_clears_frame, g_texupload_frame,
+                   (unsigned)(g_texupload_bytes_frame >> 10), g_texbind_frame,
+                   g_bind_skipped_frame, g_prog_frame, g_prog_skipped_frame,
+                   g_bufdata_frame, (unsigned)(g_bufdata_bytes_frame >> 10),
+                   g_links_frame, (unsigned)(g_link_us_frame / 1000u),
+                   io.reads - prev_io.reads,
+                   (unsigned)((io.card_bytes - prev_io.card_bytes) >> 10),
+                   (unsigned)((io.card_us - prev_io.card_us) / 1000u),
+                   io.hits - prev_io.hits, io.seeks - prev_io.seeks, io_open_count(),
+                    feed_n, (unsigned long long)feed_us, audio.feed_max_us,
+                   audio.underruns - prev_audio.underruns,
+                   engine.game_calls - prev_engine.game_calls,
+                   (unsigned)((engine.game_us - prev_engine.game_us) / 1000u),
+                    engine.screen_calls - prev_engine.screen_calls,
+                    (unsigned)((engine.screen_us - prev_engine.screen_us) / 1000u),
+                    (double)engine.selector_ai_ms, engine.selected_skip,
+                    (double)engine.next_ai_ms, (double)engine.display_fps, engine.movie_fps,
+                    sdl.delay_calls - prev_sdl.delay_calls,
+                    (unsigned)((sdl.delay_requested_us - prev_sdl.delay_requested_us) / 1000u),
+                    (unsigned)((sdl.delay_actual_us - prev_sdl.delay_actual_us) / 1000u),
+                    sdl.delay_max_us / 1000u,
+                    hitch_suppressed,
+                   hitch_suppressed_max / 1000u, (hitch_suppressed_max % 1000u) / 100u);
+        last_hitch_log = swap_end_us;
+        hitch_suppressed = hitch_suppressed_max = 0;
+      } else {
+        hitch_suppressed++;
+        if (total_us > hitch_suppressed_max) hitch_suppressed_max = (unsigned)total_us;
+      }
+    }
+#endif
+  }
+  prev_swap_end = swap_end_us;
+  prev_io = io;
+  prev_audio = audio;
+  prev_engine = engine;
+  prev_sdl = sdl;
+  engine_perf_presented();
+
   if (frame % 120 == 0) {  // ~ every couple seconds at 60fps
     log_printf("[GL] frame %u: this window drawArrays=%u drawElements=%u clears=%u"
-               " | lifetime draws=%u",
+               " | lifetime draws=%u | timing avg=%u.%u ms max=%u.%u ms >50=%u >80=%u",
                frame, g_arrays_win, g_elements_win, g_clears_win,
-               g_arrays_tot + g_elements_tot);
+               g_arrays_tot + g_elements_tot,
+               timing_n ? (unsigned)((timing_sum / timing_n) / 1000u) : 0,
+               timing_n ? (unsigned)((timing_sum / timing_n) % 1000u) / 100u : 0,
+               (unsigned)(timing_max / 1000u), (unsigned)(timing_max % 1000u) / 100u,
+               over50, over80);
     char ab[256]; int o = 0;
     for (int k = 0; k < g_bk_n && o < (int)sizeof(ab) - 28; k++)
       o += snprintf(ab + o, sizeof(ab) - o, "%ux%u=%u ", g_bk_w[k], g_bk_h[k], g_bk_n_draws[k]);
@@ -486,12 +607,30 @@ void gl_patch_on_swap(void) {
                (unsigned)g_vap_max_off, g_vap_over64k,
                (unsigned)(g_tex_live >> 10), g_tex_n_live, (unsigned)(g_tex_peak >> 10),
                (unsigned)(g_tex_up >> 10), (unsigned)(g_tex_down >> 10), g_tex_untracked,
-               g_tex16_n, (unsigned)(g_tex16_saved >> 10));
+                g_tex16_n, (unsigned)(g_tex16_saved >> 10));
+    log_printf("[GL]   policy groups skip 0/1/3/6/10/other=%u/%u/%u/%u/%u/%u "
+               "latest ai=%.1f->%u next=%.1f displayFPS=%.1f movieFPS=%d; "
+               "SDL_Delay lifetime=%u requested=%u ms actual=%u ms lifetimeMax=%u ms",
+               skip_groups[0], skip_groups[1], skip_groups[2], skip_groups[3],
+               skip_groups[4], skip_groups[5], (double)engine.selector_ai_ms,
+               engine.selected_skip, (double)engine.next_ai_ms,
+               (double)engine.display_fps, engine.movie_fps, sdl.delay_calls,
+               (unsigned)(sdl.delay_requested_us / 1000u),
+               (unsigned)(sdl.delay_actual_us / 1000u), sdl.delay_max_us / 1000u);
+    memset(skip_groups, 0, sizeof skip_groups);
     g_bind_skipped_win = g_prog_skipped_win = 0;
     g_arrays_win = g_elements_win = g_clears_win = 0;
     g_draw_client_win = g_draw_vbo_win = 0;
     g_texbind_win = g_prog_win = g_bufdata_win = 0;
+    timing_sum = timing_max = 0;
+    timing_n = over50 = over80 = 0;
   }
+  g_arrays_frame = g_elements_frame = g_clears_frame = 0;
+  g_draw_client_frame = g_draw_vbo_frame = 0;
+  g_prog_frame = g_prog_skipped_frame = 0;
+  g_texbind_frame = g_bind_skipped_frame = 0;
+  g_bufdata_frame = g_texupload_frame = g_links_frame = 0;
+  g_bufdata_bytes_frame = g_texupload_bytes_frame = g_link_us_frame = 0;
 }
 /* Capability-query getters. The companion's OpenGLES20Implementation::init()
  * fires ~18 of these before any other GL call, and feeds one straight into a
@@ -721,7 +860,7 @@ static void glPixelStorei_e(GLenum p, GLint v) { GLLOG("glPixelStorei(0x%x,%d)",
 static void glGenTextures_e(GLsizei n, GLuint *t) { GLLOG("glGenTextures(%d)", (int)n); glGenTextures(n, t); }
 static void glBindTexture_e(GLenum tg, GLuint t) {
   GLLOG("glBindTexture(0x%x,%u)", (unsigned)tg, (unsigned)t);
-  g_texbind_win++;
+  g_texbind_win++; g_texbind_frame++;
   if (tg == GL_TEXTURE_CUBE_MAP) {
     g_cur_cubetex = t;
     if (tex_kind_get(t) == TEXKIND_2D) {          /* THE fault, if it happens */
@@ -740,7 +879,9 @@ static void glBindTexture_e(GLenum tg, GLuint t) {
   }
 #if GL_FILTER_REDUNDANT_BINDS
   if (tg == GL_TEXTURE_2D) {
-    if (g_bound2d[g_active_unit] == t) { g_bind_skipped_win++; g_cur_tex = t; return; }
+    if (g_bound2d[g_active_unit] == t) {
+      g_bind_skipped_win++; g_bind_skipped_frame++; g_cur_tex = t; return;
+    }
     g_bound2d[g_active_unit] = t;
   } else {
     g_bound2d[g_active_unit] = 0;        /* unit may no longer hold that 2D texture */
@@ -904,6 +1045,10 @@ static void tex_upload2d(GLenum tg, GLint l, GLint ifmt, GLsizei w, GLsizei h,
 
 static void glTexImage2D_e(GLenum tg, GLint l, GLint ifmt, GLsizei w, GLsizei h, GLint b, GLenum f, GLenum ty, const void *px) {
   GLLOG("glTexImage2D(0x%x, l=%d, %dx%d, fmt=0x%x)", (unsigned)tg, l, (int)w, (int)h, (unsigned)f);
+  g_texupload_frame++;
+  if (w > 0 && h > 0) g_texupload_bytes_frame += (uint64_t)w * h * fmt_bpp(f);
+  if (f == GL_LUMINANCE && ty == GL_UNSIGNED_BYTE && w > 0 && h > 0)
+    bink_patch_note_texture_upload((unsigned)w, (unsigned)h);
   // The environment map is a real cube: kotor.vert declares u_texture2Sampler as
   // GL_SAMPLER_CUBE and the shiny-armour material is the USE_CUBEMAP variant.
   // Nothing in any log so far shows a single cube face being uploaded, so before
@@ -1021,6 +1166,8 @@ static void glTexImage2D_e(GLenum tg, GLint l, GLint ifmt, GLsizei w, GLsizei h,
 static void glTexSubImage2D_e(GLenum tg, GLint l, GLint xo, GLint yo, GLsizei w, GLsizei h,
                               GLenum f, GLenum ty, const void *px) {
   GLLOG("glTexSubImage2D(0x%x, l=%d, %dx%d)", (unsigned)tg, l, (int)w, (int)h);
+  g_texupload_frame++;
+  if (w > 0 && h > 0) g_texupload_bytes_frame += (uint64_t)w * h * fmt_bpp(f);
 #if GL_TEX16_CONVERT
   uint8_t kind = (g_cur_tex && g_cur_tex < TEXKIND_MAX) ? g_tex16[g_cur_tex] : TEX16_NONE;
   if (px && kind != TEX16_NONE && ty == GL_UNSIGNED_BYTE && w > 0 && h > 0 &&
@@ -1074,7 +1221,12 @@ static void glBindBuffer_e(GLenum tg, GLuint b) {
   if (tg == GL_ARRAY_BUFFER) g_cur_arraybuf = b;
   glBindBuffer(tg, b);
 }
-static void glBufferData_e(GLenum tg, GLsizeiptr sz, const void *d, GLenum u) { GLLOG("glBufferData(0x%x, %d bytes)", (unsigned)tg, (int)sz); g_bufdata_win++; glBufferData(tg, sz, d, u); }
+static void glBufferData_e(GLenum tg, GLsizeiptr sz, const void *d, GLenum u) {
+  GLLOG("glBufferData(0x%x, %d bytes)", (unsigned)tg, (int)sz);
+  g_bufdata_win++; g_bufdata_frame++;
+  if (sz > 0) g_bufdata_bytes_frame += (uint64_t)sz;
+  glBufferData(tg, sz, d, u);
+}
 static GLuint glCreateProgram_e(void) { GLLOG("glCreateProgram()"); GLuint p = glCreateProgram(); log_printf("[GL]  -> program %u", (unsigned)p); return p; }
 /* Redundant program-switch filter.
  *
@@ -1102,9 +1254,9 @@ static GLuint glCreateProgram_e(void) { GLLOG("glCreateProgram()"); GLuint p = g
  * Set GL_FILTER_REDUNDANT_PROGS to 0 in config.h to rule this out. */
 static void glUseProgram_e(GLuint p) {
   GLLOG("glUseProgram(%u)", (unsigned)p);
-  g_prog_win++;
+  g_prog_win++; g_prog_frame++;
 #if GL_FILTER_REDUNDANT_PROGS
-  if (p && p == g_cur_prog) { g_prog_skipped_win++; return; }
+  if (p && p == g_cur_prog) { g_prog_skipped_win++; g_prog_skipped_frame++; return; }
   g_cur_prog = p;
 #endif
   glUseProgram(p);

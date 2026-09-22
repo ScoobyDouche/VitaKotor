@@ -22,6 +22,7 @@
 #include "sdl_patch.h"
 #include "dynlib.h"   // g_game_threads registry (watchdog sweeps it)
 #include "fs_patch.h"
+#include "bink_patch.h"
 #include "gl_patch.h"
 #include "ime_patch.h"
 #include "input_patch.h"
@@ -47,7 +48,7 @@ static SDL_Window *SDL_CreateWindow_hook(const char *title, int x, int y,
   if (!win)
     log_printf("[SDL] CreateWindow FAILED: %s", SDL_GetError());
   else
-    input_touch_init();  // SDL video is up now -> enable front-touch injection
+    input_init();  // SDL video can enable touch; physical-controls-only mode disables it
   return win;
 }
 
@@ -62,9 +63,12 @@ static void SDL_GL_SwapWindow_hook(SDL_Window *w) {
   // The on-screen keyboard is a system common dialog: it is composited into the
   // back buffer by vglSwapBuffers, and only when we ask for it. Passing GL_TRUE
   // unconditionally would cost a sceCommonDialogUpdate every frame of the game.
+  uint64_t swap_begin = sceKernelGetProcessTimeWide();
   vglSwapBuffers(ime_dialog_active() ? GL_TRUE : GL_FALSE);
-  gl_patch_on_swap();  // periodic per-frame draw summary (see gl_patch.c)
-  input_touch_pump();  // inject Vita front-touch as SDL finger events
+  uint64_t swap_end = sceKernelGetProcessTimeWide();
+  gl_patch_on_swap(swap_begin, swap_end);
+  bink_patch_on_swap(swap_end);
+  input_probe_pump();  // raw pad health only; SDL remains the gameplay input path
   ime_pump();          // collect what the on-screen keyboard produced
 }
 
@@ -116,12 +120,42 @@ static SDL_Thread *SDL_CreateThread_hook(SDL_ThreadFunction fn, const char *name
   return t;
 }
 
+static SceUID g_delay_mutex = -1;
+static unsigned g_delay_n = 0;
+static uint64_t g_delay_requested_us = 0, g_delay_actual_us = 0;
+static unsigned g_delay_max_us = 0;
+
+static void delay_lock(void) {
+  if (g_delay_mutex >= 0) sceKernelLockMutex(g_delay_mutex, 1, NULL);
+}
+static void delay_unlock(void) {
+  if (g_delay_mutex >= 0) sceKernelUnlockMutex(g_delay_mutex, 1);
+}
+
 static void SDL_Delay_hook(Uint32 ms) {
-  static volatile int n = 0;
-  int c = n++;
+  delay_lock();
+  unsigned c = g_delay_n++;
+  delay_unlock();
   if (c < 4 || (c & 1023) == 0)
-    log_printf("[sleep] SDL_Delay(%u) #%d LR=%p", (unsigned)ms, c, __builtin_return_address(0));
+    log_printf("[sleep] SDL_Delay(%u) #%u LR=%p", (unsigned)ms, c, __builtin_return_address(0));
+  uint64_t start = sceKernelGetProcessTimeWide();
   SDL_Delay(ms);
+  unsigned elapsed = (unsigned)(sceKernelGetProcessTimeWide() - start);
+  delay_lock();
+  g_delay_requested_us += (uint64_t)ms * 1000u;
+  g_delay_actual_us += elapsed;
+  if (elapsed > g_delay_max_us) g_delay_max_us = elapsed;
+  delay_unlock();
+}
+
+void sdl_perf_snapshot(sdl_perf_t *out) {
+  if (!out) return;
+  delay_lock();
+  out->delay_calls = g_delay_n;
+  out->delay_requested_us = g_delay_requested_us;
+  out->delay_actual_us = g_delay_actual_us;
+  out->delay_max_us = g_delay_max_us;
+  delay_unlock();
 }
 
 // --- input event tracing -------------------------------------------------
@@ -198,42 +232,10 @@ static void log_event(const char *via, const SDL_Event *e) {
   }
   if (i < EVT_SLOTS) g_evt[i].n++;
 
-  // log99/log101: the on-screen GAME PAD legend does not match what the buttons
-  // actually do. SDL_main dispatches joystick events through a tbh table at
-  // +0x18be88 (idx3 = SDL_JOYBUTTONDOWN -> +0x18c092, idx4 = UP -> +0x18c120,
-  // idx2 = HAT -> +0x18c0d8).
-  //
-  // CORRECTION (was: "a std::map built for Android's SDL joystick ordering, so
-  // remap the indices"). That theory is WRONG and the remap would be a no-op.
-  // gamepadButtonById / gamepadButtonByHatId are std::map<int,GamepadButton>
-  // (libc++ __ndk1::__tree; node = left@0 right@4 parent@8 black@12 key@16
-  // value@20) living in .bss at 0x5c438c / 0x5c4398, and *nothing ever
-  // populates them*:
-  //   - each has exactly ONE GOT slot (0x5a38c0 / 0x5a38d4), and a full-.text
-  //     scan finds exactly ONE site materialising each, both in this dispatcher
-  //     (+0x18be24, +0x18c0da); libandroid_port.so references neither symbol.
-  //   - +0x18c47a is std::map::operator[]'s insert path: new 24, key = the RAW
-  //     button index at +16, value initialised to *0* at +20, then
-  //     __tree_balance_after_insert, size++.
-  //   - +0x18c4e8 then does  pressedGamepadButtons |= node[+20].
-  //   - JOYDEVICEADDED only calls OpenFirstJoystick, which appends to the
-  //     `joysticks` list and sets gamepadConnected. It builds no table.
-  // So every press ORs ZERO into the mask, for any index: the joystick path is
-  // inert by construction, not mis-indexed. (Note the map does grow at runtime,
-  // one all-zero node per distinct index pressed -- a nonzero size() is NOT
-  // evidence of a real table.)
-  //
-  // The fix is therefore to POPULATE the maps ourselves, keyed by the Vita
-  // indices captured below, with the right GamepadButton bits. What is known of
-  // that bitmask so far: it is a true bitmask (ReplaceGamepadInputForCombo at
-  // +0x18b3ec does and/bic/orr on the whole word); the D-pad occupies
-  // 0x100..0x800 (the hat handler bic's 0xf00 before OR-ing); 0x1000 is cleared
-  // on the app-background/back-button path (+0x18c1d2).
-  //
-  // Vita indices, established empirically from log101 (press order
-  // X O /\ [] L R START SELECT then D-pad up/down/left/right):
-  //   0 triangle  1 circle  2 cross  3 square  4 L  5 R
-  //   6 dpad-down 7 dpad-left 8 dpad-up 9 dpad-right  10 select  11 start
+  // The game's first static constructor prepopulates gamepadButtonById for
+  // Android SDL's normalized A/B/X/Y, shoulder and D-pad indices. Vita SDL uses
+  // the same event shape with a different button ordering; normalize_joy_event()
+  // translates that boundary before the game sees it.
   // Budgeted -- this is a bring-up probe, not steady-state logging.
   // The budget keeps going blind before the interesting part: 120 was spent on
   // menu mashing in log145, and 400 ran out at t=2965 in log149 -- minutes before
@@ -242,14 +244,9 @@ static void log_event(const char *via, const SDL_Event *e) {
   static unsigned btn_n = 0, hat_n = 0;
   if ((t == SDL_JOYBUTTONDOWN || t == SDL_JOYBUTTONUP) && btn_n < 4000) {
     btn_n++;
-    // The mask is read BEFORE the game handles this event, so it reflects the
-    // previous one -- which is what we want: a DOWN followed by a nonzero mask
-    // on the next line is a press that landed. libKOTOR's handler ORs
-    // gamepadButtonById[index] into pressedGamepadButtons; if that mask stays 0
-    // across every press, the joystick path is dead and whatever is responding
-    // to the buttons in-game reaches the engine some other way. mapSize rising
-    // with no mask change is the signature of the map being grown by the
-    // lookup itself (operator[] inserts a zero) rather than populated.
+    // This is sampled before the game handles the returned event, so the mask
+    // reflects the previous event. The next line confirms that a translated
+    // DOWN set the expected bit and its matching UP cleared it.
     log_printf("[input] JOYBUTTON%s which=%d button=%u  pressed=0x%x thisFrame=0x%x mapSize=%u  [#%u]",
                t == SDL_JOYBUTTONDOWN ? "DOWN" : "UP",
                (int)e->jbutton.which, (unsigned)e->jbutton.button,
@@ -291,16 +288,46 @@ static void SDL_PumpEvents_hook(void) {
     log_printf("[input] SDL_PumpEvents #%d (game is polling)", c);
   SDL_PumpEvents();
 }
+
+static Uint8 vita_to_android_button(Uint8 button) {
+  static const Uint8 map[] = {
+    3,   // Triangle -> Y
+    1,   // Circle   -> B
+    0,   // Cross    -> A
+    2,   // Square   -> X
+    9,   // L        -> L1
+    10,  // R        -> R1
+    12,  // D-pad down
+    13,  // D-pad left
+    11,  // D-pad up
+    14,  // D-pad right
+    4,   // Select: Android Select/Back (not assigned by KOTOR)
+    255  // Start: KOTOR's BACKBUTTON_AS_GAMEPAD_PAUSE_ID
+  };
+  return button < sizeof(map) ? map[button] : button;
+}
+
+static void normalize_joy_event(SDL_Event *e) {
+  if (e && (e->type == SDL_JOYBUTTONDOWN || e->type == SDL_JOYBUTTONUP))
+    e->jbutton.button = vita_to_android_button(e->jbutton.button);
+}
+
 static int SDL_PollEvent_hook(SDL_Event *e) {
   int r = SDL_PollEvent(e);
-  if (r && e) log_event("PollEvent", e);
+  if (r && e) {
+    normalize_joy_event(e);
+    log_event("PollEvent", e);
+  }
   return r;
 }
 static int SDL_PeepEvents_hook(SDL_Event *e, int num, SDL_eventaction action,
                                Uint32 minType, Uint32 maxType) {
   int r = SDL_PeepEvents(e, num, action, minType, maxType);
   if (r > 0 && e && action != SDL_ADDEVENT)
-    for (int i = 0; i < r && i < num; i++) log_event("PeepEvents", &e[i]);
+    for (int i = 0; i < r && i < num; i++) {
+      normalize_joy_event(&e[i]);
+      log_event("PeepEvents", &e[i]);
+    }
   return r;
 }
 
@@ -531,4 +558,8 @@ static const so_default_dynlib sdl_dynlib[] = {
   { "g_SDL_BufferGeometry_h",      (uintptr_t)&g_SDL_BufferGeometry_h },
 };
 const int sdl_dynlib_size = sizeof(sdl_dynlib);
-const so_default_dynlib *sdl_get_dynlib(void) { return sdl_dynlib; }
+const so_default_dynlib *sdl_get_dynlib(void) {
+  if (g_delay_mutex < 0)
+    g_delay_mutex = sceKernelCreateMutex("kotor_delay", 0, 0, NULL);
+  return sdl_dynlib;
+}

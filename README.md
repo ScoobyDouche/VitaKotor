@@ -44,8 +44,8 @@ playthrough on.
 | Frame rate | ~30–38 fps typical, dips into the low 20s in dense scenes |
 | Session length | 59 min tested; nothing fatal, but sound thins out past ~40 |
 | Audio | Effects and voice work; long music tracks are silent |
-| Cutscenes | Not played — the video codec is stubbed out |
-| Input | Touchscreen, plus some physical buttons — see [Controls](#controls) |
+| Cutscenes | Bink video and audio play; broad compatibility validation continues |
+| Input | Vita sticks and buttons — see [Controls](#controls) |
 | Saves | Work, stored on the Vita |
 
 `main` is usually ahead of the newest [release](../../releases); the issue list
@@ -124,23 +124,17 @@ Shaders and font metrics ship inside the VPK, so there is nothing else to copy.
 
 ## Controls
 
-**The touchscreen is the main way you play.** KOTOR's mobile release was built
-for touch, and that has not changed here: you tap the screen to pick menu
-entries, move, attack, talk and use things. The front panel maps one-to-one onto
-the screen, so tap what you can see.
+KOTOR's native Android gamepad path is mapped to the Vita controls. The left
+stick moves, the right stick controls the camera, the D-pad navigates, and the
+face buttons follow the familiar layout: Cross accepts, Circle cancels, Square
+is X, and Triangle is Y. L and R are the shoulder actions; Start opens the
+game's pause path. Select is currently reserved.
 
-The **rear touch panel is switched off on purpose** — it sits under your fingers
-while you hold the console and was firing taps into the game.
-
-The **physical buttons work for some actions**, and the game draws the button it
-wants on screen when it wants one. Which button that is changes with what you
-are doing — a prompt in combat and a prompt in a menu will not always ask for
-the same one. This is the game's own behaviour, not a remap: what the buttons do
-is inherited from the Android build and has not been reworked for the Vita's
-layout yet. If a prompt does not respond, the touchscreen always will.
+Both touch panels are disabled. Menus, dialogue, combat and exploration use the
+same physical gamepad handling and button prompts built into the Android game.
 
 **Typing a name** — your character's, or a save's — opens the Vita's on-screen
-keyboard. Tap the name box to bring it up, type, and confirm. *(New in v0.1.9.1.
+keyboard. Select the name field and confirm to bring it up, then type and accept. *(New in v0.1.9.1.
 On v0.1.9 and earlier there is no way to enter a name at all, which leaves
 character creation with no way forward.)*
 
@@ -191,12 +185,10 @@ recordings, so this is what the retail releases did too.
 None of these is reliable enough to reproduce on demand, and none of them costs
 you a save. They are listed because you may hit them. Save regularly.
 
-- **Input can stop responding.** Seen once, around 50 minutes in: the camera
-  stick and the touchscreen both stopped doing anything, while the game carried
-  on running and drawing at full speed. Quitting to the LiveArea and relaunching
-  clears it. What is known: the game was still being handed input at the time and
-  simply stopped acting on it, so this is a game-state problem rather than a
-  frozen console.
+- **Input stopped responding once in an older touch-enabled build.** Around 50
+  minutes in, the camera stick and touch input stopped doing anything while the
+  game kept running. The controller-only path has not reproduced it yet, but
+  needs the same long-session validation. Relaunching clears it.
 
 - **World geometry can tear into diagonal streaks.** Seen twice — once at about
   44 minutes, and again at 37 minutes on Taris: walls and floors smear, getting
@@ -237,14 +229,24 @@ you a save. They are listed because you may hit them. Save regularly.
 - **Long music tracks are silent.** Anything over about 90 seconds is replaced
   with correctly-timed silence, so pacing stays right but the score does not
   play. Shorter music and combat stings do. Voice and effects are unaffected.
-- **Cutscenes are skipped.** The Bink video decoder is stubbed out, so FMVs are
-  passed over rather than played.
-- **Rear touch panel is disabled** deliberately — it sits under your fingers
-  while holding the console and fired spurious taps.
+- **Bink compatibility is not exhaustively tested.** Normal movie playback and
+  physical-button skipping are enabled. A 101-second 640x272, 44.1 kHz stereo
+  movie played at 29.97 fps and returned cleanly to gameplay on hardware; 48 kHz
+  movies and localized subtitle sidecars still need coverage.
+- **Both touch panels are disabled** deliberately; the port uses physical
+  controls exclusively.
 - **No trophies.**
 
 ### Recently fixed
 
+- **Audio mixer lock contention:** the Vita mixer now snapshots active channels,
+  mixes outside the game-facing mutex, and batches FMOD completion scanning under
+  one lock. A real-Vita smoke test preserved working audio; the frame-rate effect
+  still needs a controlled A/B. See the
+  [investigation note](docs/specs/2026-09-12-audio-lock-contention.md).
+- **Bink cutscenes were skipped.** The embedded decoder and YUV renderer now run,
+  with decoded movie PCM feeding the existing Vita mixer instead of opening a
+  competing audio output. Physical-button skip and cleanup work on hardware.
 - **Voice lines silent during in-game cutscenes** (v0.1.9.2). The MP3 decoder
   sized its output buffer by assuming every frame was the smallest one the
   format allows, which asked for 2.25x what a voice line actually needs — a
@@ -277,6 +279,23 @@ a bug report.
 | Crashes immediately at launch | `kubridge.skprx` not installed |
 | Hangs at the loading spinner | An `.obb` is missing, misnamed, or still copying |
 | Textures look wrong | Set `GL_FILTER_REDUNDANT_BINDS 0` in `loader/config.h` and rebuild |
+
+Builds require the vitaGL packed-VBO patch and shader cache documented in
+`SETUP.md`. Without
+it, the game's large vertex offsets truncate above 64 KiB and skinned layouts
+can underflow when shader attribute order differs from memory order, causing
+geometry to stretch or explode. Build vitaGL with `HAVE_SHADER_CACHE=1` so
+compiled variants persist under `ux0:data/shader_cache/KOTR00001/`; otherwise
+first-use effects can block for several seconds. Use `NO_SPLASHSCREEN=1` for
+Vita3K packages.
+
+Intermittent slow frames are reported as `[hitch]` lines in
+`ux0:data/kotor/log.txt`. Each line separates game-thread work from buffer-swap
+wait and includes that frame's draw, texture, buffer, OBB I/O, and audio decode
+activity, plus time inside the engine's `GameUpdate` and `UpdateScreen` calls.
+The trace is event-driven and rate-limited so it does not log every frame.
+KOTOR's adaptive render suppression is disabled by default because it amplified
+one expensive AI update into as many as eleven updates before presenting again.
 
 A "freeze" is usually not a freeze: the crash handler parks the app in place so
 the log survives. Check the end of `log.txt` for a `[CRASH]` block before

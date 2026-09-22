@@ -56,6 +56,46 @@ void hook_addr(uintptr_t addr, uintptr_t dst) {
     hook_arm(addr, dst);
 }
 
+size_t thumb_patch_len(uintptr_t addr) {
+  addr &= ~(uintptr_t)1;
+  size_t need = (addr & 2) ? 10 : 8;
+  size_t len = 0;
+  while (len < need) {
+    uint16_t hw = *(const uint16_t *)(addr + len);
+    len += ((hw & 0xF800) >= 0xE800) ? 4 : 2;
+  }
+  return len;
+}
+
+uintptr_t build_thumb_trampoline(uintptr_t orig_fn, size_t len) {
+  orig_fn &= ~(uintptr_t)1;
+  size_t pad = (len & 2) ? 2 : 0;
+  size_t sz = len + pad + 8;
+  if (sz > 32) return 0;
+
+  SceKernelAllocMemBlockKernelOpt opt;
+  memset(&opt, 0, sizeof(opt));
+  opt.size = sizeof(opt);
+  SceUID blk = kuKernelAllocMemBlock("hook_tramp", SCE_KERNEL_MEMBLOCK_TYPE_USER_RX,
+                                     (sz + 0xfff) & ~(size_t)0xfff, &opt);
+  if (blk < 0) return 0;
+
+  void *base = NULL;
+  if (sceKernelGetMemBlockBase(blk, &base) < 0 || !base) return 0;
+
+  uint8_t buf[32];
+  memcpy(buf, (const void *)orig_fn, len);
+  uint16_t nop = 0xbf00;
+  uint32_t ldrpc = 0xf000f8df;
+  uint32_t cont = (uint32_t)(orig_fn + len) | 1u;
+  if (pad) memcpy(buf + len, &nop, sizeof nop);
+  memcpy(buf + len + pad, &ldrpc, sizeof ldrpc);
+  memcpy(buf + len + pad + sizeof ldrpc, &cont, sizeof cont);
+  kuKernelCpuUnrestrictedMemcpy(base, buf, sz);
+  kuKernelFlushCaches(base, sz);
+  return (uintptr_t)base | 1u;
+}
+
 void so_flush_caches(so_module *mod) {
   kuKernelFlushCaches((void *)mod->text_base, mod->text_size);
 }

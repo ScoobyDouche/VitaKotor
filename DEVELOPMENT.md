@@ -88,10 +88,9 @@ arm-vita-eabi-readelf --dyn-syms -W apk/lib/armeabi-v7a/libKOTOR.so
 
 The loader builds cleanly to `build/KOTOR.vpk` (0 warnings) and **runs the game's
 `SDL_main` on hardware**. It so-loads `libKOTOR.so` + `libandroid_port.so`,
-relocates/resolves them, stubs audio (FMOD/OpenSLES) and Bink, wires libc/libm/
+implements the FMOD and Bink OpenSL paths over one Vita mixer, wires libc/libm/
 C++/pthread, inits vitaGL, builds the fake JNI tables (no `JNI_OnLoad`; entry is
-`SDL_main`), redirects the filesystem, and hands off to the game. Init reaches
-the SDL/JNI display-metrics probe and window/GL-context creation.
+`SDL_main`), redirects the filesystem, and hands off to the game.
 
 - **Runtime prerequisites:** copy `libKOTOR.so`, `libandroid_port.so`,
   `libminiz.so`, and `libLzmaLib.so` from `apk/lib/armeabi-v7a/` to
@@ -147,26 +146,9 @@ partition.
 
 ## Input mapping
 
-Three separate input paths reach the game, and only one of them is wired the way
-you would expect.
-
-**Front touch panel — the primary input.** The game is touch-driven: its menu
-and input loops act on `SDL_FINGERDOWN`/`MOTION`/`UP`, confirmed by disassembly
-(`MacPlayBinkGL`'s skip loop compares `event.type` to `0x700`). Vita SDL2
-produces no finger events from the panel in our configuration, so `input_patch.c`
-reads it with `sceTouchPeek` each frame and pushes proper events into SDL's
-queue. Coordinates are normalised against the panel's *active area* from
-`sceTouchGetPanelInfo` — normalising by the maximum alone assumes the area
-starts at zero and offsets every tap.
-
-**Rear touch panel — deliberately off.** It sits under your fingers while you
-hold the console, and Vita SDL2 turns any sampling port into finger events, so
-it fired taps into the game. `input_touch_init` stops sampling it; SDL's video
-init re-enables it, so `input_touch_pump` asserts it once more afterwards.
-
-**Physical buttons — arriving, but not obviously acting.** Vita SDL2 delivers
-the pad as a joystick. The indices below were established empirically by
-pressing each button in a known order and reading the log:
+Vita SDL2 delivers the physical pad as a joystick. The indices below were
+established empirically by pressing each button in a known order and reading
+the log:
 
 | Index | Button | Index | Button |
 |---|---|---|---|
@@ -177,29 +159,16 @@ pressing each button in a known order and reading the log:
 | 4 | L | 10 | Select |
 | 5 | R | 11 | Start |
 
-Note this is **not** the generic SDL gamepad order Android would produce
-(`0=A 1=B 2=X 3=Y`). Any code that assumes the Android order will find the face
-buttons shuffled.
+This is not Android SDL's normalized ordering. KOTOR's first static constructor
+populates `gamepadButtonById` with Android indices before `SDL_main`: A/B/X/Y are
+0..3, L1/R1 are 9/10, and the D-pad is 11..14. The `SDL_PollEvent` and
+`SDL_PeepEvents` hooks translate Vita button events into that namespace. Start
+maps to the game's own `BACKBUTTON_AS_GAMEPAD_PAUSE_ID` value, 255. Sticks
+already use the expected axis order and are passed through unchanged.
 
-What the game does with an index is unresolved. `SDL_main` looks the index up in
-`gamepadButtonById` — a `std::map<int, GamepadButton>` in `.bss` — and ORs the
-value into `pressedGamepadButtons`. That map has exactly one GOT reference in
-the whole binary, inside the very handler that reads it, and the lookup is
-`operator[]`: a miss inserts a node whose value is zero. So on a static reading
-every press ORs zero, and the map growing at runtime is the lookup's own doing,
-not evidence of a real table. Against that, the buttons do appear to act in
-game. The `[input] JOYBUTTON…` log line reports the mask and the map's node
-count beside each press so a hardware session can settle it:
-
-- mask stays zero while the node count climbs → the joystick path is dead, and
-  whatever answers the buttons reaches the engine some other way
-- mask moves → the map is populated after all, and the fix is a remap from the
-  Vita indices above to what the game expects
-
-Of the bitmask itself: it is a true bitmask (`ReplaceGamepadInputForCombo` does
-`and`/`bic`/`orr` on the whole word), the D-pad occupies `0x100`–`0x800` (the
-hat handler `bic`s `0xf00` before OR-ing), and `0x1000` is cleared on the
-app-background path.
+Both touch panels are stopped at process startup and again after SDL creates the
+window. No finger events are synthesized; physical controls are the only
+gameplay input path. The Vita IME remains available for character and save names.
 
 **Text entry — the Vita on-screen keyboard.** Editable fields ask the platform
 for a keyboard via `ASLPlat_ShowVirtualKeyboard`, which on Android is a tail

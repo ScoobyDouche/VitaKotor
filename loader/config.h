@@ -314,6 +314,38 @@
 // vitaGL gap. Raise to 256 to restore the bring-up trace.
 #define GLGET_TRACE_LIMIT 0
 
+// Event-driven frame hitch trace. Timing is sampled once at swap with no
+// per-draw clock calls; only frames slower than this threshold emit a line.
+// Rate limiting prevents a sustained slow scene from turning logging into the
+// cause of the slowdown. Set the threshold to 0 to disable individual lines;
+// the existing 120-frame summary still reports average and worst frame time.
+#define FRAME_HITCH_TRACE_MS   80
+#define FRAME_HITCH_LOG_GAP_MS 500
+
+// Bink integration modes. Production uses the embedded player and routes decoded
+// PCM through the existing Vita mixer. The other modes retain isolated regression
+// gates for shader, silent-video, and single audio/video playback.
+#define BINK_MODE_SKIP        0
+#define BINK_MODE_SHADER_TEST 1
+#define BINK_MODE_LEGAL_VIDEO 2
+#define BINK_MODE_OPENSL_TEST 3
+#define BINK_MODE_PLAY        4
+#ifndef BINK_MODE
+#define BINK_MODE BINK_MODE_PLAY
+#endif
+#if BINK_MODE != BINK_MODE_SKIP && BINK_MODE != BINK_MODE_SHADER_TEST && \
+    BINK_MODE != BINK_MODE_LEGAL_VIDEO && BINK_MODE != BINK_MODE_OPENSL_TEST && \
+    BINK_MODE != BINK_MODE_PLAY
+#error Unsupported BINK_MODE
+#endif
+
+// KOTOR's Android loop turns an AI update over 33/67/100/133 ms into
+// 2/4/7/11 complete GameUpdate calls before the next presentation. On Vita the
+// extra no-present updates amplify one slow frame into a stutter cascade. Clear
+// the selected count before the primary update so every update can present.
+// Hardware A/B: first-level median window time fell from ~61 ms to ~53 ms.
+#define DISABLE_ADAPTIVE_RENDER_SKIP 1
+
 // Skip glBindTexture calls that rebind what is already bound. log120 measured
 // 1.008 texture binds per draw call, so nearly all of them are redundant.
 // Set to 0 if textures ever look wrong, to rule this out.
@@ -453,4 +485,3 @@
 // match, since a byte-typed sub-upload into a 4444 texture would corrupt it.
 // Set to 0 to go back to full-precision uploads.
 #define GL_TEX16_CONVERT 1
-

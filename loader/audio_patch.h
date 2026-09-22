@@ -31,4 +31,22 @@ void audio_log_stats(void);
 // is the game refusing itself, which no counter on this side can see.
 unsigned audio_play_count(void);
 
+typedef struct {
+  unsigned feed_count, feed_max_us, underruns;
+  uint64_t feed_us;
+} audio_perf_t;
+
+// Cumulative streaming-decoder work for correlation with slow frames.
+void audio_perf_snapshot(audio_perf_t *out);
+
+// Ensure the application's single sceAudioOut thread is ready. The custom Bink
+// OpenSL adapter shares this output rather than opening a second BGM port.
+int audio_ensure_output(void);
+
+// FModAudioSystem's wrapper knows the stable resource ID, but FMOD::createSound
+// receives only the transient buffer. Scope the ID around that nested call so
+// decoded SFX can be found without hashing memory the game may already reuse.
+unsigned audio_sfx_context_push(unsigned id);
+void audio_sfx_context_pop(unsigned previous_id);
+
 #endif

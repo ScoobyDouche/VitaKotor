@@ -60,11 +60,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
-
 #include "config.h"
 #include "audio_patch.h"
 #include "audio_mp3.h"
 #include "audio_ring.h"
+#include "opensl_patch.h"
 #include "bigalloc.h"
 #include "sdl_patch.h"
 #include "log.h"
@@ -169,6 +169,7 @@ typedef struct {
 typedef struct {
   int      used, refs;
   unsigned stamp;                          /* for LRU eviction */
+  unsigned sound_id;                       /* stable FModAudioSystem SFX id */
   unsigned key_len;
   uint32_t key_hash;
   AudioPcm pcm;
@@ -202,6 +203,7 @@ typedef struct {
   float  mindist, maxdist;                /* rolloff range; FMOD defaults 1 / 10000 */
   float  occl;                            /* direct occlusion, 0 = clear path */
   int    has_pos;                         /* set3DAttributes has been called */
+  unsigned gen;                           /* mix-snapshot validity; see MixSnap */
 } Chan;
 
 static Snd      g_snd[MAX_SOUNDS];
@@ -209,6 +211,9 @@ static Chan     g_chan[MAX_CHANNELS];
 static PcmEntry g_cache[MAX_CACHE];
 static unsigned g_clock = 0;
 static unsigned g_cache_hits = 0, g_cache_miss = 0;
+#define SFX_CONTEXT_SLOTS 32
+static unsigned g_sfx_context_id[SFX_CONTEXT_SLOTS];
+static SceUID g_sfx_context_thread[SFX_CONTEXT_SLOTS];
 
 static SceUID   g_mutex   = -1;
 static SceUID   g_thread  = -1;
@@ -249,6 +254,35 @@ static PcmEntry *cache_find(unsigned len, uint32_t h) {
   return NULL;
 }
 
+static PcmEntry *cache_find_id(unsigned id) {
+  if (!id) return NULL;
+  for (int i = 0; i < MAX_CACHE; i++)
+    if (g_cache[i].used && g_cache[i].sound_id == id) return &g_cache[i];
+  return NULL;
+}
+
+/* The mixer reads cached PCM without holding the game-facing mutex. If an
+ * eviction lands during that window, defer the actual free until write-back. */
+static volatile int g_mix_active = 0;
+static AudioPcm g_pcm_retire[MAX_CACHE];
+static int g_pcm_retire_n = 0;
+
+/* Caller holds the mixer lock. */
+static void audio_pcm_free_deferred(AudioPcm *p) {
+  if (g_mix_active && g_running) {
+    if (g_pcm_retire_n < MAX_CACHE) {
+      g_pcm_retire[g_pcm_retire_n++] = *p;
+      memset(p, 0, sizeof *p);
+      return;
+    }
+    static int logged = 0;
+    if (!logged) { logged = 1; log_printf("[snd] PCM retire overflow -- leaking"); }
+    memset(p, 0, sizeof *p);
+    return;
+  }
+  audio_pcm_free(p);
+}
+
 /* Drop the least-recently-used unreferenced entry. Returns 0 if nothing can go. */
 static int cache_evict_one(void) {
   PcmEntry *best = NULL;
@@ -260,13 +294,13 @@ static int cache_evict_one(void) {
   if (!best) return 0;
   unsigned bytes = pcm_bytes_of(&best->pcm);
   g_pcm_bytes = (g_pcm_bytes > bytes) ? g_pcm_bytes - bytes : 0;
-  audio_pcm_free(&best->pcm);
+  audio_pcm_free_deferred(&best->pcm);
   memset(best, 0, sizeof *best);
   return 1;
 }
 
 /* Takes ownership of *pcm on success (and frees nothing on failure). */
-static PcmEntry *cache_insert(unsigned len, uint32_t h, const AudioPcm *pcm) {
+static PcmEntry *cache_insert(unsigned id, unsigned len, uint32_t h, const AudioPcm *pcm) {
   unsigned bytes = pcm_bytes_of(pcm);
   /* Trim retained PCM toward the keep budget, best effort: stop as soon as
    * nothing more can go rather than failing. Referenced entries are unevictable
@@ -287,7 +321,7 @@ static PcmEntry *cache_insert(unsigned len, uint32_t h, const AudioPcm *pcm) {
   if (!slot) return NULL;
 
   slot->used = 1; slot->refs = 1; slot->stamp = ++g_clock;
-  slot->key_len = len; slot->key_hash = h; slot->pcm = *pcm;
+  slot->sound_id = id; slot->key_len = len; slot->key_hash = h; slot->pcm = *pcm;
   g_pcm_bytes += bytes;
   return slot;
 }
@@ -316,7 +350,8 @@ static int      g_stream_retire_n = 0;
 /* How long the audio thread spends decoding, and how much of that is inside the
  * lock. Decoding under the lock is what put the game thread to sleep waiting on
  * createSound: measure it rather than trust that moving it out was enough. */
-static unsigned g_feed_us_max = 0, g_feed_us_tot = 0, g_feed_n = 0;
+static unsigned g_feed_us_max = 0, g_feed_n = 0;
+static uint64_t g_feed_us_tot = 0;
 
 /* The ring's decoder end. Looping is honoured but the game passes LOOP_OFF and
  * drives its own music playlist -- looping here would mean a track could never
@@ -407,6 +442,35 @@ static void stream_close(Stream *st) {
 
 unsigned audio_cache_bytes(void) { return g_pcm_bytes; }
 
+static unsigned *sfx_context_slot(void) {
+  SceUID thid = sceKernelGetThreadId();
+  lock();
+  for (unsigned i = 0; i < SFX_CONTEXT_SLOTS; i++) {
+    if (g_sfx_context_thread[i] == thid) { unlock(); return &g_sfx_context_id[i]; }
+  }
+  for (unsigned i = 0; i < SFX_CONTEXT_SLOTS; i++) {
+    if (!g_sfx_context_thread[i]) {
+      g_sfx_context_thread[i] = thid;
+      unlock();
+      return &g_sfx_context_id[i];
+    }
+  }
+  unlock();
+  return NULL;
+}
+
+unsigned audio_sfx_context_push(unsigned id) {
+  unsigned *slot = sfx_context_slot();
+  unsigned previous = slot ? *slot : 0;
+  if (slot) *slot = id;
+  return previous;
+}
+
+void audio_sfx_context_pop(unsigned previous_id) {
+  unsigned *slot = sfx_context_slot();
+  if (slot) *slot = previous_id;
+}
+
 /* Called from the new-handler when the heap is exhausted. Everything here is a
  * pure speed optimisation -- worst case the next createSound decodes again --
  * so give all of it back rather than let an allocation fail. Entries a live
@@ -420,7 +484,7 @@ unsigned audio_cache_purge(void) {
     if (!e->used || e->refs > 0) continue;
     unsigned bytes = pcm_bytes_of(&e->pcm);
     g_pcm_bytes = (g_pcm_bytes > bytes) ? g_pcm_bytes - bytes : 0;
-    audio_pcm_free(&e->pcm);
+    audio_pcm_free_deferred(&e->pcm);
     memset(e, 0, sizeof *e);
     freed += bytes;
   }
@@ -510,22 +574,42 @@ static float    g_vol_min3d = 1.0f, g_vol_max3d = 0.0f, g_vol_sum3d = 0.0f;
 static unsigned g_mix_n2d = 0, g_mix_n3d = 0;
 static float    g_mix_sum2d = 0.0f, g_mix_sum3d = 0.0f;
 
-/* Caller holds the lock. Returns linear gain and writes a pan in [-1,1]. */
-static float chan_3d_gain(const Chan *c, float *pan_out) {
-  *pan_out = c->pan;
-  if (!AUDIO_3D_ATTENUATION) return 1.0f;
-  if (!c->snd || !c->snd->is3d || !c->has_pos) return 1.0f;
+/* One grain's immutable view of a channel. Capturing it under a short lock lets
+ * the expensive per-sample mix run without blocking the game thread. */
+typedef struct {
+  Chan *ch;
+  unsigned gen;
+  Stream *st;
+  AudioRing *ring;
+  const char *name;
+  unsigned rate;
+  const int16_t *pcm;
+  unsigned nsamples, sch;
+  int is3d, has_pos;
+  float vol, pan, px, py, pz, mindist, maxdist, occl;
+  double pos, step;
+  int finish;
+  unsigned underrun;
+} MixSnap;
+static MixSnap g_msnap[MAX_PLAY_CHANNELS];
+static struct { float px, py, pz, rx, ry, rz; int basis_ok; } g_mix_lis;
 
-  float dx = c->px - g_lis_px, dy = c->py - g_lis_py, dz = c->pz - g_lis_pz;
+/* Runs on the audio thread over the grain snapshot. */
+static float snap_3d_gain(const MixSnap *m, float *pan_out) {
+  *pan_out = m->pan;
+  if (!AUDIO_3D_ATTENUATION) return 1.0f;
+  if (!m->is3d || !m->has_pos) return 1.0f;
+
+  float dx = m->px - g_mix_lis.px, dy = m->py - g_mix_lis.py, dz = m->pz - g_mix_lis.pz;
   float d2 = dx * dx + dy * dy + dz * dz;
   float d  = (d2 > 0.0f) ? sqrtf(d2) : 0.0f;
 
-  float mn = (c->mindist > 0.0f) ? c->mindist : 1.0f;
-  float mx = (c->maxdist > mn)   ? c->maxdist : 10000.0f;
+  float mn = (m->mindist > 0.0f) ? m->mindist : 1.0f;
+  float mx = (m->maxdist > mn)   ? m->maxdist : 10000.0f;
   float dd = d < mn ? mn : (d > mx ? mx : d);
   float g  = mn / dd;
 
-  if (c->occl > 0.0f) g *= (1.0f - (c->occl > 1.0f ? 1.0f : c->occl));
+  if (m->occl > 0.0f) g *= (1.0f - (m->occl > 1.0f ? 1.0f : m->occl));
 
   /* Census the spread so the next log can say whether this is sane. */
   g_g3_n++;
@@ -540,8 +624,8 @@ static float chan_3d_gain(const Chan *c, float *pan_out) {
   /* Pan by projecting the direction onto the listener's right vector. At the
    * listener's own position there is no direction, so stay centred; and with no
    * valid basis yet, panning would be off an arbitrary axis, so stay centred. */
-  if (g_lis_basis_ok && d > 0.0001f) {
-    float p = (dx * g_lis_rx + dy * g_lis_ry + dz * g_lis_rz) / d;
+  if (g_mix_lis.basis_ok && d > 0.0001f) {
+    float p = (dx * g_mix_lis.rx + dy * g_mix_lis.ry + dz * g_mix_lis.rz) / d;
     if (p < -1.0f) p = -1.0f; else if (p > 1.0f) p = 1.0f;
     *pan_out = p;
   }
@@ -575,8 +659,10 @@ static void mix_grain(void) {
   struct { Stream *st; uint64_t pos; int havepos; } feed[MAX_SOUNDS];
   Stream *doomed[MAX_SOUNDS];
   int nfeed = 0, ndoomed = 0;
+  int nmix = 0;
 
   lock();
+  g_mix_active = 1;
   while (g_stream_retire_n > 0) doomed[ndoomed++] = g_stream_retire[--g_stream_retire_n];
   for (int i = 0; i < MAX_SOUNDS; i++) {
     Snd *s = &g_snd[i];
@@ -589,6 +675,32 @@ static void mix_grain(void) {
     feed[nfeed].havepos = (rd && rd->used && rd->playing && rd->snd == s);
     feed[nfeed].pos     = feed[nfeed].havepos ? (uint64_t)rd->pos : 0;
     nfeed++;
+  }
+  g_mix_lis.px = g_lis_px; g_mix_lis.py = g_lis_py; g_mix_lis.pz = g_lis_pz;
+  g_mix_lis.rx = g_lis_rx; g_mix_lis.ry = g_lis_ry; g_mix_lis.rz = g_lis_rz;
+  g_mix_lis.basis_ok = g_lis_basis_ok;
+  for (int c = 0; c < g_nchannels; c++) {
+    Chan *ch = &g_chan[c];
+    if (!ch->used || !ch->playing || ch->paused || !ch->snd) continue;
+    Snd *s = ch->snd;
+    if (s->st && s->st->reader != ch) { chan_finish(ch); continue; }
+    MixSnap *m = &g_msnap[nmix++];
+    m->ch = ch;
+    m->gen = ch->gen;
+    m->st = s->st;
+    m->ring = s->st ? &s->st->ring : NULL;
+    m->name = s->st ? s->st->name : "";
+    m->rate = s->pcm.rate ? s->pcm.rate : 1;
+    m->pcm = s->st ? NULL : s->pcm.pcm;
+    m->nsamples = s->pcm.nsamples;
+    m->sch = s->pcm.channels;
+    m->is3d = s->is3d;
+    m->has_pos = ch->has_pos;
+    m->vol = ch->vol; m->pan = ch->pan;
+    m->px = ch->px; m->py = ch->py; m->pz = ch->pz;
+    m->mindist = ch->mindist; m->maxdist = ch->maxdist; m->occl = ch->occl;
+    m->pos = ch->pos; m->step = ch->step;
+    m->finish = 0; m->underrun = 0;
   }
   unlock();
 
@@ -645,38 +757,31 @@ static void mix_grain(void) {
     }
     if (nfeed) {
       unsigned us = (unsigned)(sceKernelGetProcessTimeWide() - t0);
+      lock();
       if (us > g_feed_us_max) g_feed_us_max = us;
       g_feed_us_tot += us;
       g_feed_n++;
+      unlock();
     }
   }
 
-  lock();
-  for (int c = 0; c < g_nchannels; c++) {
-    Chan *ch = &g_chan[c];
-    if (!ch->used || !ch->playing || ch->paused || !ch->snd) continue;
-    Snd *s = ch->snd;
+  for (int k = 0; k < nmix; k++) {
+    MixSnap *m = &g_msnap[k];
 
-    if (s->st) {                      /* streamed: read the decoded window */
-      /* Only the channel that claimed this stream may read it. A second one
-       * cannot be served -- there is a single decoder and a single window -- so
-       * end it rather than let it starve, which also delivers its END and keeps
-       * the game's channel bookkeeping honest. */
-      if (s->st->reader != ch) { chan_finish(ch); continue; }
-      AudioRing *ring = &s->st->ring;
+    if (m->ring) {                    /* streamed: read the decoded window */
       float pan;
-      float g3 = chan_3d_gain(ch, &pan);
-      float v  = ch->vol * g3;
-      if (s->is3d) { g_mix_n3d++; g_mix_sum3d += v; }
+      float g3 = snap_3d_gain(m, &pan);
+      float v  = m->vol * g3;
+      if (m->is3d) { g_mix_n3d++; g_mix_sum3d += v; }
       else         { g_mix_n2d++; g_mix_sum2d += v; }
       float gl = v * (pan <= 0.0f ? 1.0f : 1.0f - pan);
       float gr = v * (pan >= 0.0f ? 1.0f : 1.0f + pan);
 
       for (int i = 0; i < OUT_GRAIN; i++) {
-        uint64_t i0 = (uint64_t)ch->pos;
+        uint64_t i0 = (uint64_t)m->pos;
         float l0, r0, l1, r1;
-        if (!audio_ring_frame(ring, i0, &l0, &r0) ||
-            !audio_ring_frame(ring, i0 + 1, &l1, &r1)) {
+        if (!audio_ring_frame(m->ring, i0, &l0, &r0) ||
+            !audio_ring_frame(m->ring, i0 + 1, &l1, &r1)) {
           /* Outside the decoded window. Finish ONLY if the decoder is done AND
            * the window really is drained: eos is set the moment the decoder hits
            * the end of the file, while up to RING_FRAMES of already-decoded
@@ -685,7 +790,7 @@ static void mix_grain(void) {
            *
            * Otherwise this is a refill underrun: emit nothing for this sample
            * but keep the clock moving, so a dropout cannot become drift. */
-          if (ring->eos && i0 + 1 >= ring->base + (uint64_t)ring->fill) {
+          if (m->ring->eos && i0 + 1 >= m->ring->base + (uint64_t)m->ring->fill) {
             /* A track reaching its end is the handoff point for the game's music
              * director: it plays LOOP_OFF and is supposed to queue the next one
              * off the END callback. In log166 the last music stream was created
@@ -694,51 +799,51 @@ static void mix_grain(void) {
              * the rest of the session was silent. Printing the end of every
              * track makes that gap measurable against the next CreateStream
              * instead of inferred from a mixing average. Once per track. */
-            unsigned rate = s->pcm.rate ? s->pcm.rate : 1;
             log_printf("[snd] stream FINISHED \"%.31s\" after %u ms "
                        "(chan %d, %u decoded frames) -- END now owed to the game",
-                       s->st->name, (unsigned)(i0 * 1000ull / rate), c,
-                       (unsigned)(ring->base + ring->fill));
-            chan_finish(ch);
+                       m->name, (unsigned)(i0 * 1000ull / m->rate),
+                       (int)(m->ch - g_chan),
+                       (unsigned)(m->ring->base + m->ring->fill));
+            m->finish = 1;
             break;
           }
-          ch->pos += ch->step;
-          g_stream_underruns++;
-          s->st->unders++;
+          m->pos += m->step;
+          m->underrun++;
           continue;
         }
-        float frac = (float)(ch->pos - (double)i0);
+        float frac = (float)(m->pos - (double)i0);
         float l = l0 + (l1 - l0) * frac;
         float r = r0 + (r1 - r0) * frac;
         g_acc[i * 2]     += (int32_t)(l * gl);
         g_acc[i * 2 + 1] += (int32_t)(r * gr);
-        ch->pos += ch->step;
+        m->pos += m->step;
       }
+      if (m->underrun && m->st) m->st->unders += m->underrun;
       continue;
     }
 
-    const int16_t *src = s->pcm.pcm;
-    unsigned n = s->pcm.nsamples, sch = s->pcm.channels;
-    if (!n) { chan_finish(ch); continue; }
+    const int16_t *src = m->pcm;
+    unsigned n = m->nsamples, sch = m->sch;
+    if (!n) { m->finish = 1; continue; }
     if (!src) {                       /* silent placeholder: keep time, emit nothing */
-      ch->pos += ch->step * (double)OUT_GRAIN;
-      if (ch->pos >= (double)n) chan_finish(ch);
+      m->pos += m->step * (double)OUT_GRAIN;
+      if (m->pos >= (double)n) m->finish = 1;
       continue;
     }
 
     /* pan -1 = hard left, +1 = hard right */
     float pan;
-    float g3 = chan_3d_gain(ch, &pan);
-    float v  = ch->vol * g3;
-    if (s->is3d) { g_mix_n3d++; g_mix_sum3d += v; }
+    float g3 = snap_3d_gain(m, &pan);
+    float v  = m->vol * g3;
+    if (m->is3d) { g_mix_n3d++; g_mix_sum3d += v; }
     else         { g_mix_n2d++; g_mix_sum2d += v; }
     float gl = v * (pan <= 0.0f ? 1.0f : 1.0f - pan);
     float gr = v * (pan >= 0.0f ? 1.0f : 1.0f + pan);
 
     for (int i = 0; i < OUT_GRAIN; i++) {
-      unsigned i0 = (unsigned)ch->pos;
-      if (i0 + 1 >= n) { chan_finish(ch); break; }
-      float frac = (float)(ch->pos - (double)i0);
+      unsigned i0 = (unsigned)m->pos;
+      if (i0 + 1 >= n) { m->finish = 1; break; }
+      float frac = (float)(m->pos - (double)i0);
 
       float l, r;
       if (sch == 1) {
@@ -752,10 +857,13 @@ static void mix_grain(void) {
       }
       g_acc[i * 2]     += (int32_t)(l * gl);
       g_acc[i * 2 + 1] += (int32_t)(r * gr);
-      ch->pos += ch->step;
+      m->pos += m->step;
     }
   }
-  unlock();
+
+#ifdef KOTOR_USE_BINK_OPENSL
+  bink_opensl_mix(g_acc, OUT_GRAIN, OUT_RATE);
+#endif
 
   /* Peak limiter.
    *
@@ -798,6 +906,26 @@ static void mix_grain(void) {
     if (v < -32768) v = -32768;
     g_out[i] = (int16_t)v;
   }
+
+  /* Reconcile only snapshots whose channel identity and position were not
+   * changed by the game during the unlocked mix. */
+  AudioPcm ret[MAX_CACHE];
+  int nret;
+  lock();
+  g_mix_active = 0;
+  nret = g_pcm_retire_n;
+  g_pcm_retire_n = 0;
+  for (int i = 0; i < nret; i++) ret[i] = g_pcm_retire[i];
+  for (int k = 0; k < nmix; k++) {
+    MixSnap *m = &g_msnap[k];
+    if (m->underrun) g_stream_underruns += m->underrun;
+    Chan *ch = m->ch;
+    if (ch->gen != m->gen || !ch->used || !ch->playing || !ch->snd) continue;
+    ch->pos = m->pos;
+    if (m->finish) chan_finish(ch);
+  }
+  unlock();
+  for (int i = 0; i < nret; i++) audio_pcm_free(&ret[i]);
 }
 
 static int audio_thread(SceSize args, void *argp) {
@@ -827,8 +955,29 @@ static void audio_start(void) {
   g_running = 1;
   g_thread = sceKernelCreateThread("kotor_snd", audio_thread, 0x10000100, 0x10000,
                                    0, 0, NULL);
-  if (g_thread >= 0) sceKernelStartThread(g_thread, 0, NULL);
+  if (g_thread < 0) {
+    log_printf("[snd] output thread create failed 0x%08X", (unsigned)g_thread);
+    g_running = 0;
+    sceAudioOutReleasePort(g_port);
+    g_port = -1;
+    return;
+  }
+  int rc = sceKernelStartThread(g_thread, 0, NULL);
+  if (rc < 0) {
+    log_printf("[snd] output thread start failed 0x%08X", (unsigned)rc);
+    g_running = 0;
+    sceKernelDeleteThread(g_thread);
+    g_thread = -1;
+    sceAudioOutReleasePort(g_port);
+    g_port = -1;
+    return;
+  }
   log_printf("[snd] output up: port=%d %dHz stereo grain=%d", g_port, OUT_RATE, OUT_GRAIN);
+}
+
+int audio_ensure_output(void) {
+  audio_start();
+  return g_running && g_port >= 0 && g_thread >= 0;
 }
 
 /* ---- handle helpers ------------------------------------------------------- */
@@ -847,6 +996,9 @@ static Snd *snd_alloc(void) {
  * real FMOD does under voice pressure: take a free slot, else steal the
  * oldest FINISHED voice, else the oldest playing one. */
 static unsigned g_chan_stamp = 0, g_steals = 0, g_steals_live = 0;
+/* Invalidates an in-flight unlocked mix snapshot when a channel is recycled,
+ * stopped, or repositioned. Monotonic values avoid ABA within a session. */
+static unsigned g_chan_gen = 0;
 static unsigned g_ends_rescued = 0, g_ends_lost = 0;
 /* log154's ratchet: playSound outran END delivery by 28 at t=134 and 163 at
  * t=949, monotonically, and the deficit never once fell. At t=854 the pool
@@ -934,6 +1086,7 @@ static Chan *chan_take(Chan *c) {
   memset(c, 0, sizeof *c);
   c->used  = 1;
   c->stamp = ++g_chan_stamp;
+  c->gen   = ++g_chan_gen;
   return c;
 }
 
@@ -1009,20 +1162,33 @@ static int Sys_update(void *self) {
   g_updates++;
   if (draining) return FMOD_OK;         /* HandleChannelEnd -> playSound -> ... */
   draining = 1;
-  /* Playable voices first, then the retirement ring -- a slot there exists only
-   * to carry one END and is freed the moment it is delivered. */
+  /* Collect all completions under one lock, then invoke callbacks after release
+   * because HandleChannelEnd re-enters playSound. This replaces one mutex round
+   * trip per channel with one per update. */
+  struct { Chan *c; chan_cb cb; int retire; } pend[MAX_CHANNELS];
+  int npend = 0;
+  lock();
   for (int i = 0; i < MAX_CHANNELS; i++) {
     if (i >= g_nchannels && i < MAX_PLAY_CHANNELS) continue;   /* never allocated */
     Chan *c = &g_chan[i];
-    lock();
-    chan_cb cb = c->cb;
-    int fire = c->end_pending && cb;
-    if (fire) c->end_pending = 0;
-    unlock();
-    if (fire) {                          /* never under the lock */
-      g_ends_fired++;
-      cb(c, FMOD_CHANNELCONTROL_CHANNEL, FMOD_CHANNELCONTROL_CALLBACK_END, NULL, NULL);
-      if (i >= MAX_PLAY_CHANNELS) { lock(); c->used = 0; c->cb = NULL; unlock(); }
+    if (c->end_pending && c->cb) {
+      c->end_pending = 0;
+      pend[npend].c = c;
+      pend[npend].cb = c->cb;
+      pend[npend].retire = (i >= MAX_PLAY_CHANNELS);
+      npend++;
+    }
+  }
+  unlock();
+  for (int k = 0; k < npend; k++) {
+    g_ends_fired++;
+    pend[k].cb(pend[k].c, FMOD_CHANNELCONTROL_CHANNEL,
+               FMOD_CHANNELCONTROL_CALLBACK_END, NULL, NULL);
+    if (pend[k].retire) {
+      lock();
+      pend[k].c->used = 0;
+      pend[k].c->cb = NULL;
+      unlock();
     }
   }
   draining = 0;
@@ -1183,11 +1349,27 @@ static int Sys_createSound(void *self, const char *name, unsigned mode,
   AudioPcm pcm;
   int ok = 0, silent = 0;
 
-  /* Already decoded this exact asset? Share it and skip all the work. */
+  /* The companion's SFX buffer is transient and is sometimes reused before a
+   * later request for the same resource. Prefer its stable resource ID so a
+   * cached decode can be found without touching stale bytes. */
+  unsigned *context = (mode & FMOD_OPENMEMORY) ? sfx_context_slot() : NULL;
+  unsigned sound_id = context ? *context : 0;
+  lock();
+  PcmEntry *ent = cache_find_id(sound_id);
+  if (ent) { ent->refs++; ent->stamp = ++g_clock; }
+  unlock();
+  if (ent) { g_cache_hits++; big_free(owned); goto have_pcm; }
+
+  /* Content identity remains the fallback for streams and callers outside the
+   * FModAudioSystem wrapper. Only read the transient buffer after the ID miss. */
   uint32_t hkey = key_hash(buf, len);
   lock();
-  PcmEntry *ent = cache_find(len, hkey);
-  if (ent) { ent->refs++; ent->stamp = ++g_clock; }
+  ent = cache_find(len, hkey);
+  if (ent) {
+    ent->refs++;
+    ent->stamp = ++g_clock;
+    if (sound_id && !ent->sound_id) ent->sound_id = sound_id;
+  }
   unlock();
   if (ent) { g_cache_hits++; big_free(owned); goto have_pcm; }
   g_cache_miss++;
@@ -1199,7 +1381,7 @@ static int Sys_createSound(void *self, const char *name, unsigned mode,
    * when we cannot afford it hand back a correctly-timed SILENT sound: costs no
    * memory, keeps the game's pacing, and stops the retry loop dead.
    * Proper fix is incremental streaming; this makes it survivable meanwhile. */
-  if (mode & FMOD_CREATESTREAM) {
+  if (!ok && (mode & FMOD_CREATESTREAM)) {
     AudioPcm est;
     if (audio_mp3_probe(buf, len, &est)) {
       unsigned need = est.nsamples * est.channels * 2u;
@@ -1258,7 +1440,13 @@ static int Sys_createSound(void *self, const char *name, unsigned mode,
     }
   }
 
-  if (!ok) ok = audio_mp3_decode(buf, len, &pcm);
+  if (!ok) {
+    /* Header-only rejection prevents a corrupted transient SFX buffer from
+     * spending 100+ ms in the hardware decoder's byte-by-byte resync loop. */
+    AudioPcm probe;
+    if (!(mode & FMOD_OPENMEMORY) || audio_mp3_probe(buf, len, &probe))
+      ok = audio_mp3_decode(buf, len, &pcm);
+  }
 
   /* Decode failed outright. For a stream, still prefer timed silence over an
    * error for exactly the same reason as above. */
@@ -1282,7 +1470,7 @@ static int Sys_createSound(void *self, const char *name, unsigned mode,
   big_free(owned);
 
   lock();
-  ent = cache_insert(len, hkey, &pcm);
+  ent = cache_insert(sound_id, len, hkey, &pcm);
   unlock();
   if (!ent) {
     audio_pcm_free(&pcm);
@@ -1387,6 +1575,7 @@ static int Snd_release(void *self) {
       if (g_chan[i].end_pending) g_rel_kill_pend++;   /* END built, never sent */
       g_chan[i].playing = 0; g_chan[i].used = 0;
       g_chan[i].end_pending = 0; g_chan[i].cb = NULL;   /* the source is gone */
+      g_chan[i].gen = ++g_chan_gen;
     }
   cache_release(s->ent);          /* samples stay cached for the next request */
   s->ent = NULL;
@@ -1446,6 +1635,7 @@ static int Ch_stop(void *self) {
   c->used    = 0;
   c->end_pending = 0;
   c->cb      = NULL;
+  c->gen     = ++g_chan_gen;
   unlock();
   return FMOD_OK;
 }
@@ -1507,6 +1697,7 @@ static int Ch_setPosition(void *self, unsigned pos, unsigned unit) {
   unsigned rate = c->snd->pcm.rate ? c->snd->pcm.rate : OUT_RATE;
   lock();
   c->pos = (unit & FMOD_TIMEUNIT_PCM) ? (double)pos : (double)pos * rate / 1000.0;
+  c->gen = ++g_chan_gen;
   unlock();
   return FMOD_OK;
 }
@@ -1638,6 +1829,16 @@ static int Sys_set3DListenerAttributes(void *self, int listener, const FmodVec *
  * counter -- torn reads do not matter for a log line -- or takes the lock. */
 unsigned audio_play_count(void) { return g_play_calls; }
 
+void audio_perf_snapshot(audio_perf_t *out) {
+  if (!out) return;
+  lock();
+  out->feed_count = g_feed_n;
+  out->feed_us = g_feed_us_tot;
+  out->feed_max_us = g_feed_us_max;
+  out->underruns = g_stream_underruns;
+  unlock();
+}
+
 void audio_log_stats(void) {
   {
     /* g_played is the discriminator log4 lacked. Its END rate fell from ~127 per
@@ -1696,7 +1897,8 @@ void audio_log_stats(void) {
                  g_mix_n2d ? g_mix_sum2d / (float)g_mix_n2d : 0.0f, g_mix_n2d,
                  g_mix_n3d ? g_mix_sum3d / (float)g_mix_n3d : 0.0f, g_mix_n3d,
                  g_streams_open, g_stream_decoders, g_stream_underruns,
-                 g_feed_n ? g_feed_us_tot / g_feed_n : 0u, g_feed_us_max, g_feed_n,
+                 (unsigned)(g_feed_n ? g_feed_us_tot / g_feed_n : 0u),
+                 g_feed_us_max, g_feed_n,
                  g_stop_calls, g_stop_live, g_stop_pend, g_stop_stale,
                  g_pause_set, g_pause_clr,
                  nused, nplaying, npaused, npend, g_nchannels);
@@ -1705,18 +1907,28 @@ void audio_log_stats(void) {
 
 /* OpenSLES interface IDs are data objects the engine dereferences by address;
  * a stable dummy address per IID is enough to satisfy relocation. */
+#ifndef KOTOR_USE_BINK_OPENSL
 static const uint32_t sl_iid_engine      = 0;
 static const uint32_t sl_iid_play        = 0;
 static const uint32_t sl_iid_volume      = 0;
 static const uint32_t sl_iid_bufferqueue = 0;
+#endif
 
 static const so_default_dynlib audio_dynlib[] = {
   // ---- OpenSLES (libandroid_port.so imports these directly) ----
+#ifdef KOTOR_USE_BINK_OPENSL
+  { "slCreateEngine",     (uintptr_t)&bink_slCreateEngine },
+  { "SL_IID_ENGINE",      (uintptr_t)&bink_sl_iid_engine },
+  { "SL_IID_PLAY",        (uintptr_t)&bink_sl_iid_play },
+  { "SL_IID_VOLUME",      (uintptr_t)&bink_sl_iid_volume },
+  { "SL_IID_BUFFERQUEUE", (uintptr_t)&bink_sl_iid_bufferqueue },
+#else
   { "slCreateEngine",     (uintptr_t)&fmod_stub },
   { "SL_IID_ENGINE",      (uintptr_t)&sl_iid_engine },
   { "SL_IID_PLAY",        (uintptr_t)&sl_iid_play },
   { "SL_IID_VOLUME",      (uintptr_t)&sl_iid_volume },
   { "SL_IID_BUFFERQUEUE", (uintptr_t)&sl_iid_bufferqueue },
+#endif
 
   // ---- FMOD C API ----
   { "FMOD_System_Create",       (uintptr_t)&Sys_Create },

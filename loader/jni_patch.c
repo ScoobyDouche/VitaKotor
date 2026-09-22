@@ -150,8 +150,8 @@ static void *CallStaticObjectMethodV(void *env, void *cls, void *mid, va_list a)
 }
 static int CallStaticBooleanMethodV(void *env, void *cls, void *mid, va_list a) {
   const char *n = id_name(mid);
-  // The Vita has a front touchscreen; report it so the game keeps touch input.
-  int r = !strcmp(n, "HasTouchScreen") ? 1 : 0;
+  // Gameplay is controller-only. The Vita IME remains available for text entry.
+  int r = 0;
   // log98: this defaulted to 0 for GetHighResolution, which puts the engine in
   // its low-res mobile mode: it clamps the render height to `resolutionCap` (480)
   // and scales width to match, giving glViewport(0,0,847,480) and a 847x480 colour

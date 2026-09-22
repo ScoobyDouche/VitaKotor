@@ -3,7 +3,6 @@
 #ifndef __MAIN_H__
 #define __MAIN_H__
 
-#include <psp2/touch.h>
 #include "so_util.h"
 
 extern so_module kotor_mod;   // libKOTOR.so
@@ -21,6 +20,15 @@ int loader_language(void);
 int ret0(void);
 int ret1(void);
 
-extern SceTouchPanelInfo panelInfoFront, panelInfoBack;
+typedef struct {
+  unsigned game_calls, screen_calls;
+  uint64_t game_us, screen_us;
+  unsigned policy_seq, selected_skip;
+  float selector_ai_ms, next_ai_ms, display_fps;
+  int movie_fps;
+} engine_perf_t;
+
+void engine_perf_snapshot(engine_perf_t *out, uint64_t now_us);
+void engine_perf_presented(void);
 
 #endif

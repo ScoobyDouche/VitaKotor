@@ -43,6 +43,8 @@ typedef struct {
 void hook_thumb(uintptr_t addr, uintptr_t dst);
 void hook_arm(uintptr_t addr, uintptr_t dst);
 void hook_addr(uintptr_t addr, uintptr_t dst);
+size_t thumb_patch_len(uintptr_t addr);
+uintptr_t build_thumb_trampoline(uintptr_t orig_fn, size_t len);
 
 void so_flush_caches(so_module *mod);
 int so_load(so_module *mod, const char *filename, uintptr_t load_addr);
