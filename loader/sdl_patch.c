@@ -48,7 +48,7 @@ static SDL_Window *SDL_CreateWindow_hook(const char *title, int x, int y,
   if (!win)
     log_printf("[SDL] CreateWindow FAILED: %s", SDL_GetError());
   else
-    input_init();  // SDL video can enable touch; physical-controls-only mode disables it
+    input_touch_init();  // SDL video is up now -> enable front-touch injection
   return win;
 }
 
@@ -68,7 +68,7 @@ static void SDL_GL_SwapWindow_hook(SDL_Window *w) {
   uint64_t swap_end = sceKernelGetProcessTimeWide();
   gl_patch_on_swap(swap_begin, swap_end);
   bink_patch_on_swap(swap_end);
-  input_probe_pump();  // raw pad health only; SDL remains the gameplay input path
+  input_touch_pump();  // front touch as SDL finger events; the pad goes through SDL
   ime_pump();          // collect what the on-screen keyboard produced
 }
 

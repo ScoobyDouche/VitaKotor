@@ -2642,7 +2642,7 @@ int main(int argc, char *argv[]) {
   // of them are black screen, so the trigger has to be latched across the whole
   // wait rather than sampled once at the end of it.
   langsel_watch_begin();
-  sceTouchSetSamplingState(SCE_TOUCH_PORT_FRONT, SCE_TOUCH_SAMPLING_STATE_STOP);
+  sceTouchSetSamplingState(SCE_TOUCH_PORT_FRONT, SCE_TOUCH_SAMPLING_STATE_START);
   sceTouchSetSamplingState(SCE_TOUCH_PORT_BACK, SCE_TOUCH_SAMPLING_STATE_STOP);
 
   scePowerSetArmClockFrequency(444);
