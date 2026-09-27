@@ -50,6 +50,8 @@ add_executable(KOTOR
   loader/jni_patch.c
   loader/ini.c
   loader/langsel.c
+  loader/translation.c
+  loader/trname.c
   loader/audio_patch.c
   loader/audio_mp3.c
   loader/audio_ring.c

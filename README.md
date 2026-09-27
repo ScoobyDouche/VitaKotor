@@ -181,6 +181,39 @@ This changes the on-screen text and the main-menu artwork. **Voice-over stays
 English** in every language — the game data only ever shipped one set of
 recordings, so this is what the retail releases did too.
 
+### Fan translations
+
+Unofficial translations show up in the same list, below the five built-in
+languages. Give each one its own folder:
+
+```
+ux0:data/kotor/translations/Polski/tv_dialog.tlk
+```
+
+The folder name is what the list shows, so name it after the language. The
+file inside can be called `tv_dialog.tlk` or `dialog.tlk`; either works. Then
+**press L while the game is starting** and pick it. The choice is saved as
+`Translation=Polski` next to `Language=` in `swkotor.ini`, and choosing one of
+the built-in languages again switches it off.
+
+Don't repack the OBB files, and don't edit them. The card folder is read first.
+
+Things to know:
+
+- A translation runs as English underneath, so the **main-menu buttons stay in
+  English**: they are pictures, not text. The boot-screen tips use the
+  translation's text.
+- The game's fonts only have Western European letters. Accented Latin text
+  (Portuguese, Polish without ł/ś/ż, and so on) shows up, but Cyrillic and
+  other scripts show up as the wrong letters. A translation can include
+  replacement font files in its folder: any file there overrides the game
+  file with the same name. It is not yet confirmed that the game picks up fonts
+  this way.
+- The game's own text tables all have 49,265 entries. The log says how many
+  entries your file has (`ux0:data/kotor/log.txt`, look for `[tr]`). If the
+  numbers differ, the file was made for another edition of the game, and
+  some lines may be missing or in the wrong place.
+
 ## Known issues
 
 ### Intermittent

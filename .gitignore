@@ -19,3 +19,4 @@ backups/
 
 # Local tooling config -- regenerates on every permission grant, machine-specific
 .claude/
+test-translation/

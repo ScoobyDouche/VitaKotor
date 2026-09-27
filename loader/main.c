@@ -24,6 +24,7 @@
 #include "jni_patch.h"
 #include "ini.h"
 #include "langsel.h"
+#include "translation.h"
 #include "audio_patch.h"
 #include "bink_patch.h"
 #include "fs_patch.h"
@@ -2140,13 +2141,42 @@ static int         g_lang_have_key = 0;
 
 int loader_language(void) { return g_lang_id; }
 
+// A fan translation (translation.h) is saved next to Language as
+// [Game Options] Translation=<folder>. It wins over Language, because it only
+// works by standing in for the English table: the game is told English and
+// asks for tv_dialog.tlk, which the translation then serves. A folder that has
+// since gone from the card falls back to Language rather than to nothing.
+static void resolve_translation(const char *ini) {
+  char name[80];
+  if (!ini_get(ini, "Game Options", "Translation", name, sizeof(name)) || !name[0])
+    return;
+  int i = translation_find(name);
+  if (i < 0) {
+    log_printf("[lang] [Game Options] Translation=%s, but there is no such folder "
+               "with a dialog table in ux0:data/kotor/translations/ -- ignoring it",
+               name);
+    return;
+  }
+  translation_select(i);
+  g_lang_id = INI_LANG_EN;
+  g_lang_have_key = 1;
+  jni_set_language(INI_LANG_EN);
+  log_printf("[lang] [Game Options] Translation=%s -> the game runs as English "
+             "with that folder's text", name);
+}
+
 static void resolve_language(void) {
   char buf[4097];
+  translation_scan();
   for (int i = 0; i < INI_PATH_COUNT; i++) {
     if (slurp_ini(kIniPaths[i], buf, sizeof(buf)) <= 0) continue;
     g_ini_path = kIniPaths[i];
     char code[16];
-    if (!ini_get(buf, "Game Options", "Language", code, sizeof(code))) break;
+    if (!ini_get(buf, "Game Options", "Language", code, sizeof(code))) {
+      resolve_translation(buf);
+      if (g_lang_have_key) return;
+      break;
+    }
     int id = ini_language_id(code);
     log_printf("[lang] %s: [Game Options] Language=%s -> id %d%s",
                kIniPaths[i], code, id,
@@ -2155,6 +2185,7 @@ static void resolve_language(void) {
     g_lang_id = id;
     g_lang_have_key = 1;
     jni_set_language(id);
+    resolve_translation(buf);
     return;
   }
   log_printf("[lang] no [Game Options] Language key -> id %d (English)",
@@ -2195,22 +2226,39 @@ static char *read_whole_ini(const char *path) {
 // options are saved, so this changes the one line and hands back everything
 // else untouched (see ini_set). It lands via a temp file: an interrupted write
 // then costs the new setting and never the file that was already there.
-static void write_language(int id) {
+//
+// `translation` is the fan-translation folder to save, or NULL for none. An
+// ini that never had a Translation key does not gain an empty one.
+static char *ini_with(const char *base, const char *key, const char *value,
+                      size_t *len) {
+  size_t need = ini_set(base, "Game Options", key, value, NULL, 0);
+  char *out = malloc(need + 1);
+  if (out) ini_set(base, "Game Options", key, value, out, need + 1);
+  *len = need;
+  return out;
+}
+
+static void write_language(int id, const char *translation) {
   const char *code = ini_language_code(id);
   const char *path = g_ini_path ? g_ini_path : kIniPaths[0];
 
   char *text = read_whole_ini(path);
   const char *base = text ? text : "";
 
-  size_t need = ini_set(base, "Game Options", "Language", code, NULL, 0);
-  char *out = malloc(need + 1);
+  size_t need = 0;
+  char *out = ini_with(base, "Language", code, &need);
+  char had[2];
+  if (out && (translation ||
+              ini_get(out, "Game Options", "Translation", had, sizeof(had)))) {
+    char *both = ini_with(out, "Translation", translation ? translation : "", &need);
+    free(out);
+    out = both;
+  }
+  free(text);
   if (!out) {
-    free(text);
     log_printf("[lang] out of memory writing %s", path);
     return;
   }
-  ini_set(base, "Game Options", "Language", code, out, need + 1);
-  free(text);
 
   char tmp[256];
   snprintf(tmp, sizeof(tmp), "%s.new", path);
@@ -2233,20 +2281,40 @@ static void write_language(int id) {
                tmp, path, (unsigned)r);
     return;
   }
-  log_printf("[lang] saved [Game Options] Language=%s to %s", code, path);
+  log_printf("[lang] saved [Game Options] Language=%s%s%s to %s", code,
+             translation ? " Translation=" : "", translation ? translation : "",
+             path);
 }
 
 // Offer the picker and act on what comes back. Deliberately called from the
 // game thread before loadscreen_begin(): vitaGL is up by then, and the time a
 // user spends reading a menu must not land inside the boot-duration estimate
 // the progress bar persists, or the next boot's bar is pure fiction.
+//
+// Rows past the game's five languages are fan translations, which run as
+// English with their own table swapped in (see resolve_translation).
 static void offer_language_picker(void) {
-  int picked = g_lang_id;
-  if (!langsel_run(g_lang_id, g_lang_have_key, &picked)) return;
+  const char *extra[TRANSLATION_MAX];
+  int nextra = translation_count();
+  for (int i = 0; i < nextra; i++) extra[i] = translation_label(i);
+
+  int current = translation_active() >= 0
+                  ? LANGSEL_BUILTIN + translation_active() : g_lang_id;
+  int picked = current;
+  if (!langsel_run(current, g_lang_have_key, extra, nextra, &picked)) return;
+
+  const char *folder = NULL;
+  if (picked >= LANGSEL_BUILTIN) {
+    translation_select(picked - LANGSEL_BUILTIN);
+    folder = translation_name(picked - LANGSEL_BUILTIN);
+    picked = INI_LANG_EN;
+  } else {
+    translation_select(-1);
+  }
   g_lang_id = picked;
   g_lang_have_key = 1;
   jni_set_language(picked);               // no game code has run yet
-  write_language(picked);
+  write_language(picked, folder);
 }
 
 static void dump_ini(const char *path) {

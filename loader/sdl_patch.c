@@ -27,6 +27,7 @@
 #include "ime_patch.h"
 #include "input_patch.h"
 #include "so_util.h"
+#include "translation.h"
 #include "log.h"
 
 extern int ret0(void);   // from dynlib.c
@@ -411,6 +412,19 @@ static SDL_RWops *SDL_RWFromFile_hook(const char *fname, const char *mode) {
   if (fname && mode && (mode[0] == 'r')) {
     const char *slash = strrchr(fname, '/');
     const char *base = slash ? slash + 1 : fname;
+    // A fan translation's files beat everything, bundled .txi included: a
+    // translation that brings its own font brings the metrics to match.
+    char tp[320];
+    if (translation_path(base, tp, sizeof(tp))) {
+      SDL_RWops *trw = SDL_RWFromFile(tp, mode);
+      static unsigned tr_n = 0;
+      if (tr_n < 64) {
+        tr_n++;
+        log_printf("[tr] %s %s for %s", trw ? "served" : "!!! could not open",
+                   tp, fname);
+      }
+      if (trw) return trw;
+    }
     if (is_shader_name(base)) {
       char ap[256];
       snprintf(ap, sizeof(ap), "app0:shaders/%s", base);

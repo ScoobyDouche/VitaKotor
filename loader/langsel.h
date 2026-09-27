@@ -37,14 +37,22 @@
  * langsel_run() consumes the latch and stops the watcher. */
 void langsel_watch_begin(void);
 
-/* Offer the picker. `current` is the language id the ini resolved to and
- * `have_key` says whether it came from an actual Language key or from the
- * English default.
+/* The game's own languages are the first rows, in INI_LANG_* order. */
+#define LANGSEL_BUILTIN 5
+
+/* Offer the picker. `current` is the row the ini resolved to and `have_key`
+ * says whether it came from an actual Language key or from the English
+ * default.
  *
- * Returns 1 when the user confirmed a choice, with the chosen id in *out;
+ * Rows 0..LANGSEL_BUILTIN-1 are the INI_LANG_* ids; `extra` adds `nextra`
+ * more after them (fan translations, see translation.h), so row
+ * LANGSEL_BUILTIN + i is extra[i]. The labels are CP1252.
+ *
+ * Returns 1 when the user confirmed a choice, with the chosen row in *out;
  * 0 when the picker did not run, was cancelled, or timed out, leaving *out
  * untouched. A cancel on a first boot therefore saves nothing and the picker
  * asks again next time, which is the honest reading of "I did not choose". */
-int langsel_run(int current, int have_key, int *out);
+int langsel_run(int current, int have_key, const char *const *extra, int nextra,
+                int *out);
 
 #endif

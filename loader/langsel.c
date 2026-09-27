@@ -23,7 +23,11 @@
 static const char *const kNames[] = {
   "ENGLISH", "FRAN\xC7" "AIS", "ITALIANO", "DEUTSCH", "ESPA\xD1" "OL",
 };
-#define LANG_COUNT ((int)(sizeof kNames / sizeof kNames[0]))
+_Static_assert(sizeof kNames / sizeof kNames[0] == LANGSEL_BUILTIN,
+               "kNames must hold exactly the game's own languages");
+
+/* Built-in rows plus however many fan translations fit. */
+#define LANGSEL_MAX_ROWS 32
 
 /* Same trick loadscreen.c uses for its bar: a scissored clear needs no shader,
  * no buffer and no texture, so it cannot disturb anything the font path sets
@@ -44,7 +48,19 @@ static void centred(const char *s, float y, float scale,
 
 #define ROW_Y(i)  (LANGSEL_ROWS_Y + (i) * LANGSEL_ROW_STEP)
 
-static void draw(int sel, const char *footer) {
+/* A folder name can be far longer than FRANCAIS, so a row that would spill out
+ * of its highlight is drawn smaller rather than cut. */
+static void row(const char *s, int slot, int on) {
+  float scale = LANGSEL_ROW_SCALE;
+  float w = (float)font_measure(s, -1);
+  float room = (float)(LANGSEL_HL_W - 24);
+  if (w * scale > room && w > 0) scale = room / w;
+  centred(s, (float)ROW_Y(slot) + (LANGSEL_ROW_SCALE - scale) * 8.0f, scale,
+          on ? 0.70f : 0.42f, on ? 0.82f : 0.49f, on ? 1.00f : 0.60f);
+}
+
+static void draw(const char *const *rows, int count, int sel, int top,
+                 const char *footer) {
   glDisable(GL_SCISSOR_TEST);
   glDisable(GL_DEPTH_TEST);
   glDisable(GL_CULL_FACE);
@@ -56,7 +72,7 @@ static void draw(int sel, const char *footer) {
    * clear would wipe glyphs already drawn. Art coordinates run top-down and GL
    * window space runs bottom-up, hence the flip. */
   fill((SCREEN_W - LANGSEL_HL_W) / 2,
-       SCREEN_H - (ROW_Y(sel) - LANGSEL_HL_PAD) - LANGSEL_HL_H,
+       SCREEN_H - (ROW_Y(sel - top) - LANGSEL_HL_PAD) - LANGSEL_HL_H,
        LANGSEL_HL_W, LANGSEL_HL_H, 0.11f, 0.18f, 0.31f);
 
   /* Top-down ortho, matching the sense font_draw's y argument is written in. */
@@ -69,11 +85,16 @@ static void draw(int sel, const char *footer) {
   centred("CHOOSE A LANGUAGE", (float)LANGSEL_TITLE_Y, LANGSEL_TITLE_SCALE,
           0.588f, 0.667f, 0.784f);
 
-  for (int i = 0; i < LANG_COUNT; i++) {
-    int on = (i == sel);
-    centred(kNames[i], (float)ROW_Y(i), LANGSEL_ROW_SCALE,
-            on ? 0.70f : 0.42f, on ? 0.82f : 0.49f, on ? 1.00f : 0.60f);
-  }
+  for (int i = top; i < count && i < top + LANGSEL_VISIBLE_ROWS; i++)
+    row(rows[i], i - top, i == sel);
+
+  /* With fan translations the list can outgrow the screen, and scrolls; these
+   * say there is more in that direction. */
+  if (top > 0)
+    centred("...", (float)LANGSEL_MORE_UP_Y, 1.0f, 0.43f, 0.63f, 0.92f);
+  if (top + LANGSEL_VISIBLE_ROWS < count)
+    centred("...", (float)ROW_Y(LANGSEL_VISIBLE_ROWS), 1.0f,
+            0.43f, 0.63f, 0.92f);
 
   centred("CHANGE THIS LATER BY HOLDING L WHILE THE GAME STARTS",
           (float)LANGSEL_HINT_Y, 1.0f, 0.33f, 0.40f, 0.50f);
@@ -175,7 +196,8 @@ void langsel_watch_begin(void) {
   sceKernelStartThread(th, 0, NULL);
 }
 
-int langsel_run(int current, int have_key, int *out) {
+int langsel_run(int current, int have_key, const char *const *extra, int nextra,
+                int *out) {
   /* The Ext2 reader, like input_patch.c: main() has already selected
    * ANALOG_WIDE, and this is the reader known to work under it on hardware. A
    * read that returns nothing leaves the buttons zero, which the loop below
@@ -216,13 +238,22 @@ int langsel_run(int current, int have_key, int *out) {
   const char *footer;
   enter_buttons(&btn_ok, &btn_cancel, &footer);
 
-  int sel = (current >= 0 && current < LANG_COUNT) ? current : INI_LANG_EN;
+  const char *rows[LANGSEL_MAX_ROWS];
+  int count = 0;
+  for (int i = 0; i < LANGSEL_BUILTIN; i++) rows[count++] = kNames[i];
+  for (int i = 0; i < nextra && count < LANGSEL_MAX_ROWS; i++)
+    rows[count++] = extra[i];
+
+  int sel = (current >= 0 && current < count) ? current : INI_LANG_EN;
+  int top = 0;
+  if (sel >= LANGSEL_VISIBLE_ROWS) top = sel - LANGSEL_VISIBLE_ROWS + 1;
   unsigned prev = pad.buttons;
   uint64_t idle = sceKernelGetProcessTimeWide();
   int confirmed = 0;
 
-  log_printf("[langsel] open (current %s, %s)", ini_language_code(current),
-             have_key ? "L held" : "no Language key yet");
+  log_printf("[langsel] open (current row %d, %s, %d fan translation%s)",
+             current, have_key ? "L held" : "no Language key yet",
+             count - LANGSEL_BUILTIN, count - LANGSEL_BUILTIN == 1 ? "" : "s");
 
   for (;;) {
     memset(&pad, 0, sizeof pad);
@@ -231,8 +262,10 @@ int langsel_run(int current, int have_key, int *out) {
     if (pad.buttons != prev) idle = sceKernelGetProcessTimeWide();
     prev = pad.buttons;
 
-    if (edge & SCE_CTRL_UP)   sel = (sel + LANG_COUNT - 1) % LANG_COUNT;
-    if (edge & SCE_CTRL_DOWN) sel = (sel + 1) % LANG_COUNT;
+    if (edge & SCE_CTRL_UP)   sel = (sel + count - 1) % count;
+    if (edge & SCE_CTRL_DOWN) sel = (sel + 1) % count;
+    if (sel < top) top = sel;
+    if (sel >= top + LANGSEL_VISIBLE_ROWS) top = sel - LANGSEL_VISIBLE_ROWS + 1;
 
     if (edge & btn_ok) { confirmed = 1; break; }
     if (edge & btn_cancel) break;
@@ -247,7 +280,7 @@ int langsel_run(int current, int have_key, int *out) {
       break;
     }
 
-    draw(sel, footer);
+    draw(rows, count, sel, top, footer);
 
     /* Whether vglSwapBuffers waits for vblank is vitaGL's business, not ours,
      * so the poll rate is pinned here: fast enough that a press never feels
@@ -257,7 +290,10 @@ int langsel_run(int current, int have_key, int *out) {
 
   if (confirmed) {
     *out = sel;
-    log_printf("[langsel] chose %s (id %d)", ini_language_code(sel), sel);
+    if (sel < LANGSEL_BUILTIN)
+      log_printf("[langsel] chose %s (id %d)", ini_language_code(sel), sel);
+    else
+      log_printf("[langsel] chose fan translation row %d (%s)", sel, rows[sel]);
   } else {
     log_printf("[langsel] dismissed without choosing");
   }
@@ -268,8 +304,9 @@ int langsel_run(int current, int have_key, int *out) {
 
 void langsel_watch_begin(void) { }
 
-int langsel_run(int current, int have_key, int *out) {
-  (void)current; (void)have_key; (void)out;
+int langsel_run(int current, int have_key, const char *const *extra, int nextra,
+                int *out) {
+  (void)current; (void)have_key; (void)extra; (void)nextra; (void)out;
   return 0;
 }
 

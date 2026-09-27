@@ -243,6 +243,11 @@
 #define LANGSEL_HL_H              44    // highlight reads as a row, not a label
 #define LANGSEL_HL_PAD            6
 #define LANGSEL_HINT_Y            452
+// Fan translations (translation.h) add rows past the five languages; beyond
+// this many the list scrolls, with "..." marking more above or below. The
+// lower marker sits in the slot after the last visible row.
+#define LANGSEL_VISIBLE_ROWS      5
+#define LANGSEL_MORE_UP_Y         124
 #define LANGSEL_FOOTER_Y          486
 
 // How many times to dump the game's GL state after it takes over. The art can

@@ -10,6 +10,7 @@
 #include "config.h"
 #include "log.h"
 #include "obbzip.h"
+#include "translation.h"
 
 #define MAX_HINTS  256
 #define ARENA_SIZE (48 * 1024)
@@ -191,17 +192,32 @@ const char *hints_loading(void) {
   return g_loading[0] ? g_loading : NULL;
 }
 
+/* Where the table lives: stored inside main.obb, or -- for a fan translation
+ * (translation.h) -- a plain file on the card. */
+typedef struct {
+  ObbZip *z;
+  unsigned long long base;   /* the table's first byte within the zip */
+  SceUID fd;                 /* >= 0 when the table is a card file */
+} TlkSrc;
+
+static int tlk_pread(const TlkSrc *t, unsigned long long off, void *dst,
+                     unsigned len) {
+  if (t->fd >= 0)
+    return sceIoPread(t->fd, dst, len, (SceOff)off) == (int)len;
+  return obbzip_pread(t->z, t->base + off, dst, len);
+}
+
 /* One string out of an open TLK. The entry table is fixed-width records from
  * byte 20, each carrying an offset into the string block and a length. */
-static int tlk_string(ObbZip *z, unsigned long long tlk, unsigned stroff,
-                      unsigned nstr, unsigned strref, char *out, unsigned outsz) {
+static int tlk_string(const TlkSrc *t, unsigned stroff, unsigned nstr,
+                      unsigned strref, char *out, unsigned outsz) {
   if (strref >= nstr) return 0;
   unsigned char ent[40];
-  if (!obbzip_pread(z, tlk + 20 + (unsigned long long)strref * 40, ent, sizeof ent))
+  if (!tlk_pread(t, 20 + (unsigned long long)strref * 40, ent, sizeof ent))
     return 0;
   unsigned so = rd32(ent + 28), sz = rd32(ent + 32);
   if (!sz || sz >= outsz) return 0;
-  if (!obbzip_pread(z, tlk + stroff + so, out, sz)) return 0;
+  if (!tlk_pread(t, (unsigned long long)stroff + so, out, sz)) return 0;
   out[sz] = '\0';
   return (int)sz;
 }
@@ -210,6 +226,7 @@ int hints_load(LzmaUncompressFn lzma, int lang) {
   uint64_t t0 = sceKernelGetProcessTimeWide();
   unsigned char *key = NULL, *bzf = NULL, *tda = NULL;
   unsigned *refs = NULL;
+  TlkSrc tlk = { NULL, 0, -1 };
   if (!lzma) { log_printf("[hints] no LZMA decompressor"); return 0; }
   ObbZip *z = obbzip_open(OBB_MAIN_PATH);
   if (!z) { log_printf("[hints] cannot read %s as a zip", OBB_MAIN_PATH); return 0; }
@@ -249,25 +266,34 @@ int hints_load(LzmaUncompressFn lzma, int lang) {
   if (nref <= 0) { log_printf("[hints] loadscreenhints held no StrRefs"); goto done; }
 
   /* The table for the chosen language, falling back to the English one. Each
-   * is 5+ MB, so only the records we actually want are read. */
-  char tlkname[32];
-  if (lang == INI_LANG_EN)
-    strcpy(tlkname, "dialog.tlk");
-  else
-    snprintf(tlkname, sizeof tlkname, "dialog%s.tlk", ini_language_code(lang));
-
-  unsigned long long tlk = 0;
+   * is 5+ MB, so only the records we actually want are read. A fan
+   * translation's own table comes first, so the tips match the game's text. */
+  char tlkname[320];
   unsigned tlk_len = 0;
-  if (!obbzip_locate(z, tlkname, &tlk, &tlk_len)) {
-    log_printf("[hints] no %s -- falling back to English", tlkname);
-    strcpy(tlkname, "dialog.tlk");
-    if (!obbzip_locate(z, tlkname, &tlk, &tlk_len)) {
-      log_printf("[hints] no dialog.tlk either");
-      goto done;
+  tlk.z = z;
+  if (translation_path("tv_dialog.tlk", tlkname, sizeof tlkname)) {
+    tlk.fd = sceIoOpen(tlkname, SCE_O_RDONLY, 0);
+    if (tlk.fd < 0)
+      log_printf("[hints] cannot open %s (0x%08x) -- using the game's own table",
+                 tlkname, (unsigned)tlk.fd);
+  }
+  if (tlk.fd < 0) {
+    if (lang == INI_LANG_EN)
+      strcpy(tlkname, "dialog.tlk");
+    else
+      snprintf(tlkname, sizeof tlkname, "dialog%s.tlk", ini_language_code(lang));
+
+    if (!obbzip_locate(z, tlkname, &tlk.base, &tlk_len)) {
+      log_printf("[hints] no %s -- falling back to English", tlkname);
+      strcpy(tlkname, "dialog.tlk");
+      if (!obbzip_locate(z, tlkname, &tlk.base, &tlk_len)) {
+        log_printf("[hints] no dialog.tlk either");
+        goto done;
+      }
     }
   }
   unsigned char head[20];
-  if (!obbzip_pread(z, tlk, head, sizeof head) || memcmp(head, "TLK V3.0", 8) != 0) {
+  if (!tlk_pread(&tlk, 0, head, sizeof head) || memcmp(head, "TLK V3.0", 8) != 0) {
     log_printf("[hints] %s header is not TLK V3.0", tlkname);
     goto done;
   }
@@ -278,13 +304,13 @@ int hints_load(LzmaUncompressFn lzma, int lang) {
 
   char buf[512];
   for (int i = 0; i < nref && g_n < MAX_HINTS; i++) {
-    int sz = tlk_string(z, tlk, stroff, nstr, refs[i], buf, sizeof buf);
+    int sz = tlk_string(&tlk, stroff, nstr, refs[i], buf, sizeof buf);
     if (sz > 0) arena_put(buf, (unsigned)sz);
   }
 
   /* The boot screen's own heading, from the same table rather than from a
    * translation this port would have had to invent. */
-  if (tlk_string(z, tlk, stroff, nstr, LOADING_STRREF, g_loading,
+  if (tlk_string(&tlk, stroff, nstr, LOADING_STRREF, g_loading,
                  sizeof g_loading) > 0)
     log_printf("[hints] StrRef %d (\"Loading\") in %s is \"%s\"",
                LOADING_STRREF, tlkname, g_loading);
@@ -298,6 +324,7 @@ int hints_load(LzmaUncompressFn lzma, int lang) {
              g_used, (unsigned)ARENA_SIZE);
 
 done:
+  if (tlk.fd >= 0) sceIoClose(tlk.fd);
   free(refs);
   free(tda);
   free(bzf);
