@@ -255,18 +255,18 @@ you a save. They are listed because you may hit them. Save regularly.
 
 ### Recently fixed
 
-- **Footsteps, doors and containers were very quiet** *(not released yet)*.
+- **Footsteps, doors and containers were very quiet** *(v0.3.0)*.
   Early builds of the port misread decimal numbers in `swkotor.ini`, and the
   engine saved its 2D/3D sound balance at its lowest setting, which plays every
   positioned sound at a tenth of its volume. The port now resets that one value
   to the engine default on launch, so an ini carried over from an old build is
   repaired automatically.
-- **Sound thinning out, then going silent, over a long session** *(not released
-  yet)*. The game has 45 sound slots and frees one only when it sees the sound
+- **Sound thinning out, then going silent, over a long session** *(v0.3.0)*.
+  The game has 45 sound slots and frees one only when it sees the sound
   end; some never got that, and after an hour or so every slot was taken. Dead
   slots are now handed back, and an 87-minute session stayed clean.
-- **World geometry tearing into spikes** after 20–40 minutes *(not released
-  yet)*. The GPU's vertex-shader pool filled up and new shaders silently failed.
+- **World geometry tearing into spikes** after 20–40 minutes *(v0.3.0)*.
+  The GPU's vertex-shader pool filled up and new shaders silently failed.
   The pool is four times larger and now reclaims idle entries; an 83-minute
   session had no failures.
 - **Audio mixer lock contention:** the Vita mixer now snapshots active channels,
