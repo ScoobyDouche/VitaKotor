@@ -2251,6 +2251,63 @@ static char *read_whole_ini(const char *path) {
   return text;
 }
 
+// Replace the ini with `need` bytes of `out`, via a temp file: an interrupted
+// write then costs the new setting and never the file that was already there.
+static int ini_replace_file(const char *path, const char *out, size_t need) {
+  char tmp[256];
+  snprintf(tmp, sizeof(tmp), "%s.new", path);
+  SceUID fd = sceIoOpen(tmp, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
+  int wrote = (fd >= 0) ? sceIoWrite(fd, out, (unsigned)need) : -1;
+  if (fd >= 0) sceIoClose(fd);
+
+  if (wrote != (int)need) {
+    log_printf("[ini] could not write %s (%d of %u bytes) -- %s unchanged",
+               tmp, wrote, (unsigned)need, path);
+    sceIoRemove(tmp);
+    return 0;
+  }
+
+  sceIoRemove(path);                      // FAT will not rename onto a live name
+  int r = sceIoRename(tmp, path);
+  if (r < 0) {
+    log_printf("!!! [ini] wrote %s but could not rename it to %s (0x%08x)",
+               tmp, path, (unsigned)r);
+    return 0;
+  }
+  return 1;
+}
+
+// Undo a 2D3D Bias the engine saved while strtod was broken.
+//
+// The engine scales every positional sound by this bias when it is below 1
+// (and every flat one by 2 - bias when above), and clamps it to 0.1..1.9. Its
+// own default is 1.0. Before the softfp strtod shim, AsFLOAT read garbage, the
+// clamp turned that into 0.1, and the engine wrote "0.10" back -- after which
+// every boot read 0.10 honestly. log195: footsteps at volume 0.05, doors and
+// footlockers 0.09, blasters 0.10, against ambience at 0.2-0.6, all with SFX
+// at 100. Exactly the floor is the signature; nobody picks it by hand, and any
+// other value is left alone.
+static void repair_sound_bias(void) {
+  const char *path = g_ini_path ? g_ini_path : kIniPaths[0];
+  char *text = read_whole_ini(path);
+  if (!text) return;
+  char val[32];
+  if (!ini_get(text, "Sound Options", "2D3D Bias", val, sizeof(val)) ||
+      strtof(val, NULL) > 0.1001f) {
+    free(text);
+    return;
+  }
+  size_t need = ini_set(text, "Sound Options", "2D3D Bias", "1.00", NULL, 0);
+  char *out = malloc(need + 1);
+  if (out) ini_set(text, "Sound Options", "2D3D Bias", "1.00", out, need + 1);
+  free(text);
+  if (!out) return;
+  if (ini_replace_file(path, out, need))
+    log_printf("[snd] swkotor.ini: 2D3D Bias=%s was the clamp floor left by the old "
+               "strtod bug -- reset to the engine default 1.00", val);
+  free(out);
+}
+
 // Save the picked language into swkotor.ini.
 //
 // The file belongs to the user and to the engine, which rewrites it whenever
@@ -2290,28 +2347,9 @@ static void write_language(int id, const char *translation) {
     log_printf("[lang] out of memory writing %s", path);
     return;
   }
-
-  char tmp[256];
-  snprintf(tmp, sizeof(tmp), "%s.new", path);
-  SceUID fd = sceIoOpen(tmp, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
-  int wrote = (fd >= 0) ? sceIoWrite(fd, out, (unsigned)need) : -1;
-  if (fd >= 0) sceIoClose(fd);
+  int ok = ini_replace_file(path, out, need);
   free(out);
-
-  if (wrote != (int)need) {
-    log_printf("[lang] could not write %s (%d of %u bytes) -- %s unchanged",
-               tmp, wrote, (unsigned)need, path);
-    sceIoRemove(tmp);
-    return;
-  }
-
-  sceIoRemove(path);                      // FAT will not rename onto a live name
-  int r = sceIoRename(tmp, path);
-  if (r < 0) {
-    log_printf("!!! [lang] wrote %s but could not rename it to %s (0x%08x)",
-               tmp, path, (unsigned)r);
-    return;
-  }
+  if (!ok) return;
   log_printf("[lang] saved [Game Options] Language=%s%s%s to %s", code,
              translation ? " Translation=" : "", translation ? translation : "",
              path);
@@ -2825,6 +2863,7 @@ int main(int argc, char *argv[]) {
   // Read the language out of swkotor.ini before the JNI tables go up: the
   // game polls getCurrentLanguage from its first frame onwards.
   resolve_language();
+  repair_sound_bias();
 
   // Build the fake JNI tables (this build has no JNI_OnLoad; see RECON-JNI.md).
   jni_setup();
