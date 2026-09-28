@@ -63,6 +63,8 @@ add_executable(KOTOR
   loader/input_patch.c
   loader/ime_patch.c
   loader/gl_patch.c
+  loader/geo_probe.c
+  loader/gxm_patcher.c
   loader/glsl_prep.c
   loader/crash.c
   loader/heap.c
@@ -87,6 +89,12 @@ endif()
 
 target_link_libraries(KOTOR
   -Wl,--whole-archive pthread -Wl,--no-whole-archive
+  # vitaGL re-creates a patched vertex program on every draw and never releases
+  # one; gxm_patcher.c keeps the pool from filling (see gxm_patcher.h).
+  -Wl,--wrap=sceGxmShaderPatcherCreateVertexProgram
+  -Wl,--wrap=sceGxmShaderPatcherCreateFragmentProgram
+  -Wl,--wrap=sceGxmShaderPatcherForceUnregisterProgram
+  -Wl,--wrap=sceGxmSetVertexProgram
   # real-code archives first, then the libs they depend on (stdc++, m) so the
   # linker resolves left-to-right without undefined std:: references
   SDL2

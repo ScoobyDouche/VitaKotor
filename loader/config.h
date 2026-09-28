@@ -319,6 +319,14 @@
 // vitaGL gap. Raise to 256 to restore the bring-up trace.
 #define GLGET_TRACE_LIMIT 0
 
+// Geometry-spike probe (geo_probe.c). Samples a few draws a frame for vertex
+// values no KOTOR model can have, indices past the end of their buffer, and
+// attribute layouts vitaGL's 16-bit offset cannot express, and hashes every
+// vertex buffer at upload to catch bytes that change with no GL write. Costs
+// roughly 2 MB/s of buffer reads. 0 compiles all of it out. Off: log191/192
+// found the vertex data clean every time; the spikes were the shader patcher.
+#define GEOM_PROBE 0
+
 // Event-driven frame hitch trace. Timing is sampled once at swap with no
 // per-draw clock calls; only frames slower than this threshold emit a line.
 // Rate limiting prevents a sustained slow scene from turning logging into the

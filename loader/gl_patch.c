@@ -35,6 +35,8 @@
 #include "sdl_patch.h"
 #include "log.h"
 #include "loadscreen.h"
+#include "geo_probe.h"
+#include "gxm_patcher.h"
 
 static inline float u2f(uint32_t u) { union { uint32_t u; float f; } c; c.u = u; return c.f; }
 
@@ -308,6 +310,9 @@ static void glLinkProgram_t(GLuint p) {
   g_link_us_frame += sceKernelGetProcessTimeWide() - link_start;
   g_links_frame++;
   g_cur_prog = 0;             /* relinking can change what this id draws with */
+#if GEOM_PROBE
+  geo_note_link(p);
+#endif
   GLint ok = 0;
   glGetProgramiv(p, GL_LINK_STATUS, &ok);
   if (!ok) {
@@ -469,6 +474,9 @@ static void glDrawArrays_t(GLenum mode, GLint first, GLsizei count) {
                g_textdraw_n++, (unsigned)mode, (int)count, g_cur_tex);
   tex_note_draw(g_cur_tex);
   g_draw_n++; g_arrays_win++; g_arrays_frame++; g_arrays_tot++; draw_note_source();
+#if GEOM_PROBE
+  geo_check_arrays(g_cur_prog, first, count);
+#endif
   glDrawArrays(mode, first, count);
 }
 static void glDrawElements_t(GLenum mode, GLsizei count, GLenum type, const void *idx) {
@@ -480,6 +488,9 @@ static void glDrawElements_t(GLenum mode, GLsizei count, GLenum type, const void
                g_textdraw_n++, (unsigned)mode, (int)count, g_cur_tex);
   tex_note_draw(g_cur_tex);
   g_draw_n++; g_elements_win++; g_elements_frame++; g_elements_tot++; draw_note_source();
+#if GEOM_PROBE
+  geo_check_elements(g_cur_prog, count, type, idx);
+#endif
   glDrawElements(mode, count, type, idx);
 }
 void gl_patch_on_swap(uint64_t swap_begin_us, uint64_t swap_end_us) {
@@ -503,6 +514,10 @@ void gl_patch_on_swap(uint64_t swap_begin_us, uint64_t swap_end_us) {
   engine_perf_snapshot(&engine, swap_begin_us);
   sdl_perf_snapshot(&sdl);
   frame++;
+  gxmp_on_swap();
+#if GEOM_PROBE
+  geo_on_swap();
+#endif
 
   if (engine.policy_seq != policy_seen) {
     unsigned bucket = engine.selected_skip == 0 ? 0 : engine.selected_skip == 1 ? 1 :
@@ -608,6 +623,10 @@ void gl_patch_on_swap(uint64_t swap_begin_us, uint64_t swap_end_us) {
                (unsigned)(g_tex_live >> 10), g_tex_n_live, (unsigned)(g_tex_peak >> 10),
                (unsigned)(g_tex_up >> 10), (unsigned)(g_tex_down >> 10), g_tex_untracked,
                 g_tex16_n, (unsigned)(g_tex16_saved >> 10));
+    gxmp_window_report();
+#if GEOM_PROBE
+    geo_window_report();
+#endif
     log_printf("[GL]   policy groups skip 0/1/3/6/10/other=%u/%u/%u/%u/%u/%u "
                "latest ai=%.1f->%u next=%.1f displayFPS=%.1f movieFPS=%d; "
                "SDL_Delay lifetime=%u requested=%u ms actual=%u ms lifetimeMax=%u ms",
@@ -939,6 +958,9 @@ static void glVertexAttribPointer_e(GLuint index, GLint size, GLenum type, GLboo
     if ((uintptr_t)pointer > g_vap_max_off) g_vap_max_off = (uintptr_t)pointer;
     if ((uintptr_t)pointer > 0xFFFFu) g_vap_over64k++;
   }
+#if GEOM_PROBE
+  geo_note_attrib(index, size, type, stride, pointer, g_cur_arraybuf);
+#endif
   glVertexAttribPointer(index, size, type, normalized, stride, pointer);
 }
 
@@ -1219,6 +1241,9 @@ static void glGenBuffers_e(GLsizei n, GLuint *b) { GLLOG("glGenBuffers(%d)", (in
 static void glBindBuffer_e(GLenum tg, GLuint b) {
   GLLOG("glBindBuffer(0x%x,%u)", (unsigned)tg, (unsigned)b);
   if (tg == GL_ARRAY_BUFFER) g_cur_arraybuf = b;
+#if GEOM_PROBE
+  geo_note_bind(tg, b);
+#endif
   glBindBuffer(tg, b);
 }
 static void glBufferData_e(GLenum tg, GLsizeiptr sz, const void *d, GLenum u) {
@@ -1226,7 +1251,34 @@ static void glBufferData_e(GLenum tg, GLsizeiptr sz, const void *d, GLenum u) {
   g_bufdata_win++; g_bufdata_frame++;
   if (sz > 0) g_bufdata_bytes_frame += (uint64_t)sz;
   glBufferData(tg, sz, d, u);
+#if GEOM_PROBE
+  geo_note_bufdata(tg, sz, d, u);
+#endif
 }
+#if GEOM_PROBE
+static void glBufferSubData_e(GLenum tg, GLintptr off, GLsizeiptr sz, const void *d) {
+  glBufferSubData(tg, off, sz, d);
+  geo_note_subdata(tg);
+}
+static void *glMapBuffer_e(GLenum tg, GLenum access) {
+  geo_note_map(tg);
+  return glMapBuffer(tg, access);
+}
+static GLboolean glUnmapBuffer_e(GLenum tg) {
+  GLboolean r = glUnmapBuffer(tg);
+  geo_note_unmap(tg);
+  return r;
+}
+static void glDeleteBuffers_e(GLsizei n, const GLuint *b) {
+  geo_note_delete(n, b);
+  glDeleteBuffers(n, b);
+}
+static void glEnableVertexAttribArray_e(GLuint i) { geo_note_enable(i, 1); glEnableVertexAttribArray(i); }
+static void glDisableVertexAttribArray_e(GLuint i) { geo_note_enable(i, 0); glDisableVertexAttribArray(i); }
+#define GEO_HOOK(probe, plain) (uintptr_t)&probe
+#else
+#define GEO_HOOK(probe, plain) (uintptr_t)&plain
+#endif
 static GLuint glCreateProgram_e(void) { GLLOG("glCreateProgram()"); GLuint p = glCreateProgram(); log_printf("[GL]  -> program %u", (unsigned)p); return p; }
 /* Redundant program-switch filter.
  *
@@ -1261,7 +1313,13 @@ static void glUseProgram_e(GLuint p) {
 #endif
   glUseProgram(p);
 }
-static void glDeleteProgram_e(GLuint p) { g_cur_prog = 0; glDeleteProgram(p); }
+static void glDeleteProgram_e(GLuint p) {
+  g_cur_prog = 0;
+#if GEOM_PROBE
+  geo_note_link(p);   /* a reused id must not inherit the old attribute mask */
+#endif
+  glDeleteProgram(p);
+}
 static void glScissor_e(GLint x, GLint y, GLsizei w, GLsizei h) { GLLOG("glScissor(%d,%d,%d,%d)", x, y, (int)w, (int)h); glScissor(x, y, w, h); }
 static void glClearStencil_e(GLint s) { GLLOG("glClearStencil(%d)", s); glClearStencil(s); }
 static GLenum glGetError_e(void) { GLenum e = glGetError(); GLLOG("glGetError() -> 0x%x", (unsigned)e); return e; }
@@ -1355,21 +1413,21 @@ static const so_default_dynlib gl_dynlib[] = {
   { "glBlendEquation",                   (uintptr_t)&glBlendEquation },
   { "glBlendEquationSeparate",           (uintptr_t)&glBlendEquationSeparate },
   { "glBlendFuncSeparate",               (uintptr_t)&glBlendFuncSeparate },
-  { "glBufferSubData",                   (uintptr_t)&glBufferSubData },
+  { "glBufferSubData",                   GEO_HOOK(glBufferSubData_e, glBufferSubData) },
   // GLES OES buffer-mapping ext: identical signatures to vitaGL's core maps.
-  { "glMapBufferOES",                    (uintptr_t)&glMapBuffer },
-  { "glUnmapBufferOES",                  (uintptr_t)&glUnmapBuffer },
+  { "glMapBufferOES",                    GEO_HOOK(glMapBuffer_e, glMapBuffer) },
+  { "glUnmapBufferOES",                  GEO_HOOK(glUnmapBuffer_e, glUnmapBuffer) },
   { "glCompressedTexImage2D",            (uintptr_t)&glCompressedTexImage2D },
   { "glCopyTexImage2D",                  (uintptr_t)&glCopyTexImage2D },
   { "glCopyTexSubImage2D",               (uintptr_t)&glCopyTexSubImage2D },
-  { "glDeleteBuffers",                   (uintptr_t)&glDeleteBuffers },
+  { "glDeleteBuffers",                   GEO_HOOK(glDeleteBuffers_e, glDeleteBuffers) },
   { "glDeleteFramebuffers",              (uintptr_t)&glDeleteFramebuffers },
   { "glDeleteProgram",                   (uintptr_t)&glDeleteProgram_e },
   { "glDeleteRenderbuffers",             (uintptr_t)&glDeleteRenderbuffers },
   { "glDeleteShader",                    (uintptr_t)&glDeleteShader },
   { "glDeleteTextures",                  (uintptr_t)&glDeleteTextures_e },
-  { "glDisableVertexAttribArray",        (uintptr_t)&glDisableVertexAttribArray },
-  { "glEnableVertexAttribArray",         (uintptr_t)&glEnableVertexAttribArray },
+  { "glDisableVertexAttribArray",        GEO_HOOK(glDisableVertexAttribArray_e, glDisableVertexAttribArray) },
+  { "glEnableVertexAttribArray",         GEO_HOOK(glEnableVertexAttribArray_e, glEnableVertexAttribArray) },
   { "glFinish",                          (uintptr_t)&glFinish },
   { "glFlush",                           (uintptr_t)&glFlush },
   { "glGenerateMipmap",                  (uintptr_t)&glGenerateMipmap },

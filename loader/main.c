@@ -36,6 +36,7 @@
 #include "heap.h"
 #include "bigalloc.h"
 #include "log.h"
+#include "gxm_patcher.h"
 
 #include <pthread.h>
 
@@ -2652,7 +2653,11 @@ static void *game_main_thread(void *arg) {
   log_printf(">>> vitaGL application shader cache storage = %p",
              (void *)vgl_shader_cache_path);
   vglSetupRuntimeShaderCompiler(SHARK_OPT_UNSAFE, SHARK_ENABLE, SHARK_ENABLE, SHARK_ENABLE);
+  // vitaGL's 1 MB vertex USSE pool filled in a 20-minute session (log192);
+  // gxm_patcher.c also frees idle variants, the bigger pool keeps that rare.
+  vglSetupShaderPatcher(GXMP_BUFFER_MEM, GXMP_VERTEX_USSE_MEM, GXMP_FRAGMENT_USSE_MEM);
   vglInitExtended(0, SCREEN_W, SCREEN_H, MEMORY_VITAGL_THRESHOLD_MB * 1024 * 1024, GL_MSAA_MODE);
+  gxmp_arm();
   log_printf(">>> vitaGL application shader cache: %s", vgl_shader_cache_path);
 
   // vitaGL ignores the return of sceGxmShaderPatcherCreate (gxm.c:561), so a
