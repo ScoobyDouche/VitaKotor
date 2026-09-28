@@ -117,6 +117,20 @@ static GLuint glCreateShader_t(GLenum type) {
   log_printf("[GL] glCreateShader(0x%x) -> %u", (unsigned)type, (unsigned)id);  // init vitashark
   return id;
 }
+/* Ubershader switch set, parsed from the source and carried to the program;
+ * see the shiny-armour note further down. */
+#define VAR_SKIN      0x01
+#define VAR_CUBEMAP   0x02
+#define VAR_BUMPMAP   0x04
+#define VAR_LIGHTMAP  0x08
+#define VAR_ALPHATEST 0x10
+#define VAR_FLATCUBE  0x20
+#define VAR_KNOWN     0x80          /* we parsed defines out of this source */
+
+#define GL_OBJ_MAX 256
+static uint8_t g_shader_var[GL_OBJ_MAX];
+static uint8_t g_prog_var[GL_OBJ_MAX];
+static unsigned g_cubedraw_n = 0, g_cubedraw_named = 0;
 
 static void glShaderSource_t(GLuint sh, GLsizei count, const GLchar *const *str, const GLint *len) {
   log_printf("[GL] glShaderSource(sh=%u, count=%d) ===begin dump===", (unsigned)sh, count);
@@ -220,6 +234,26 @@ static void glShaderSource_t(GLuint sh, GLsizei count, const GLchar *const *str,
     // the original so every offset in the buffer -- and the varying pre-pass that
     // runs next -- is untouched. `clamp` deliberately stays in the float domain:
     // GLSL ES 1.00 has no integer overload of clamp().
+    /* Which ubershader variant is this? The game writes the switches in as
+     * plain "#define USE_X 0|1" at the top of the joined source, so reading
+     * them costs a handful of strstr on a path that runs 60 times a session.
+     * Kept per shader id and OR'd onto the program at glAttachShader, which is
+     * what lets a draw say which variant it is drawing with. */
+    if (sh < GL_OBJ_MAX) {
+      static const struct { const char *name; uint8_t bit; } kVars[] = {
+        { "#define USE_SKIN 1",         VAR_SKIN      },
+        { "#define USE_CUBEMAP 1",      VAR_CUBEMAP   },
+        { "#define USE_BUMPMAP 1",      VAR_BUMPMAP   },
+        { "#define USE_LIGHTMAP 1",     VAR_LIGHTMAP  },
+        { "#define USE_ALPHATEST 1",    VAR_ALPHATEST },
+        { "#define USE_FLAT_CUBEMAP 1", VAR_FLATCUBE  },
+      };
+      uint8_t v = VAR_KNOWN;
+      for (unsigned i = 0; i < sizeof kVars / sizeof kVars[0]; i++)
+        if (strstr(joined, kVars[i].name)) v |= kVars[i].bit;
+      g_shader_var[sh] = v;
+    }
+
     int skin_fix = 0;
     if (SKIN_INDEX_ROUND_FIX) {
       static const char kOld[] = "ivec4(clamp(3.0 * a_matrixIndices, 0.0, 50.0))";
@@ -458,6 +492,37 @@ static uint8_t  g_tex16[TEXKIND_MAX];
 static unsigned g_tex16_n = 0;
 static uint64_t g_tex16_saved = 0;          /* bytes NOT spent, lifetime */
 
+/* ---- shiny-armour instrumentation -----------------------------------------
+ * The armour renders as a mirror of the room, and the shader says why it could:
+ *
+ *     color = mix(cubecolor, color, color.a);
+ *
+ * The blend weight is the DIFFUSE texture's alpha -- alpha 1 is matte, alpha 0
+ * is a full mirror. So either the alpha channel is not arriving, or those
+ * materials really are near-zero alpha and the fault is elsewhere. Six other
+ * explanations are already dead: the cube binding is correct (zero MISMATCH
+ * lines in log174), the cube uploads all six faces with full mip chains, cube
+ * faces bypass the 16-bit conversion entirely, glsl_prep only blanks `varying`
+ * in dead regions so it cannot select a branch, the 4444 channel order is right
+ * (a swapped one would wreck every GUI element with alpha, and the GUI is
+ * perfect), and log174 proves the compiled variant is USE_SKIN=1 -- so
+ * `#if USE_BUMPMAP && !USE_SKIN`, the branch that assigns the cube colour
+ * outright, is correctly not taken.
+ *
+ * That leaves one number nobody has ever looked at. tex16_pack already walks
+ * every texel of every RGBA texture, so the mean costs one add on a path that
+ * is already reading the byte. Record it, then print it for the textures that
+ * are actually bound as diffuse on a cubemap draw. */
+static uint8_t  g_tex_alpha[TEXKIND_MAX];   /* mean alpha, 0-255; 255 if opaque */
+
+/* Per-unit 2D binding shadow. Declared here rather than with the redundant-bind
+ * filter that owns it, because the cubemap draw probe below needs unit 0 and
+ * runs earlier in the file. */
+#define GL_MAX_TEXUNITS 8
+static unsigned g_active_unit = 0;
+static GLuint   g_bound2d[GL_MAX_TEXUNITS];
+
+
 static GLuint   g_cur_arraybuf = 0;      /* last glBindBuffer(GL_ARRAY_BUFFER) */
 
 static inline void draw_note_source(void) {
@@ -479,6 +544,54 @@ static void glDrawArrays_t(GLenum mode, GLint first, GLsizei count) {
 #endif
   glDrawArrays(mode, first, count);
 }
+/* Name the diffuse texture behind a cubemap draw, and its alpha.
+ *
+ * "color = mix(cubecolor, color, color.a)" makes the diffuse alpha the entire
+ * reflection mask, so the armour being a mirror means color.a is near zero for
+ * those texels. This prints the number for every distinct texture that is
+ * actually drawn through a USE_CUBEMAP program, once each, so one session says
+ * whether the alpha channel is arriving at all.
+ *
+ * Read it like this. mean alpha near 255 and the armour still mirrored means
+ * the alpha survives upload and is being lost or ignored later -- look at the
+ * sampler, not the texture. Mean alpha near 0 means the texture really is a
+ * full-mirror mask, the blend is behaving, and the fault is that the cube it
+ * mirrors is the wrong content. Anything in between is the real material and
+ * says the port is closer than it looks.
+ *
+ * A texture reported "opaque" is one that never went through the 4444 packer,
+ * i.e. arrived as RGB with no alpha channel at all -- and for a cubemap
+ * material that alone is the bug, because the shader would then read alpha 1
+ * and blend in NO reflection. */
+static void cube_draw_note(void) {
+  uint8_t v = (g_cur_prog < GL_OBJ_MAX) ? g_prog_var[g_cur_prog] : 0;
+  if (!(v & VAR_KNOWN) || !(v & VAR_CUBEMAP)) return;
+
+  g_cubedraw_n++;
+  GLuint t = g_bound2d[0];                      /* u_texture0Sampler is unit 0 */
+  if (!t || t >= TEXKIND_MAX) return;
+
+  static uint8_t seen[TEXKIND_MAX];
+  if (seen[t] || g_cubedraw_named >= 48) return;
+  seen[t] = 1;
+  g_cubedraw_named++;
+
+  int is4444 = (g_tex16[t] == TEX16_4444);
+  log_printf("[GL] cubemap draw: prog=%u variant=%s%s%s%s%s diffuse tex=%u %dx%d %s "
+             "mean alpha=%u/255%s",
+             (unsigned)g_cur_prog,
+             (v & VAR_SKIN)      ? "SKIN "      : "",
+             (v & VAR_BUMPMAP)   ? "BUMP "      : "",
+             (v & VAR_LIGHTMAP)  ? "LIGHTMAP "  : "",
+             (v & VAR_ALPHATEST) ? "ALPHATEST " : "",
+             (v & VAR_FLATCUBE)  ? "FLATCUBE "  : "",
+             (unsigned)t,
+             t < TEXDIM_MAX ? (int)g_tex_w[t] : 0, t < TEXDIM_MAX ? (int)g_tex_h[t] : 0,
+             is4444 ? "RGBA4444" : (g_tex16[t] == TEX16_565 ? "RGB565" : "opaque/unconverted"),
+             is4444 ? g_tex_alpha[t] : 255u,
+             is4444 ? "" : "  <<< no alpha channel: shader can blend NO reflection");
+}
+
 static void glDrawElements_t(GLenum mode, GLsizei count, GLenum type, const void *idx) {
   if (loadscreen_active()) loadscreen_end();   /* first real frame: hand over */
   if (g_draw_n < 20) log_printf("[GL] glDrawElements(mode=0x%x, count=%d, type=0x%x) #%d",
@@ -487,6 +600,7 @@ static void glDrawElements_t(GLenum mode, GLsizei count, GLenum type, const void
     log_printf("[textdraw#%d] glDrawElements(mode=0x%x, count=%d) tex=%u",
                g_textdraw_n++, (unsigned)mode, (int)count, g_cur_tex);
   tex_note_draw(g_cur_tex);
+  cube_draw_note();
   g_draw_n++; g_elements_win++; g_elements_frame++; g_elements_tot++; draw_note_source();
 #if GEOM_PROBE
   geo_check_elements(g_cur_prog, count, type, idx);
@@ -610,7 +724,8 @@ void gl_patch_on_swap(uint64_t swap_begin_us, uint64_t swap_end_us) {
     if (o) log_printf("[GL]   draws by texture size (lifetime): %s", ab);
     log_printf("[GL]   per-window: clientArrayDraws=%u vboDraws=%u  texBinds=%u "
                "(skipped %u = %u%%) progSwitches=%u (skipped %u = %u%%) "
-               "bufferUploads=%u nonTex2DBinds=%u maxAttrOff=0x%x over64k=%u\n"
+               "bufferUploads=%u nonTex2DBinds=%u maxAttrOff=0x%x over64k=%u "
+               "cubemapDraws=%u (%u diffuse textures named)\n"
                "[GL]   textures live: %u KB in %u ids (peak %u KB); "
                "lifetime %u KB up / %u KB released, %u untracked ids; "
                "16-bit: %u ids, %u KB saved",
@@ -619,7 +734,7 @@ void gl_patch_on_swap(uint64_t swap_begin_us, uint64_t swap_end_us) {
                g_prog_win, g_prog_skipped_win,
                g_prog_win ? (g_prog_skipped_win * 100 / g_prog_win) : 0,
                g_bufdata_win, g_nontex2d_binds,
-               (unsigned)g_vap_max_off, g_vap_over64k,
+               (unsigned)g_vap_max_off, g_vap_over64k, g_cubedraw_n, g_cubedraw_named,
                (unsigned)(g_tex_live >> 10), g_tex_n_live, (unsigned)(g_tex_peak >> 10),
                (unsigned)(g_tex_up >> 10), (unsigned)(g_tex_down >> 10), g_tex_untracked,
                 g_tex16_n, (unsigned)(g_tex16_saved >> 10));
@@ -752,9 +867,32 @@ static void glDisable_e(GLenum cap) { GLLOG("glDisable(0x%x)", (unsigned)cap); g
  *     otherwise carries a 2D texture. Forgetting the entry costs one redundant
  *     bind on the rare cube path and cannot draw the wrong texture.
  * Set GL_FILTER_REDUNDANT_BINDS to 0 in config.h to rule this out. */
-#define GL_MAX_TEXUNITS 8
-static unsigned g_active_unit = 0;
-static GLuint   g_bound2d[GL_MAX_TEXUNITS];
+
+/* Sampler-unit assignments. glUniform1i is how every sampler in kotor.frag is
+ * pointed at a texture unit, and it has been forwarded unwrapped all along --
+ * so nothing in any log so far says which unit u_texture2Sampler actually
+ * reads. If the cube sampler resolves to a unit carrying an ordinary 2D
+ * texture, textureCube() returns that room texture and every USE_CUBEMAP
+ * material -- armour, vibroblades, anything shiny -- takes on the colour of
+ * the room, with no GL error and no MISMATCH. Log each distinct
+ * (program, location, unit) once; there are only a handful. */
+static struct { GLuint prog; GLint loc; GLint val; } g_u1i[32];
+static unsigned g_u1i_n = 0;
+static void glUniform1i_e(GLint location, GLint v) {
+  if (v >= 0 && v < GL_MAX_TEXUNITS) {          /* plausible sampler unit */
+    unsigned i;
+    for (i = 0; i < g_u1i_n; i++)
+      if (g_u1i[i].prog == g_cur_prog && g_u1i[i].loc == location && g_u1i[i].val == v) break;
+    if (i == g_u1i_n && g_u1i_n < 32) {
+      g_u1i[g_u1i_n].prog = g_cur_prog; g_u1i[g_u1i_n].loc = location;
+      g_u1i[g_u1i_n].val = v; g_u1i_n++;
+      log_printf("[GL] sampler: prog=%u loc=%d -> texture unit %d",
+                 (unsigned)g_cur_prog, (int)location, (int)v);
+    }
+  }
+  glUniform1i(location, v);
+}
+
 
 static void glActiveTexture_e(GLenum t) {
   GLLOG("glActiveTexture(0x%x)", (unsigned)t);
@@ -990,7 +1128,9 @@ static GLint glGetAttribLocation_e(GLuint prog, const GLchar *name) {
 }
 static GLint glGetUniformLocation_e(GLuint prog, const GLchar *name) {
   GLint l = glGetUniformLocation(prog, name);
-  if (name && strstr(name, "bone"))
+  /* Samplers as well as bones: the unit logged by glUniform1i_e is only useful
+   * if the location can be named, and u_texture2Sampler is the cube. */
+  if (name && (strstr(name, "bone") || strstr(name, "Sampler")))
     log_printf("[vtx] uniformLoc prog=%u \"%s\" -> %d", (unsigned)prog, name, (int)l);
   return l;
 }
@@ -1013,7 +1153,9 @@ static GLsizei gl_rt_align_w(GLsizei w) { return (w > 0 && (w & 7)) ? ((w + 7) &
 static const uint8_t k_bayer4[16] = { 0, 8, 2,10, 12, 4,14, 6,  3,11, 1, 9, 15, 7,13, 5 };
 
 /* Writes w*h uint16 into dst. src is tightly packed 8-bit RGB(A). */
-static void tex16_pack(uint16_t *dst, const unsigned char *src, int w, int h, int kind) {
+static void tex16_pack(uint16_t *dst, const unsigned char *src, int w, int h, int kind,
+                       unsigned *mean_a_out) {
+  uint64_t asum = 0;
   for (int y = 0; y < h; y++) {
     const unsigned char *sp = src + (size_t)y * w * (kind == TEX16_4444 ? 4 : 3);
     uint16_t *d = dst + (size_t)y * w;
@@ -1024,6 +1166,7 @@ static void tex16_pack(uint16_t *dst, const unsigned char *src, int w, int h, in
         unsigned g4 = (sp[1] + dth) >> 4; if (g4 > 15) g4 = 15;
         unsigned b4 = (sp[2] + dth) >> 4; if (b4 > 15) b4 = 15;
         unsigned a4 = (sp[3] + dth) >> 4; if (a4 > 15) a4 = 15;
+        asum += sp[3];
         d[x] = (uint16_t)((r4 << 12) | (g4 << 8) | (b4 << 4) | a4);
         sp += 4;
       } else {
@@ -1035,6 +1178,9 @@ static void tex16_pack(uint16_t *dst, const unsigned char *src, int w, int h, in
       }
     }
   }
+  if (mean_a_out)
+    *mean_a_out = (kind == TEX16_4444 && w && h)
+                    ? (unsigned)(asum / ((uint64_t)w * h)) : 255u;
 }
 
 /* The one 2D upload path: convert when we can, charge what was really spent,
@@ -1046,7 +1192,10 @@ static void tex_upload2d(GLenum tg, GLint l, GLint ifmt, GLsizei w, GLsizei h,
   if (px && kind != TEX16_NONE && ty == GL_UNSIGNED_BYTE && w > 0 && h > 0) {
     uint16_t *cv = (uint16_t *)malloc((size_t)w * h * 2);
     if (cv) {
-      tex16_pack(cv, (const unsigned char *)px, w, h, kind);
+      unsigned mean_a = 255;
+      tex16_pack(cv, (const unsigned char *)px, w, h, kind, &mean_a);
+      if (g_cur_tex && g_cur_tex < TEXKIND_MAX && l == 0)
+        g_tex_alpha[g_cur_tex] = (uint8_t)mean_a;
       GLenum ty16 = (kind == TEX16_4444) ? GL_UNSIGNED_SHORT_4_4_4_4
                                          : GL_UNSIGNED_SHORT_5_6_5;
       if (g_cur_tex && g_cur_tex < TEXKIND_MAX && l == 0) {
@@ -1196,7 +1345,9 @@ static void glTexSubImage2D_e(GLenum tg, GLint l, GLint xo, GLint yo, GLsizei w,
       ((kind == TEX16_4444 && f == GL_RGBA) || (kind == TEX16_565 && f == GL_RGB))) {
     uint16_t *cv = (uint16_t *)malloc((size_t)w * h * 2);
     if (cv) {
-      tex16_pack(cv, (const unsigned char *)px, w, h, kind);
+      /* A sub-upload covers part of the image, so its mean says nothing about
+       * the whole texture -- take the conversion, discard the statistic. */
+      tex16_pack(cv, (const unsigned char *)px, w, h, kind, NULL);
       glTexSubImage2D(tg, l, xo, yo, w, h, f,
                       (kind == TEX16_4444) ? GL_UNSIGNED_SHORT_4_4_4_4
                                            : GL_UNSIGNED_SHORT_5_6_5, cv);
@@ -1304,6 +1455,14 @@ static GLuint glCreateProgram_e(void) { GLLOG("glCreateProgram()"); GLuint p = g
  * The shadow is dropped whenever a program is linked or deleted, since either
  * can change what an id means.
  * Set GL_FILTER_REDUNDANT_PROGS to 0 in config.h to rule this out. */
+/* Programs are built from two shaders carrying the same switch set, so OR is
+ * enough -- and a program that never sees a parsed source stays 0, which the
+ * draw probe reads as "unknown" rather than as "no features". */
+static void glAttachShader_e(GLuint prog, GLuint sh) {
+  if (prog < GL_OBJ_MAX && sh < GL_OBJ_MAX) g_prog_var[prog] |= g_shader_var[sh];
+  glAttachShader(prog, sh);
+}
+
 static void glUseProgram_e(GLuint p) {
   GLLOG("glUseProgram(%u)", (unsigned)p);
   g_prog_win++; g_prog_frame++;
@@ -1408,7 +1567,7 @@ static const so_default_dynlib gl_dynlib[] = {
   { "glBlendFunc",                       (uintptr_t)&glBlendFunc_e },
   { "glDepthMask",                       (uintptr_t)&glDepthMask_e },
   /* (1) direct maps to vitaGL */
-  { "glAttachShader",                    (uintptr_t)&glAttachShader },
+  { "glAttachShader",                    (uintptr_t)&glAttachShader_e },
   { "glBindAttribLocation",              (uintptr_t)&glBindAttribLocation },
   { "glBlendEquation",                   (uintptr_t)&glBlendEquation },
   { "glBlendEquationSeparate",           (uintptr_t)&glBlendEquationSeparate },
@@ -1463,7 +1622,7 @@ static const so_default_dynlib gl_dynlib[] = {
   { "glTexParameteriv",                  (uintptr_t)&glTexParameteriv },
   { "glTexSubImage2D",                   (uintptr_t)&glTexSubImage2D_e },
   { "glUniform1fv",                      (uintptr_t)&glUniform1fv },
-  { "glUniform1i",                       (uintptr_t)&glUniform1i },
+  { "glUniform1i",                       (uintptr_t)&glUniform1i_e },
   { "glUniform1iv",                      (uintptr_t)&glUniform1iv },
   { "glUniform2fv",                      (uintptr_t)&glUniform2fv },
   { "glUniform2i",                       (uintptr_t)&glUniform2i },

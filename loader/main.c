@@ -2001,7 +2001,9 @@ static void *FmodCreateSound_probe(void *self, char *name, int id, void *data,
                n, name ? name : "?", id, data, size, e, f);
   n++; g_fmod_create++;
   unsigned previous_id = audio_sfx_context_push((unsigned)id);
+  audio_sfx_context_name(name);
   void *rc = FmodCreateSound_orig(self, name, id, data, size, e, f);
+  audio_sfx_context_name(NULL);
   audio_sfx_context_pop(previous_id);
   return rc;
 }

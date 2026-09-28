@@ -173,6 +173,8 @@ typedef struct {
   unsigned key_len;
   uint32_t key_hash;
   AudioPcm pcm;
+  char     name[24];                       /* the game's resref, for the loudness census */
+  uint16_t peak, rms;                      /* of the decoded PCM, 0..32767 */
 } PcmEntry;
 
 typedef struct {
@@ -181,6 +183,7 @@ typedef struct {
   PcmEntry *ent;                           /* owns a reference */
   AudioPcm  pcm;                           /* borrowed copy of ent->pcm */
   Stream   *st;                            /* non-NULL => streamed, pcm.pcm NULL */
+  char      tag[16];                       /* created as a stream (VO, music): its id */
 } Snd;
 
 /* The END callback the companion registers on every voice. All parameters are
@@ -214,6 +217,7 @@ static unsigned g_cache_hits = 0, g_cache_miss = 0;
 #define SFX_CONTEXT_SLOTS 32
 static unsigned g_sfx_context_id[SFX_CONTEXT_SLOTS];
 static SceUID g_sfx_context_thread[SFX_CONTEXT_SLOTS];
+static const char *g_sfx_context_name[SFX_CONTEXT_SLOTS];
 
 static SceUID   g_mutex   = -1;
 static SceUID   g_thread  = -1;
@@ -471,6 +475,28 @@ void audio_sfx_context_pop(unsigned previous_id) {
   if (slot) *slot = previous_id;
 }
 
+void audio_sfx_context_name(const char *name) {
+  unsigned *slot = sfx_context_slot();
+  if (slot) g_sfx_context_name[slot - g_sfx_context_id] = name;
+}
+
+/* Peak and RMS of a decoded asset, so "footsteps are quiet" can be split into
+ * a quiet recording versus a quiet mix. One pass per cache miss, beside a
+ * decode that costs far more. */
+static void pcm_level(const AudioPcm *p, uint16_t *peak, uint16_t *rms) {
+  *peak = 0; *rms = 0;
+  if (!p->pcm || !p->nsamples) return;
+  unsigned n = p->nsamples * (p->channels ? p->channels : 1);
+  int32_t pk = 0; double sq = 0.0;
+  for (unsigned i = 0; i < n; i++) {
+    int32_t a = p->pcm[i] < 0 ? -(int32_t)p->pcm[i] : p->pcm[i];
+    if (a > pk) pk = a;
+    sq += (double)a * (double)a;
+  }
+  *peak = (uint16_t)(pk > 32767 ? 32767 : pk);
+  *rms  = (uint16_t)sqrt(sq / (double)n);
+}
+
 /* Called from the new-handler when the heap is exhausted. Everything here is a
  * pure speed optimisation -- worst case the next createSound decodes again --
  * so give all of it back rather than let an allocation fail. Entries a live
@@ -582,6 +608,7 @@ typedef struct {
   Stream *st;
   AudioRing *ring;
   const char *name;
+  const PcmEntry *ent;                  /* in-memory sounds: name and asset level */
   unsigned rate;
   const int16_t *pcm;
   unsigned nsamples, sch;
@@ -595,8 +622,12 @@ static MixSnap g_msnap[MAX_PLAY_CHANNELS];
 static struct { float px, py, pz, rx, ry, rz; int basis_ok; } g_mix_lis;
 
 /* Runs on the audio thread over the grain snapshot. */
+/* The parts of the last snap_3d_gain, for the loudness census. Audio thread. */
+static float g_snap_d = -1.0f, g_snap_gd = 1.0f, g_snap_occl = 0.0f;
+
 static float snap_3d_gain(const MixSnap *m, float *pan_out) {
   *pan_out = m->pan;
+  g_snap_d = -1.0f; g_snap_gd = 1.0f; g_snap_occl = 0.0f;
   if (!AUDIO_3D_ATTENUATION) return 1.0f;
   if (!m->is3d || !m->has_pos) return 1.0f;
 
@@ -608,6 +639,7 @@ static float snap_3d_gain(const MixSnap *m, float *pan_out) {
   float mx = (m->maxdist > mn)   ? m->maxdist : 10000.0f;
   float dd = d < mn ? mn : (d > mx ? mx : d);
   float g  = mn / dd;
+  g_snap_d = d; g_snap_gd = g; g_snap_occl = m->occl;
 
   if (m->occl > 0.0f) g *= (1.0f - (m->occl > 1.0f ? 1.0f : m->occl));
 
@@ -630,6 +662,100 @@ static float snap_3d_gain(const MixSnap *m, float *pan_out) {
     *pan_out = p;
   }
   return g;
+}
+
+/* ---- loudness census ------------------------------------------------------
+ * log194: the user heard chest opening and footsteps "very quiet". Every
+ * aggregate we log says the mix is sane -- 91% of 3D gains at or above 0.5,
+ * the limiter almost idle -- and yet one 3D sound 2.4 m away, well inside its
+ * 20 m mindistance, was mixed at gain 0.000. Only occlusion can do that. An
+ * aggregate cannot say which sounds are quiet or why, so account per sound:
+ * the game's own volume, our distance gain, the game's occlusion, what reached
+ * the bus, and how loud the recording itself is. Accumulated per grain on the
+ * audio thread, printed and cleared on the watchdog clock. */
+#define LOUD_MAX 64
+typedef struct {
+  char     name[24];
+  uint8_t  is3d;
+  uint16_t peak, rms;
+  unsigned grains, occluded, muted;
+  float    vol, gd, occl, fin, d;
+  float    dmin;
+} LoudRow;
+static LoudRow  g_loud[LOUD_MAX];
+static unsigned g_loud_n = 0, g_loud_dropped = 0;
+static unsigned g_occl_hist[4];          /* 0 | (0,0.5) | [0.5,0.99) | >=0.99, lifetime grains */
+
+static void loud_note(const MixSnap *m, float v) {
+  if (m->is3d && m->has_pos) {
+    float o = g_snap_occl;
+    g_occl_hist[o <= 0.0f ? 0 : o < 0.5f ? 1 : o < 0.99f ? 2 : 3]++;
+  }
+  const char *nm = (m->ent && m->ent->name[0]) ? m->ent->name : m->name;
+  if (!nm || !nm[0]) nm = "?";
+  LoudRow *r = NULL;
+  for (unsigned i = 0; i < g_loud_n; i++)
+    if (g_loud[i].is3d == (uint8_t)m->is3d && !strncmp(g_loud[i].name, nm, sizeof r->name - 1)) {
+      r = &g_loud[i]; break;
+    }
+  if (!r) {
+    if (g_loud_n >= LOUD_MAX) { g_loud_dropped++; return; }
+    r = &g_loud[g_loud_n];
+    memset(r, 0, sizeof *r);
+    strncpy(r->name, nm, sizeof r->name - 1);
+    r->is3d = (uint8_t)m->is3d;
+    r->dmin = 1e9f;
+    g_loud_n++;
+  }
+  if (m->ent) { r->peak = m->ent->peak; r->rms = m->ent->rms; }
+  r->grains++;
+  r->vol += m->vol;
+  r->fin += v;
+  if (m->is3d && m->has_pos) {
+    r->gd += g_snap_gd; r->occl += g_snap_occl; r->d += g_snap_d;
+    if (g_snap_d < r->dmin) r->dmin = g_snap_d;
+    if (g_snap_occl >= 0.5f) r->occluded++;
+    if (g_snap_occl >= 0.99f) r->muted++;
+  }
+}
+
+static float to_dbfs(unsigned a) {
+  return a ? 20.0f * log10f((float)a / 32767.0f) : -99.0f;
+}
+
+/* Watchdog thread. Races with the mixer are tolerated: this is a probe and a
+ * torn float costs one line. The table is copied then cleared under the lock. */
+static void loud_dump(void) {
+  static LoudRow rows[LOUD_MAX];
+  lock();
+  unsigned n = g_loud_n, dropped = g_loud_dropped;
+  memcpy(rows, g_loud, n * sizeof rows[0]);
+  unsigned h[4]; memcpy(h, g_occl_hist, sizeof h);
+  g_loud_n = 0; g_loud_dropped = 0;
+  unlock();
+  unsigned ht = h[0] + h[1] + h[2] + h[3];
+  log_printf("[snd] loud: %u sounds this window%s | 3D occlusion (lifetime grains): "
+             "clear %u, light %u, heavy %u, MUTED %u of %u",
+             n, dropped ? " (table full, some dropped)" : "", h[0], h[1], h[2], h[3], ht);
+  /* Most-heard first, 14 rows: enough to catch footsteps and the ambience
+   * they compete with. */
+  for (unsigned k = 0; k < n && k < 14; k++) {
+    unsigned best = k;
+    for (unsigned i = k + 1; i < n; i++) if (rows[i].grains > rows[best].grains) best = i;
+    LoudRow t = rows[k]; rows[k] = rows[best]; rows[best] = t;
+    LoudRow *r = &rows[k];
+    float g = (float)r->grains;
+    if (r->is3d)
+      log_printf("[snd] loud 3D %-16.23s grains=%-5u vol=%.2f dist=%.2f occl=%.2f "
+                 "(heavy %u%%, muted %u%%) -> bus %.3f  d avg %.1f min %.1f | asset %.0f/%.0f dBFS",
+                 r->name, r->grains, r->vol / g, r->gd / g, r->occl / g,
+                 r->occluded * 100u / r->grains, r->muted * 100u / r->grains,
+                 r->fin / g, r->d / g, r->dmin, to_dbfs(r->peak), to_dbfs(r->rms));
+    else
+      log_printf("[snd] loud 2D %-16.23s grains=%-5u vol=%.2f -> bus %.3f | asset %.0f/%.0f dBFS",
+                 r->name, r->grains, r->vol / g, r->fin / g,
+                 to_dbfs(r->peak), to_dbfs(r->rms));
+  }
 }
 
 /* ---- mixer ---------------------------------------------------------------- */
@@ -689,7 +815,8 @@ static void mix_grain(void) {
     m->gen = ch->gen;
     m->st = s->st;
     m->ring = s->st ? &s->st->ring : NULL;
-    m->name = s->st ? s->st->name : "";
+    m->name = s->st ? s->st->name : s->tag;
+    m->ent = s->st ? NULL : s->ent;
     m->rate = s->pcm.rate ? s->pcm.rate : 1;
     m->pcm = s->st ? NULL : s->pcm.pcm;
     m->nsamples = s->pcm.nsamples;
@@ -774,6 +901,7 @@ static void mix_grain(void) {
       float v  = m->vol * g3;
       if (m->is3d) { g_mix_n3d++; g_mix_sum3d += v; }
       else         { g_mix_n2d++; g_mix_sum2d += v; }
+      loud_note(m, v);
       float gl = v * (pan <= 0.0f ? 1.0f : 1.0f - pan);
       float gr = v * (pan >= 0.0f ? 1.0f : 1.0f + pan);
 
@@ -837,6 +965,7 @@ static void mix_grain(void) {
     float v  = m->vol * g3;
     if (m->is3d) { g_mix_n3d++; g_mix_sum3d += v; }
     else         { g_mix_n2d++; g_mix_sum2d += v; }
+    loud_note(m, v);
     float gl = v * (pan <= 0.0f ? 1.0f : 1.0f - pan);
     float gr = v * (pan >= 0.0f ? 1.0f : 1.0f + pan);
 
@@ -1486,6 +1615,15 @@ static int Sys_createSound(void *self, const char *name, unsigned mode,
   }
 
 have_pcm:;
+  if (!ent->name[0] && context) {
+    const char *nm = g_sfx_context_name[context - g_sfx_context_id];
+    if (nm) {
+      uint16_t pk, rm;
+      pcm_level(&ent->pcm, &pk, &rm);
+      ent->peak = pk; ent->rms = rm;
+      strncpy(ent->name, nm, sizeof ent->name - 1);
+    }
+  }
 
   lock();
   Snd *s = snd_alloc();
@@ -1493,6 +1631,8 @@ have_pcm:;
   if (!s) { lock(); cache_release(ent); unlock(); return FMOD_ERR_INVALID_PARAM; }
   s->is3d = (mode & FMOD_3D) ? 1 : 0;
   s->ent = ent;
+  s->tag[0] = 0;
+  if (mode & FMOD_CREATESTREAM) strncpy(s->tag, what, sizeof s->tag - 1);
   s->pcm = ent->pcm;                 /* borrowed: the cache owns the samples */
   *out = s;
 
@@ -1512,6 +1652,33 @@ have_pcm:;
  * from "the game asked and we turned it down" -- and log154 and log159 both show
  * playSound flatlining exactly while the pool sits at 45 of 45. Count the calls
  * themselves, and both ways one can fail. */
+
+/* ---- voice-line trace --------------------------------------------------------
+ * log195: the user died to the apartments assassin, reloaded a save made
+ * outside the cantina, and heard her line over the loading screen. The slot
+ * census shows one game-paused channel going live during that load, but not
+ * which, or who resumed it. Streams (VO, music) are rare enough to trace every
+ * play, pause change, stop and release with the id and position. Values are
+ * captured under the lock and printed after it. */
+#define VO_TRACE_MAX 3000
+static unsigned g_vo_lines = 0;
+typedef struct { char tag[16]; int chan; unsigned ms, len; } VoSnap;
+static int vo_snap(const Chan *c, VoSnap *v) {
+  /* 2D only: VO and music are 2D, and log196 spent the whole budget by 1009 s
+   * on the 3D ambient loops, which pause and resume constantly. */
+  if (!c->snd || !c->snd->tag[0] || c->snd->is3d || g_vo_lines >= VO_TRACE_MAX) return 0;
+  memcpy(v->tag, c->snd->tag, sizeof v->tag);
+  v->chan = (int)(c - g_chan);
+  unsigned rate = c->snd->pcm.rate ? c->snd->pcm.rate : 1;
+  v->ms  = (unsigned)(c->pos * 1000.0 / rate);
+  v->len = c->snd->pcm.ms;
+  return 1;
+}
+static void vo_log(const VoSnap *v, const char *ev) {
+  g_vo_lines++;
+  log_printf("[snd] vo %-7s \"%s\" chan %d at %u/%u ms", ev, v->tag, v->chan,
+             v->ms, v->len);
+}
 
 static int Sys_playSound(void *self, void *sound, void *group, int paused, void **outch) {
   (void)self; (void)group;
@@ -1544,8 +1711,10 @@ static int Sys_playSound(void *self, void *sound, void *group, int paused, void 
       s->st->restart = 1;      /* the audio thread rewinds; see mix_grain */
     }
   }
+  VoSnap vs; int vo = c ? vo_snap(c, &vs) : 0;
   unlock();
   if (!c) { g_play_nochan++; return FMOD_ERR_INVALID_PARAM; }
+  if (vo) vo_log(&vs, paused ? "play(p)" : "play");
   if (outch) *outch = c;
   if (g_played < 24)
     log_printf("[snd] playSound -> chan %d (%u ms, paused=%d)",
@@ -1573,8 +1742,10 @@ static int Snd_release(void *self) {
   Snd *s = (Snd *)self;
   lock();
   g_rel_calls++;
+  VoSnap rv; int rvo = 0;
   for (int i = 0; i < g_nchannels; i++)
     if (g_chan[i].used && g_chan[i].snd == s) {
+      if (g_chan[i].playing && !rvo) rvo = vo_snap(&g_chan[i], &rv);
       if (g_chan[i].playing)     g_rel_kill_live++;   /* died with no END at all */
       if (g_chan[i].end_pending) g_rel_kill_pend++;   /* END built, never sent */
       g_chan[i].playing = 0; g_chan[i].used = 0;
@@ -1599,7 +1770,9 @@ static int Snd_release(void *self) {
   }
   memset(&s->pcm, 0, sizeof s->pcm);
   s->used = 0;
+  s->tag[0] = 0;
   unlock();
+  if (rvo) vo_log(&rv, "release");
   /* No audio thread to hand it to (output never opened, or shutting down), so
    * nothing can be inside it and closing here is safe. */
   if (st && !handed) stream_close(st);
@@ -1638,11 +1811,14 @@ static int Ch_stop(void *self) {
    * owner silently -- no END, so the owner's slot stays in use forever. Enough
    * of those and every slot is held (log193). The caller's slot is Reset
    * straight after stop() either way, so doing nothing is the correct stop. */
+  VoSnap vs; int vo = vo_snap(c, &vs);
   if (g_stop_owner && c->used && c->userdata != g_stop_owner) {
     g_stop_foreign++;
     unlock();
+    if (vo) vo_log(&vs, "REFUSED");
     return FMOD_OK;
   }
+  const char *vev = !c->used ? "stop-st" : c->playing ? "stop" : "stop-end";
   if (!c->used)          g_stop_stale++;   /* handle the game kept past recycling */
   else if (c->playing)   g_stop_live++;    /* cut off mid-play */
   else if (c->end_pending) g_stop_pend++;  /* an END it asked for and discarded */
@@ -1652,14 +1828,19 @@ static int Ch_stop(void *self) {
   c->cb      = NULL;
   c->gen     = ++g_chan_gen;
   unlock();
+  if (vo) vo_log(&vs, vev);
   return FMOD_OK;
 }
 static int Ch_setPaused(void *self, int paused) {
   if (!chan_valid(self)) return FMOD_ERR_INVALID_PARAM;
   lock();                       /* the mixer reads this flag on the audio thread */
-  ((Chan *)self)->paused = paused ? 1 : 0;
+  Chan *c = (Chan *)self;
+  VoSnap vs;
+  int vo = (c->used && c->paused != (paused ? 1 : 0)) ? vo_snap(c, &vs) : 0;
+  c->paused = paused ? 1 : 0;
   if (paused) g_pause_set++; else g_pause_clr++;
   unlock();
+  if (vo) vo_log(&vs, paused ? "pause" : "RESUME");
   return FMOD_OK;
 }
 static int Ch_setVolume(void *self, uint32_t v) {          /* softfp float */
@@ -2005,6 +2186,10 @@ void audio_perf_snapshot(audio_perf_t *out) {
 }
 
 void audio_log_stats(void) {
+  {
+    static unsigned calls = 0;
+    if (calls++ % 4 == 3) loud_dump();
+  }
   {
     /* g_played is the discriminator log4 lacked. Its END rate fell from ~127 per
      * 128 createSound to 0 while createSound itself kept climbing, and both

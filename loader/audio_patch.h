@@ -59,5 +59,8 @@ int audio_ensure_output(void);
 // decoded SFX can be found without hashing memory the game may already reuse.
 unsigned audio_sfx_context_push(unsigned id);
 void audio_sfx_context_pop(unsigned previous_id);
+// The resref of the sound being created on this thread, for the loudness
+// census. Pass NULL when the create returns; the pointer is not kept.
+void audio_sfx_context_name(const char *name);
 
 #endif
