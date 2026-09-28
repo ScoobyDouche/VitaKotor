@@ -31,6 +31,17 @@ void audio_log_stats(void);
 // is the game refusing itself, which no counter on this side can see.
 unsigned audio_play_count(void);
 
+// The companion's channel-slot table (FModAudioSystem, 45 slots). attach hands
+// over the FModAudioSystem and its ChannelInfo::Reset; ensure_free runs before
+// PlaySound/PlayStream pick a slot and frees a dead one only when none is free;
+// stop_begin/end bracket StopChannel so a stale stop cannot kill another slot's
+// voice; log_slots prints the census on the watchdog clock.
+void audio_slots_attach(void *fmod_sys, void (*reset)(void *info));
+void audio_slots_ensure_free(void);
+void audio_slot_stop_begin(unsigned key);
+void audio_slot_stop_end(void);
+void audio_log_slots(void);
+
 typedef struct {
   unsigned feed_count, feed_max_us, underruns;
   uint64_t feed_us;

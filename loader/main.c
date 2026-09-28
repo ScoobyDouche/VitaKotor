@@ -174,7 +174,7 @@ static void *watchdog_thread(void *arg) {
      * game goes quiet. */
     {
       static unsigned stick = 0;
-      if (stick % 4 == 0) sound_pipeline_census();
+      if (stick % 4 == 0) { sound_pipeline_census(); audio_log_slots(); }
       if (stick % 8 == 0) audio_log_stats();
       stick++;
     }
@@ -2081,8 +2081,38 @@ static void *FmodReleaseSound_probe(void *self, int id) {
   return rc;
 }
 
+/* The FModAudioSystem is only reachable as `this`, so the slot table is handed
+ * to audio_patch on the first call that carries it. */
+static void slots_attach(void *self) {
+  static int done = 0;
+  if (done || !self) return;
+  done = 1;
+  void (*reset)(void *) =
+      (void (*)(void *))so_symbol(&port_mod, "_ZN26FModAudioSystemChannelInfo5ResetEv");
+  if (!reset) log_printf("[snd] ChannelInfo::Reset symbol missing -- no slot reclaim");
+  audio_slots_attach(self, reset);
+}
+
+static void *(*FmodPlayStream_orig)(void *, unsigned, int) = NULL;
+static void *(*FmodStopChannel_orig)(void *, unsigned) = NULL;
+
+static void *FmodPlayStream_probe(void *self, unsigned h, int paused) {
+  slots_attach(self);
+  audio_slots_ensure_free();
+  return FmodPlayStream_orig(self, h, paused);
+}
+static void *FmodStopChannel_probe(void *self, unsigned key) {
+  slots_attach(self);
+  audio_slot_stop_begin(key);
+  void *rc = FmodStopChannel_orig(self, key);
+  audio_slot_stop_end();
+  return rc;
+}
+
 static void *FmodPlaySound_probe(void *self, int id) {
   static unsigned n = 0;
+  slots_attach(self);
+  audio_slots_ensure_free();
   void *rc = FmodPlaySound_orig(self, id);
   if (n < 40) log_printf("[snd?] FMod::PlaySound #%u id=%d -> %p", n, id, rc);
   n++; g_fmod_play++; if (!rc) g_fmod_play_null++;
@@ -2373,6 +2403,10 @@ static void install_sound_probe(void) {
                   (void **)&FmodCreateStream_orig, "FModAudioSystem::CreateStream");
   hook_named_port("_ZN15FModAudioSystem9PlaySoundEi", (uintptr_t)&FmodPlaySound_probe,
                   (void **)&FmodPlaySound_orig, "FModAudioSystem::PlaySound");
+  hook_named_port("_ZN15FModAudioSystem10PlayStreamEmi", (uintptr_t)&FmodPlayStream_probe,
+                  (void **)&FmodPlayStream_orig, "FModAudioSystem::PlayStream");
+  hook_named_port("_ZN15FModAudioSystem11StopChannelEm", (uintptr_t)&FmodStopChannel_probe,
+                  (void **)&FmodStopChannel_orig, "FModAudioSystem::StopChannel");
   hook_named_port("_ZN15FModAudioSystem11CloseStreamEm", (uintptr_t)&FmodCloseStream_probe,
                   (void **)&FmodCloseStream_orig, "FModAudioSystem::CloseStream");
   hook_named_port("_ZN15FModAudioSystem12ReleaseSoundEi", (uintptr_t)&FmodReleaseSound_probe,

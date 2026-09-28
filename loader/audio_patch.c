@@ -1036,6 +1036,10 @@ static unsigned g_play_calls = 0, g_play_badsnd = 0, g_play_nochan = 0;
  * had already finished is bookkeeping, while stopping one mid-play or with an
  * END still owed is the game discarding a notification it asked for. */
 static unsigned g_stop_calls = 0, g_stop_live = 0, g_stop_pend = 0, g_stop_stale = 0;
+/* The companion slot (FModAudioSystemChannelInfo*) whose StopChannel is on the
+ * stack, or NULL. Game thread only; see Ch_stop and audio_slot_stop_begin. */
+static void *g_stop_owner = NULL;
+static unsigned g_stop_foreign = 0;
 
 /* setPaused, split by direction. A channel the mixer skips is invisible in
  * every other counter: mix_grain drops paused channels before it can advance
@@ -1628,6 +1632,17 @@ static int Ch_stop(void *self) {
   lock();
   Chan *c = (Chan *)self;
   g_stop_calls++;
+  /* A slot stopping a voice that now belongs to ANOTHER slot. The companion
+   * keeps a Channel* per slot long after the sound ended, and chan_alloc has
+   * since handed that voice to a new sound; stopping it here would kill the new
+   * owner silently -- no END, so the owner's slot stays in use forever. Enough
+   * of those and every slot is held (log193). The caller's slot is Reset
+   * straight after stop() either way, so doing nothing is the correct stop. */
+  if (g_stop_owner && c->used && c->userdata != g_stop_owner) {
+    g_stop_foreign++;
+    unlock();
+    return FMOD_OK;
+  }
   if (!c->used)          g_stop_stale++;   /* handle the game kept past recycling */
   else if (c->playing)   g_stop_live++;    /* cut off mid-play */
   else if (c->end_pending) g_stop_pend++;  /* an END it asked for and discarded */
@@ -1829,6 +1844,156 @@ static int Sys_set3DListenerAttributes(void *self, int listener, const FmodVec *
  * counter -- torn reads do not matter for a log line -- or takes the lock. */
 unsigned audio_play_count(void) { return g_play_calls; }
 
+/* ---- the companion's slot table -------------------------------------------
+ * FModAudioSystem keeps one FModAudioSystemChannelInfo per channel (45 of them,
+ * built by InitChannels) in a std::map at this+20. PlaySound and PlayStream take
+ * the first slot whose inUse word is 0 and return -1 when there is none -- so a
+ * full table means every sound and every music track is refused, and the game
+ * answers the refused music by re-creating the stream several times a second
+ * (log193: 680 creates of mus_theme_cult, 150 ms each, 5 fps). Only four paths
+ * clear a slot, and in play only StopChannel matters: the game must stop every
+ * sound it started. Where our emulation lets that go wrong the slot is gone for
+ * the rest of the session.
+ *
+ * Offsets, from the companion's own code (+0x7355c PlaySound, +0x751a0 Reset,
+ * +0x746a4 GetIsChannelPlaying):
+ *   info+0   slot key (what PlaySound returns and StopChannel takes)
+ *   info+16  in use          info+20  stolen, awaiting reboot
+ *   info+24  paused by game  info+28  ended (HandleChannelEnd set it)
+ *   info+68  FMOD::Channel*  -- one of ours
+ * libc++ map: map+4 is the root; a node is {left, right, parent, colour, key,
+ * value} with the value at +20. The tree is built once and never reshaped, so
+ * walking it from the watchdog thread is safe; only the slot words change. */
+#define SLOT_KEY(i)     (*(unsigned *)((char *)(i) + 0))
+#define SLOT_INUSE(i)   (*(int *)((char *)(i) + 16))
+#define SLOT_STOLEN(i)  (*(int *)((char *)(i) + 20))
+#define SLOT_GPAUSED(i) (*(int *)((char *)(i) + 24))
+#define SLOT_ENDED(i)   (*(int *)((char *)(i) + 28))
+#define SLOT_CHAN(i)    (*(void **)((char *)(i) + 68))
+#define SLOT_MAX 128
+
+static void *g_fmod_sys = NULL;
+static void (*g_slot_reset)(void *info) = NULL;
+static unsigned g_slot_full = 0, g_slot_reclaimed[3] = {0, 0, 0}, g_slot_unfreeable = 0;
+
+static int slot_collect(void **out) {
+  if (!g_fmod_sys) return 0;
+  char *map = *(char **)((char *)g_fmod_sys + 20);
+  if (!map) return 0;
+  void *stack[64];
+  int sp = 0, n = 0;
+  void *node = *(void **)(map + 4);
+  while ((node || sp) && n < SLOT_MAX) {
+    while (node && sp < 64) { stack[sp++] = node; node = *(void **)node; }
+    if (!sp) break;
+    node = stack[--sp];
+    void *info = *(void **)((char *)node + 20);
+    if (info) out[n++] = info;
+    node = *(void **)((char *)node + 4);
+  }
+  return n;
+}
+
+/* How dead a held slot is: 0 = nothing of ours behind it any more, 1 = its sound
+ * is over, 2 = parked paused (the mixer skips it, so it can never end), 3 =
+ * genuinely playing or owed an END. Caller holds the lock. */
+static int slot_rank(void *info) {
+  Chan *c = (Chan *)SLOT_CHAN(info);
+  if (!chan_valid(c) || !c->used || c->userdata != info) return 0;
+  if (c->end_pending) return 3;
+  if (!c->playing || SLOT_ENDED(info)) return 1;
+  if (c->paused) return 2;
+  return 3;
+}
+
+void audio_slots_attach(void *fmod_sys, void (*reset)(void *info)) {
+  g_fmod_sys   = fmod_sys;
+  g_slot_reset = reset;
+}
+
+/* Called before the companion scans for a free slot. With one free, nothing is
+ * touched: this only ever acts on a table that is already refusing everything.
+ * Then it frees the deadest slot, oldest voice first within a rank, and never a
+ * voice that is still audible. The game may still hold the old key and stop it
+ * later; if the slot has been reused by then it cuts a new sound short, which is
+ * the whole cost, against all sound going quiet for good. */
+void audio_slots_ensure_free(void) {
+  void *info[SLOT_MAX];
+  int n = slot_collect(info);
+  if (!n || !g_slot_reset) return;
+  void *best = NULL;
+  int best_rank = 3;
+  unsigned best_stamp = 0;
+  lock();
+  for (int i = 0; i < n; i++) {
+    if (!SLOT_INUSE(info[i])) { unlock(); return; }
+    int r = slot_rank(info[i]);
+    Chan *c = (Chan *)SLOT_CHAN(info[i]);
+    unsigned stamp = chan_valid(c) ? c->stamp : 0;
+    if (r < best_rank || (r == best_rank && best && stamp < best_stamp)) {
+      best = info[i]; best_rank = r; best_stamp = stamp;
+    }
+  }
+  g_slot_full++;
+  if (!best) { g_slot_unfreeable++; unlock(); return; }
+  Chan *c = (Chan *)SLOT_CHAN(best);
+  if (best_rank > 0 && chan_valid(c)) {         /* ours and owned: stop, no END */
+    c->playing = 0;
+    c->used    = 0;
+    c->end_pending = 0;
+    c->cb      = NULL;
+    c->gen     = ++g_chan_gen;
+  }
+  g_slot_reclaimed[best_rank]++;
+  unsigned total = g_slot_reclaimed[0] + g_slot_reclaimed[1] + g_slot_reclaimed[2];
+  int key = (int)SLOT_KEY(best), st = SLOT_STOLEN(best), gp = SLOT_GPAUSED(best),
+      en = SLOT_ENDED(best);
+  unlock();
+  g_slot_reset(best);
+  if (total <= 40 || (total & 63) == 0)
+    log_printf("[snd] slot table FULL: reclaimed slot %d (rank %d: %s; stolen=%d "
+               "gamePaused=%d ended=%d) -- reclaim #%u",
+               key, best_rank,
+               best_rank == 0 ? "voice no longer its own" :
+               best_rank == 1 ? "sound already over" : "parked paused",
+               st, gp, en, total);
+}
+
+/* StopChannel brackets its stop() with these so Ch_stop can tell the caller's
+ * own voice from one that has since moved to another slot. */
+void audio_slot_stop_begin(unsigned key) {
+  void *info[SLOT_MAX];
+  int n = slot_collect(info);
+  g_stop_owner = NULL;
+  for (int i = 0; i < n; i++)
+    if (SLOT_KEY(info[i]) == key) { g_stop_owner = info[i]; break; }
+}
+void audio_slot_stop_end(void) { g_stop_owner = NULL; }
+
+void audio_log_slots(void) {
+  void *info[SLOT_MAX];
+  int n = slot_collect(info);
+  if (!n) return;
+  int inuse = 0, ended = 0, gpaused = 0, stolen = 0, rank[4] = {0, 0, 0, 0};
+  lock();
+  for (int i = 0; i < n; i++) {
+    if (!SLOT_INUSE(info[i])) continue;
+    inuse++;
+    if (SLOT_ENDED(info[i]))   ended++;
+    if (SLOT_GPAUSED(info[i])) gpaused++;
+    if (SLOT_STOLEN(info[i]))  stolen++;
+    rank[slot_rank(info[i])]++;
+  }
+  unlock();
+  log_printf("[snd] slots: %d/%d in use (ended %d, game-paused %d, stolen %d | "
+             "orphaned %d, over %d, parked %d, live %d) | table full %u times, "
+             "reclaimed %u orphaned / %u over / %u parked, %u unfreeable, "
+             "%u foreign stops refused",
+             inuse, n, ended, gpaused, stolen, rank[0], rank[1], rank[2], rank[3],
+             g_slot_full, g_slot_reclaimed[0], g_slot_reclaimed[1],
+             g_slot_reclaimed[2], g_slot_unfreeable, g_stop_foreign);
+}
+
 void audio_perf_snapshot(audio_perf_t *out) {
   if (!out) return;
   lock();
@@ -1876,7 +2041,7 @@ void audio_log_stats(void) {
                  "bus2d avg=%.3f over %u, bus3d avg=%.3f over %u, "
                  "streams %u opened / %d live / %u underruns, "
                  "decode %u us avg / %u us worst over %u grains (budget 21333), "
-                 "stop %u calls (%u live / %u pending / %u stale), "
+                 "stop %u calls (%u live / %u pending / %u stale / %u foreign), "
                  "paused %u set / %u cleared, "
                  "chans %d used / %d playing / %d paused / %d endPending of %d",
                  g_created, g_cache_hits, g_cache_miss, g_pcm_bytes / 1024, g_missing,
@@ -1899,7 +2064,7 @@ void audio_log_stats(void) {
                  g_streams_open, g_stream_decoders, g_stream_underruns,
                  (unsigned)(g_feed_n ? g_feed_us_tot / g_feed_n : 0u),
                  g_feed_us_max, g_feed_n,
-                 g_stop_calls, g_stop_live, g_stop_pend, g_stop_stale,
+                 g_stop_calls, g_stop_live, g_stop_pend, g_stop_stale, g_stop_foreign,
                  g_pause_set, g_pause_clr,
                  nused, nplaying, npaused, npend, g_nchannels);
   }
