@@ -18,32 +18,30 @@ with a from-scratch FMOD audio implementation over `sceAudiodec` and
 
 ## Status
 
-**Work in progress — playable in stretches, not yet a playthrough.**
+**Work in progress — good enough for a real playthrough, if you save regularly.**
 
-It boots, gets through character creation, and plays past the Endar Spire onto
-Taris. Combat, dialogue, inventory, containers and saves all work, and it looks
-and sounds like the game.
+It boots, gets through character creation, and plays through the Endar Spire and
+across Taris. Combat, dialogue, inventory, containers and saves all work, and it
+looks and sounds like the game.
 
-The area-transition crash that used to end every session at 10–20 minutes is
-**fixed**: sessions now run past 50 minutes with the heap still healthy at the
-end. What remains is cosmetic or recoverable rather than fatal — sound thinning
-out over a long session, the world geometry occasionally tearing, and input
-going unresponsive once in about five hours. Nothing crashes and no save has
-been lost. See [Known issues](#known-issues).
+The two faults that used to wear a long session down are **fixed**: sound no
+longer thins out and goes silent, and the world geometry no longer tears into
+spikes. Sessions of close to 90 minutes now end as healthy as they started.
+What remains is frame rate and a few rough edges. Nothing crashes and no save
+has been lost. See [Known issues](#known-issues).
 
 The wait before the main menu is now dressed in the game's own loading art, with
 a hint to read while it works *(new in v0.1.10)*.
 
-So: worth playing now, saving regularly. Not yet something to start a serious
-playthrough on.
+So: worth starting a proper playthrough on now. Save regularly all the same.
 
 | | |
 |---|---|
 | Startup | ~2 min on first launch, then under a minute |
-| Area loads | 0.4–0.8 s |
-| Frame rate | ~30–38 fps typical, dips into the low 20s in dense scenes |
-| Session length | 59 min tested; nothing fatal, but sound thins out past ~40 |
-| Audio | Effects and voice work; long music tracks are silent |
+| Area loads | Under a second to load; the loading screen then stays up 15–20 s while textures upload |
+| Frame rate | ~30–38 fps typical, dips into the low 20s in dense scenes, with stutters |
+| Session length | ~90 min tested with nothing fatal and nothing wearing down |
+| Audio | Effects, voice and music all work |
 | Cutscenes | Bink movies play with sound; tap or press a button to skip |
 | Input | Touchscreen, sticks and buttons — see [Controls](#controls) |
 | Saves | Work, stored on the Vita |
@@ -226,33 +224,21 @@ you a save. They are listed because you may hit them. Save regularly.
   running. It has not been seen since, but touch and buttons together have not
   had a long session yet. Relaunching clears it.
 
-- **World geometry can tear into diagonal streaks.** Seen twice — once at about
-  44 minutes, and again at 37 minutes on Taris: walls and floors smear, getting
-  worse over the following minute or two, while the HUD and dialogue text keep
-  drawing perfectly. It followed the player between areas rather than being tied
-  to one. A 52-minute session in between was completely clean, so whatever
-  triggers it is not just time played. Relaunching and loading the same save came
-  back clean. Nothing crashes.
-
-  What is known: it is not a failed allocation (vitaGL reports none), and the
-  game's own heap is healthy at the time. Video memory does run dry a minute
-  into play and stay that way, but that is true of sessions with no tearing at
-  all, so it is not sufficient on its own.
-
-- **Sound thins out over a long session.** Seen at 40 minutes and worse by 59:
-  spoken lines and effects gradually stop playing, while the game itself runs on
-  normally. Relaunching clears it and your save is safe. This is what is left of
-  the fault v0.1.9.1 fixed the fatal half of: the engine learns a sound has
-  finished from a single callback, and over a long session it stops hearing about
-  some of them, after which those sources never speak again. **This is the thing
-  being worked on.**
-
 ### Rough edges
 
-- **Some armour renders flat white instead of shiny,** going reflective only
-  under certain lighting — Sith armour is the clearest example. The shine is an
-  environment map, sampled through a cube texture that the port is not binding
-  reliably.
+- **Frame drops.** Besides the dense-scene dips below, some areas stutter
+  about once a second: one frame in thirty takes around 100 ms, while nothing on
+  screen changes. That time goes on the game's own update rather than drawing,
+  and it is being investigated.
+- **Voices over the loading screen.** The game starts running as soon as the
+  area data is in, while the loading screen is still up for the texture upload,
+  so the new area's sounds and conversations can start before you see it. Once,
+  after dying and reloading, a line from the fight that killed you played over
+  the loading screen; that one is being traced.
+- **Some shiny armour looks off.** Reflective materials can shine too strongly
+  or with a colour tint — Sith armour is the clearest example. The environment
+  map and its mask reach the shader correctly, so the remaining suspect is how
+  the reflection is blended with the lit colour.
 - **The Undercity runs at 5–8 fps.** Measured against 30–40 fps in the areas
   above it. It draws roughly three and a half times as many objects per frame as
   the streets of Taris — about 480 draw calls a frame against 140 — and frame
@@ -262,9 +248,6 @@ you a save. They are listed because you may hit them. Save regularly.
   and the frame rate drops into the low 20s. Video memory is also full for most
   of a session, so textures loaded after the first minute are served from
   ordinary RAM, which likely contributes.
-- **Long music tracks are silent.** Anything over about 90 seconds is replaced
-  with correctly-timed silence, so pacing stays right but the score does not
-  play. Shorter music and combat stings do. Voice and effects are unaffected.
 - **Not every movie has been checked.** The ones played so far run with
   sound and hand back to the game cleanly; 48 kHz movies and localized
   subtitles have not been specifically tested.
@@ -272,6 +255,20 @@ you a save. They are listed because you may hit them. Save regularly.
 
 ### Recently fixed
 
+- **Footsteps, doors and containers were very quiet** *(not released yet)*.
+  Early builds of the port misread decimal numbers in `swkotor.ini`, and the
+  engine saved its 2D/3D sound balance at its lowest setting, which plays every
+  positioned sound at a tenth of its volume. The port now resets that one value
+  to the engine default on launch, so an ini carried over from an old build is
+  repaired automatically.
+- **Sound thinning out, then going silent, over a long session** *(not released
+  yet)*. The game has 45 sound slots and frees one only when it sees the sound
+  end; some never got that, and after an hour or so every slot was taken. Dead
+  slots are now handed back, and an 87-minute session stayed clean.
+- **World geometry tearing into spikes** after 20–40 minutes *(not released
+  yet)*. The GPU's vertex-shader pool filled up and new shaders silently failed.
+  The pool is four times larger and now reclaims idle entries; an 83-minute
+  session had no failures.
 - **Audio mixer lock contention:** the Vita mixer now snapshots active channels,
   mixes outside the game-facing mutex, and batches FMOD completion scanning under
   one lock. A real-Vita smoke test preserved working audio; the frame-rate effect
@@ -298,8 +295,7 @@ you a save. They are listed because you may hit them. Save regularly.
 - **Sound taking the game down with it** (v0.1.9.1). The engine was never told
   when a sound finished, so it never reused a voice or closed a music stream;
   the leak exhausted both file handles and memory and ended the session. That
-  crash is gone. Sound still thins out over a long session, though — see
-  [Known issues](#known-issues).
+  crash is gone.
 
 ## Troubleshooting
 
