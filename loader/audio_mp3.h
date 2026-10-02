@@ -68,6 +68,22 @@ typedef struct AudioMp3Stream AudioMp3Stream;
  * the same asset. Returns NULL if the asset is not decodable. */
 AudioMp3Stream *audio_mp3_stream_open(const void *data, unsigned len, AudioPcm *fmt);
 
+/* Bytes of the asset that are actually in memory yet, for a stream whose file
+ * is still being read in behind it (see the progressive loader in
+ * audio_patch.c). The writer publishes `loaded` with release ordering after the
+ * bytes land, and sets `done` once nothing more will arrive -- at which point
+ * `loaded` is the true end, even if the file came up shorter than its header
+ * claimed. Until `done`, a decoder that catches up just produces nothing (a
+ * starve, not end-of-stream). */
+typedef struct {
+  volatile unsigned loaded;
+  volatile int      done;
+} AudioStreamFeed;
+
+/* Attach a feed. Call before the first read; NULL means the whole buffer is
+ * already there. The feed must outlive the stream. */
+void audio_mp3_stream_set_feed(AudioMp3Stream *s, const AudioStreamFeed *f);
+
 /* 1 if streaming this asset would take one of the AUDIO_MP3_DECODER_POOL
  * hardware handles. The ambient beds are IMA ADPCM behind a 470-byte junk-MP3
  * prefix and decode in software, so they must NOT count against the pool --

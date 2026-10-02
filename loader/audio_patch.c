@@ -156,6 +156,12 @@ typedef struct {
    * where the decoding happens: rewinding the decoder from the game thread
    * would be reaching into state the audio thread is using without the lock. */
   int       restart;
+  /* Progressive load (AUDIO_STREAM_PROGRESSIVE): the rest of `src` is still
+   * being read in by the loader thread. `loading` is set when the job is queued
+   * and cleared by the loader once it has let go of the file and the buffer;
+   * stream_close raises `cancel` and waits for that. */
+  AudioStreamFeed feed;
+  volatile int loading, cancel;
 } Stream;
 
 /* ---- decoded-PCM cache ----------------------------------------------------
@@ -429,6 +435,12 @@ static Stream *stream_open(void *src_owned, const void *es, unsigned len,
  * address-range check that tells pool pointers from newlib's. */
 static void stream_close(Stream *st) {
   if (!st) return;
+  if (__atomic_load_n(&st->loading, __ATOMIC_ACQUIRE)) {
+    /* The loader is still writing into st->src: stop it and wait until it has
+     * closed the file. It checks between 64 KB reads, so this is a few ms. */
+    __atomic_store_n(&st->cancel, 1, __ATOMIC_RELEASE);
+    while (__atomic_load_n(&st->loading, __ATOMIC_ACQUIRE)) sceKernelDelayThread(1000);
+  }
   if (st->dec) {
     int hw = st->hw;
     audio_mp3_stream_close(st->dec);
@@ -1357,6 +1369,104 @@ static int Sys_setFileSystem(void *self, fs_open_cb o, fs_close_cb c, fs_read_cb
   return FMOD_OK;
 }
 
+#if AUDIO_STREAM_PROGRESSIVE
+/* ---- progressive stream loads ----------------------------------------------
+ * log203: with voice and ambience fixed, the biggest stalls left were music
+ * and long ambient beds. createSound read the whole 1.2-2.3 MB file through the
+ * companion's callbacks before it returned -- 160-520 ms of frozen frame at
+ * every track change. Now only PROG_HEAD_BYTES are read up front (enough for
+ * the header and several seconds of audio), and this thread reads the rest
+ * behind the decoder. The card delivers ~10 MB/s against a track that plays
+ * at ~16 KB/s, so the load front is never in reach. If it ever is, the decoder
+ * starves for a moment rather than ending the track (AudioStreamFeed). */
+#define PROG_HEAD_BYTES (128u * 1024u)
+#define PROG_CHUNK      (64u * 1024u)
+#define PROG_MAX_JOBS   8
+
+typedef struct { Stream *st; void *h; unsigned want; } ProgJob;
+static ProgJob  g_prog_q[PROG_MAX_JOBS];
+static unsigned g_prog_n;
+static SceUID   g_prog_sema = -1, g_prog_thid = -1;
+static unsigned g_prog_jobs, g_prog_short, g_prog_cancelled;
+
+static int prog_thread(SceSize args, void *argp) {
+  (void)args; (void)argp;
+  for (;;) {
+    sceKernelWaitSema(g_prog_sema, 1, NULL);
+    lock();
+    ProgJob j = g_prog_q[0];
+    for (unsigned i = 1; i < g_prog_n; i++) g_prog_q[i - 1] = g_prog_q[i];
+    g_prog_n--;
+    unlock();
+
+    Stream *st = j.st;
+    unsigned have = st->feed.loaded;
+    int cancelled = 0;
+    while (have < j.want) {
+      if (__atomic_load_n(&st->cancel, __ATOMIC_ACQUIRE)) { cancelled = 1; break; }
+      unsigned n = j.want - have, got = 0;
+      if (n > PROG_CHUNK) n = PROG_CHUNK;
+      g_fs_read(j.h, (char *)st->src + have, n, &got, NULL);
+      if (got > n) got = n;                 /* never trust the count; see log109 */
+      if (!got) break;                      /* EOF or a dead handle: end here */
+      have += got;
+      __atomic_store_n(&st->feed.loaded, have, __ATOMIC_RELEASE);
+    }
+    if (g_fs_close) g_fs_close(j.h, NULL);
+    if (cancelled) g_prog_cancelled++;
+    else if (have < j.want) {
+      g_prog_short++;
+      log_printf("[snd] progressive load of \"%s\" ended short: %u of %u bytes",
+                 st->name, have, j.want);
+    }
+    __atomic_store_n(&st->feed.done, 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&st->loading, 0, __ATOMIC_RELEASE);
+  }
+  return 0;
+}
+
+static int prog_start(void) {
+  if (g_prog_thid >= 0) return 1;
+  g_prog_sema = sceKernelCreateSema("kotor_sndload", 0, 0, PROG_MAX_JOBS, NULL);
+  if (g_prog_sema < 0) return 0;
+  /* Below the game thread: it should soak up idle time, not take it. */
+  g_prog_thid = sceKernelCreateThread("kotor_sndload", prog_thread, 0x10000110, 0x4000,
+                                      0, 0, NULL);
+  if (g_prog_thid < 0 || sceKernelStartThread(g_prog_thid, 0, NULL) < 0) {
+    log_printf("[snd] progressive loader thread failed -- streams load whole");
+    g_prog_thid = -1;
+    return 0;
+  }
+  return 1;
+}
+
+/* Hand the rest of the file to the loader. Takes the handle. 0 = queue full
+ * (the caller then finishes the read itself). */
+static int prog_queue(Stream *st, void *h, unsigned want) {
+  lock();
+  if (g_prog_n >= PROG_MAX_JOBS) { unlock(); return 0; }
+  st->loading = 1;
+  g_prog_q[g_prog_n++] = (ProgJob){ st, h, want };
+  g_prog_jobs++;
+  unlock();
+  sceKernelSignalSema(g_prog_sema, 1);
+  return 1;
+}
+
+/* Read the rest of a stream's file on this thread: the fallback whenever the
+ * progressive path is not taken. */
+static unsigned read_rest(void *h, void *buf, unsigned have, unsigned want) {
+  while (have < want) {
+    unsigned got = 0, n = want - have;
+    g_fs_read(h, (char *)buf + have, n, &got, NULL);
+    if (got > n) got = n;
+    if (!got) break;
+    have += got;
+  }
+  return have;
+}
+#endif
+
 static unsigned g_created = 0, g_played = 0, g_missing = 0, g_overbudget = 0;
 
 /* When InitializeSource fails the game retries the SAME track many times a
@@ -1414,6 +1524,10 @@ static int Sys_createSound(void *self, const char *name, unsigned mode,
   const void *buf = NULL;
   unsigned    len = 0;
   void       *owned = NULL;               /* freed before we return */
+  /* Progressive stream load: the file handle still open behind `owned`, and
+   * how much of `len` is actually in it so far. NULL once the read is whole. */
+  void       *ph = NULL;
+  unsigned    have = 0;
 
   if (mode & FMOD_OPENMEMORY) {
     /* SFX: `name` is the buffer, not a path. */
@@ -1440,17 +1554,30 @@ static int Sys_createSound(void *self, const char *name, unsigned mode,
     owned = big_malloc(want);
     if (!owned) { if (g_fs_close) g_fs_close(h, NULL); return FMOD_ERR_MEMORY; }
     if (ex_off && g_fs_seek) g_fs_seek(h, ex_off, NULL);
-    unsigned got = 0;
-    g_fs_read(h, owned, want, &got, NULL);      /* EOF is fine if got > 0 */
-    if (g_fs_close) g_fs_close(h, NULL);
+    unsigned got = 0, first = want;
+#if AUDIO_STREAM_PROGRESSIVE
+    /* Only the head now; the loader thread reads the rest once the stream is
+     * open. Small files are not worth a second thread's attention. */
+    int prog = (mode & FMOD_CREATESTREAM) && want > 2 * PROG_HEAD_BYTES && prog_start();
+    if (prog) first = PROG_HEAD_BYTES;
+#endif
+    g_fs_read(h, owned, first, &got, NULL);     /* EOF is fine if got > 0 */
     /* NEVER trust the callback's byte count: once the companion's OBB handle
      * went bad it reported 966980227 for a 1.3 MB buffer, and we then scanned
      * far past the allocation (log109). */
-    if (got > want) {
+    if (got > first) {
       log_printf("[snd] stream read OVERRUN id=%.32s said %u for a %u buffer -- clamped",
-                 name, got, want);
-      got = want;
+                 name, got, first);
+      got = first;
     }
+#if AUDIO_STREAM_PROGRESSIVE
+    if (prog && got == first) {
+      ph = h;                                   /* keep it: the rest comes later */
+      have = got;
+      got = want;                               /* `len` is the whole file */
+    } else
+#endif
+    if (g_fs_close) g_fs_close(h, NULL);
     if (!got) {
       if (g_missing < 32)
         log_printf("[snd] stream read EMPTY id=%.32s want=%u fsz=%u", name, want, fsz);
@@ -1491,20 +1618,30 @@ static int Sys_createSound(void *self, const char *name, unsigned mode,
   PcmEntry *ent = cache_find_id(sound_id);
   if (ent) { ent->refs++; ent->stamp = ++g_clock; }
   unlock();
-  if (ent) { g_cache_hits++; big_free(owned); goto have_pcm; }
+  if (ent) {
+#if AUDIO_STREAM_PROGRESSIVE
+    if (ph && g_fs_close) g_fs_close(ph, NULL);
+#endif
+    g_cache_hits++; big_free(owned); goto have_pcm;
+  }
 
   /* Content identity remains the fallback for streams and callers outside the
-   * FModAudioSystem wrapper. Only read the transient buffer after the ID miss. */
-  uint32_t hkey = key_hash(buf, len);
-  lock();
-  ent = cache_find(len, hkey);
-  if (ent) {
-    ent->refs++;
-    ent->stamp = ++g_clock;
-    if (sound_id && !ent->sound_id) ent->sound_id = sound_id;
+   * FModAudioSystem wrapper. Only read the transient buffer after the ID miss.
+   * A progressive load has most of its bytes still to come, so it cannot be
+   * hashed; it is a stream, which this cache would not serve anyway. */
+  uint32_t hkey = 0;
+  if (!ph) {
+    hkey = key_hash(buf, len);
+    lock();
+    ent = cache_find(len, hkey);
+    if (ent) {
+      ent->refs++;
+      ent->stamp = ++g_clock;
+      if (sound_id && !ent->sound_id) ent->sound_id = sound_id;
+    }
+    unlock();
+    if (ent) { g_cache_hits++; big_free(owned); goto have_pcm; }
   }
-  unlock();
-  if (ent) { g_cache_hits++; big_free(owned); goto have_pcm; }
   g_cache_miss++;
 
   /* A whole music track is ~15 MB of PCM. Two of them filled the heap, after
@@ -1514,6 +1651,18 @@ static int Sys_createSound(void *self, const char *name, unsigned mode,
    * when we cannot afford it hand back a correctly-timed SILENT sound: costs no
    * memory, keeps the game's pacing, and stops the retry loop dead.
    * Proper fix is incremental streaming; this makes it survivable meanwhile. */
+#if AUDIO_STREAM_PROGRESSIVE
+  /* The header has to be inside what was read: a probe over the whole length
+   * would otherwise go hunting for a frame sync in bytes not yet loaded. */
+  if (ph) {
+    AudioPcm hp;
+    if (!audio_mp3_probe(buf, have, &hp)) {
+      len = read_rest(ph, owned, have, len);
+      if (g_fs_close) g_fs_close(ph, NULL);
+      ph = NULL;
+    }
+  }
+#endif
   if (!ok && (mode & FMOD_CREATESTREAM)) {
     AudioPcm est;
     if (audio_mp3_probe(buf, len, &est)) {
@@ -1537,6 +1686,21 @@ static int Sys_createSound(void *self, const char *name, unsigned mode,
           Stream *st = stream_open(owned, buf, len, &fmt,
                                    (mode & FMOD_LOOP_NORMAL) != 0);
           if (st) {
+#if AUDIO_STREAM_PROGRESSIVE
+            if (ph) {
+              /* Publish what is here before anything can read it, then let the
+               * loader fetch the rest. The Snd is not yet visible to the mixer,
+               * so nothing reads st until after this. */
+              st->feed.loaded = have;
+              audio_mp3_stream_set_feed(st->dec, &st->feed);
+              if (!prog_queue(st, ph, len)) {
+                st->feed.loaded = read_rest(ph, owned, have, len);
+                if (g_fs_close) g_fs_close(ph, NULL);
+                st->feed.done = 1;
+              }
+              ph = NULL;                   /* the loader (or we) closed it */
+            }
+#endif
             const char *base = what;
             for (const char *q = what; *q; q++)
               if (*q == '\\' || *q == '/') base = q + 1;
@@ -1582,6 +1746,16 @@ static int Sys_createSound(void *self, const char *name, unsigned mode,
     }
   }
 
+#if AUDIO_STREAM_PROGRESSIVE
+  /* Not streamed after all: everything below wants the whole file. */
+  if (ph) {
+    len = read_rest(ph, owned, have, len);
+    if (g_fs_close) g_fs_close(ph, NULL);
+    ph = NULL;
+    if (!len) { big_free(owned); return FMOD_ERR_FILE_NOTFOUND; }
+  }
+  if (!hkey) hkey = key_hash(buf, len);
+#endif
   if (!ok) {
     /* Header-only rejection prevents a corrupted transient SFX buffer from
      * spending 100+ ms in the hardware decoder's byte-by-byte resync loop. */

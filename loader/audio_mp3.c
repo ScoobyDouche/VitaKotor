@@ -596,7 +596,23 @@ struct AudioMp3Stream {
   unsigned blk;                            /* next block index */
   int16_t *wbuf;                           /* one block of decoded frames */
   unsigned wbuf_n, wbuf_off;               /* in int16 units */
+
+  const AudioStreamFeed *feed;             /* NULL: the whole buffer is here */
 };
+
+void audio_mp3_stream_set_feed(AudioMp3Stream *s, const AudioStreamFeed *f) {
+  if (s) s->feed = f;
+}
+
+/* How far into the buffer may be read right now. *final is 1 when that is
+ * the real end of the asset, 0 while more bytes are still on their way. */
+static unsigned es_end(const AudioMp3Stream *s, int *final) {
+  if (!s->feed) { *final = 1; return s->len; }
+  int done = __atomic_load_n(&s->feed->done, __ATOMIC_ACQUIRE);
+  unsigned n = __atomic_load_n(&s->feed->loaded, __ATOMIC_ACQUIRE);
+  *final = done;
+  return n < s->len ? n : s->len;
+}
 
 /* Would this asset need one of the AUDIO_MP3_DECODER_POOL hardware handles?
  * The caller checks its stream cap against the pool, and a RIFF stream must not
@@ -729,6 +745,20 @@ unsigned audio_mp3_stream_read(AudioMp3Stream *s, int16_t *dst, unsigned frames)
         continue;
       }
       if (s->eos) break;
+      if (s->feed) {
+        /* Never decode a block whose bytes have not arrived. Once the load is
+         * finished, a block past the bytes that did arrive is the end. */
+        const WavInfo *w = &s->wav;
+        unsigned bsz = (w->afmt == 17) ? w->balign : (1024 * w->ch * (w->bits / 8));
+        unsigned need = w->data_off + (s->blk + 1) * bsz;
+        if (need > w->data_off + w->data_len) need = w->data_off + w->data_len;
+        int final;
+        unsigned end = es_end(s, &final);
+        if (need > end) {
+          if (final) s->eos = 1;
+          break;
+        }
+      }
       unsigned n = wav_fill_block(s);
       if (!n) { s->eos = 1; break; }
       s->wbuf_n   = n * s->ch;
@@ -756,7 +786,12 @@ unsigned audio_mp3_stream_read(AudioMp3Stream *s, int16_t *dst, unsigned frames)
     s->ctrl.inputEsSize   = 0;
     s->ctrl.pPcm          = s->carry;
     s->ctrl.outputPcmSize = 0;
-    unsigned avail = (s->pos < s->len) ? s->len - s->pos : 0;
+    int final;
+    unsigned end = es_end(s, &final);
+    unsigned avail = (s->pos < end) ? end - s->pos : 0;
+    /* A frame cut off by the load front would decode as garbage and be
+     * skipped byte by byte, so wait for a full maximum-size frame. */
+    if (!final && avail < SCE_AUDIODEC_MP3_MAX_ES_SIZE) break;
     if (avail < 4) { s->eos = 1; break; }
     s->ctrl.maxEsSize = avail < SCE_AUDIODEC_MP3_MAX_ES_SIZE
                           ? avail : SCE_AUDIODEC_MP3_MAX_ES_SIZE;
@@ -779,6 +814,7 @@ unsigned audio_mp3_stream_read(AudioMp3Stream *s, int16_t *dst, unsigned frames)
     s->carry_off = 0;
     s->pos      += s->ctrl.inputEsSize;
     if (!s->carry_n && s->pos >= s->len) { s->eos = 1; break; }
+    if (!s->carry_n && s->feed && s->pos >= es_end(s, &final) && final) { s->eos = 1; break; }
   }
   return got / s->ch;
 }

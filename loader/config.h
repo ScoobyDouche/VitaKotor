@@ -500,6 +500,13 @@
 // Needs AUDIO_STREAM_LONG_ASSETS. 0 = stream only the oversized ones, as before.
 #define AUDIO_STREAM_ALL 1
 
+// Read a long stream's file in behind the decoder instead of all at once.
+// log203: music and long ambient beds read 1.2-2.3 MB on the game thread before
+// they could start, 160-520 ms of frozen frame at every track change. Now only
+// the first 128 KB is read up front and a loader thread fetches the rest. Files
+// up to 256 KB still load whole. 0 = read every stream whole, as before.
+#define AUDIO_STREAM_PROGRESSIVE 1
+
 // Decompressed-resource cache (lzma_cache.c), in KB; 0 disables it. log202: a
 // sound the game replays several times a second (pl_doorstuck) cost ~36 ms per
 // play, 29 of them LZMA re-decompressing the same 47 KB -- the engine's own
