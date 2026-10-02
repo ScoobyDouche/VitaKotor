@@ -55,6 +55,20 @@ BUILD stamp — and therefore the snapshot name — goes stale.
 release, and the newest `backups/KOTOR-<stamp>.vpk` is a byte-identical copy of
 it. There is no separate hand-maintained release copy to keep in sync.
 
+Releases also carry a quiet build, attached as `KOTOR-nolog.vpk`. It writes no
+`log.txt` (a CPU fault still dumps its crash report there) and leaves out the
+`[prof]` timers. It is an extra download for players who want it, never a
+replacement: the logged `KOTOR.vpk` stays the main asset, because its log is
+how bug reports get fixed. Build it from the same tree, in its own directory:
+
+```bash
+cmake -S . -B build-nolog -DCMAKE_BUILD_TYPE=Release -DKOTOR_NO_LOG=ON   # once
+touch loader/log.c && make -C build-nolog KOTOR.vpk-vpk -j8
+cp build-nolog/KOTOR.vpk KOTOR-nolog.vpk                                   # upload this name
+```
+
+It is not snapshotted to `backups/`.
+
 Inspecting the Android binaries (recon):
 
 ```bash

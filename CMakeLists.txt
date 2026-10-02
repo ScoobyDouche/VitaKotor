@@ -33,6 +33,7 @@ set(VITA_MKSFOEX_FLAGS "-d ATTRIBUTE2=12")
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -g -D_GNU_SOURCE -Wl,-q -Wl,-z,max-page-size=0x10000 -Wall -O2 -fno-optimize-sibling-calls")
 set(CMAKE_CXX_FLAGS "${CMAKE_C_FLAGS} -std=c++11 -Wno-write-strings")
 
+option(KOTOR_NO_LOG "Quiet build: no log.txt except a crash dump (shipped next to the logged VPK)" OFF)
 option(KOTOR_BINK_SHADER_TEST "Initialize the embedded Bink shaders while continuing to skip movies" OFF)
 option(KOTOR_BINK_LEGAL_VIDEO_TEST "Play silent legal.bik once while skipping all audio-bearing movies" OFF)
 option(KOTOR_BINK_OPENSL_TEST "Play short 01c.bik once through the existing Vita mixer" OFF)
@@ -73,6 +74,9 @@ add_executable(KOTOR
 )
 
 target_compile_definitions(KOTOR PRIVATE KOTOR_USE_BINK_OPENSL=1)
+if(KOTOR_NO_LOG)
+  target_compile_definitions(KOTOR PRIVATE LOG_OFF=1)
+endif()
 
 if((KOTOR_BINK_SHADER_TEST AND KOTOR_BINK_LEGAL_VIDEO_TEST) OR
    (KOTOR_BINK_SHADER_TEST AND KOTOR_BINK_OPENSL_TEST) OR
@@ -182,8 +186,12 @@ vita_create_vpk(KOTOR.vpk ${VITA_TITLEID} eboot.bin
 
 # Keep the last few builds (vpk + matching source tarball) under backups/ so a
 # bad change can be undone without a rebuild. Never fails the build.
+# The no-log build is configured in its own directory (build-nolog/) and the
+# snapshot script only knows build/, so it would back up the wrong VPK.
+if(NOT KOTOR_NO_LOG)
 add_custom_command(TARGET KOTOR.vpk-vpk POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E env KEEP_BUILDS=4
           bash ${CMAKE_SOURCE_DIR}/tools/snapshot.sh || ${CMAKE_COMMAND} -E true
   COMMENT "Snapshotting build to backups/"
 )
+endif()

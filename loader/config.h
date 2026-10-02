@@ -301,6 +301,15 @@
 // warning is kept regardless, as is everything written in panic mode.
 #define LOG_DIAGNOSTICS 1
 
+// The no-log VPK (cmake -DKOTOR_NO_LOG=ON, see CMakeLists.txt) sets LOG_OFF=1:
+// log.txt is never written, except that a CPU fault still dumps its crash
+// report there. It ships NEXT TO the normal build for players who want the
+// last bit of card I/O back, never instead of it -- the logged build is still
+// the one a bug report needs.
+#ifndef LOG_OFF
+#define LOG_OFF 0
+#endif
+
 #define LOG_BUFFER_KB  8
 #define LOG_FLUSH_MS   1000
 

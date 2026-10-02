@@ -141,6 +141,10 @@ static int log_suppressed(const char *fmt) {
 void log_printf(const char *fmt, ...) {
   char line[1024];
 
+#if LOG_OFF
+  if (!g_panic) return;
+#endif
+
 #if !LOG_DIAGNOSTICS
   if (!g_panic && log_suppressed(fmt)) return;
 #endif
@@ -204,6 +208,13 @@ void log_init(void) {
   // Ensure ux0:data/kotor exists (ignore EEXIST).
   sceIoMkdir("ux0:data", 0777);
   sceIoMkdir(DATA_PATH, 0777);
+
+#if LOG_OFF
+  // No log this session. Remove the last one so a log.txt left by a logged
+  // build is never mistaken for this run; a crash dump recreates the file.
+  sceIoRemove(LOG_PATH);
+  return;
+#endif
 
   // Truncate the log at startup.
   SceUID fd = sceIoOpen(LOG_PATH, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
