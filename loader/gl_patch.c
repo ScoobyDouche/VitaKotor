@@ -37,6 +37,7 @@
 #include "loadscreen.h"
 #include "geo_probe.h"
 #include "gxm_patcher.h"
+#include "gameprof.h"
 
 static inline float u2f(uint32_t u) { union { uint32_t u; float f; } c; c.u = u; return c.f; }
 
@@ -542,7 +543,9 @@ static void glDrawArrays_t(GLenum mode, GLint first, GLsizei count) {
 #if GEOM_PROBE
   geo_check_arrays(g_cur_prog, first, count);
 #endif
+  uint64_t t0 = sceKernelGetProcessTimeWide();
   glDrawArrays(mode, first, count);
+  g_prof_draw_us += sceKernelGetProcessTimeWide() - t0;
 }
 /* Name the diffuse texture behind a cubemap draw, and its alpha.
  *
@@ -605,7 +608,9 @@ static void glDrawElements_t(GLenum mode, GLsizei count, GLenum type, const void
 #if GEOM_PROBE
   geo_check_elements(g_cur_prog, count, type, idx);
 #endif
+  uint64_t t0 = sceKernelGetProcessTimeWide();
   glDrawElements(mode, count, type, idx);
+  g_prof_draw_us += sceKernelGetProcessTimeWide() - t0;
 }
 void gl_patch_on_swap(uint64_t swap_begin_us, uint64_t swap_end_us) {
   static unsigned frame = 0;
@@ -739,6 +744,7 @@ void gl_patch_on_swap(uint64_t swap_begin_us, uint64_t swap_end_us) {
                (unsigned)(g_tex_up >> 10), (unsigned)(g_tex_down >> 10), g_tex_untracked,
                 g_tex16_n, (unsigned)(g_tex16_saved >> 10));
     gxmp_window_report();
+    gameprof_window_report();
 #if GEOM_PROBE
     geo_window_report();
 #endif

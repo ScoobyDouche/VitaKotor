@@ -344,6 +344,12 @@
 #define FRAME_HITCH_TRACE_MS   80
 #define FRAME_HITCH_LOG_GAP_MS 500
 
+// Game-side frame profile (gameprof.c): the engine's own per-frame stopwatches
+// plus inclusive timers on the client/server object updates, one pair of
+// [prof] lines per 120-frame window. log197 put ~60 of an 80 ms Undercity
+// frame in CClientAIMaster::UpdateState; this says which part of it.
+#define GAME_PROF (!LOG_OFF)
+
 // Bink integration modes. Production uses the embedded player and routes decoded
 // PCM through the existing Vita mixer. The other modes retain isolated regression
 // gates for shader, silent-video, and single audio/video playback.

@@ -37,6 +37,7 @@
 #include "bigalloc.h"
 #include "log.h"
 #include "gxm_patcher.h"
+#include "gameprof.h"
 
 #include <pthread.h>
 
@@ -1526,6 +1527,7 @@ static void *GameUpdate_probe(void) {
   g_gu_time += sceKernelGetProcessTimeWide() - start;
   g_gu_active = 0;
   if (g_ai_update_time) g_last_ai_ms = *g_ai_update_time;
+  gameprof_after_update();
   return rc;
 }
 
@@ -2857,6 +2859,7 @@ int main(int argc, char *argv[]) {
   install_lzma_probe();
   install_head_probe();
   install_load_probe();
+  gameprof_install();
   install_sound_probe();
 
   // NOTE: vitaGL is initialised on the game thread (see game_main_thread), not

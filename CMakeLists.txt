@@ -70,6 +70,7 @@ add_executable(KOTOR
   loader/crash.c
   loader/heap.c
   loader/bigalloc.c
+  loader/gameprof.c
   loader/log.c
 )
 
