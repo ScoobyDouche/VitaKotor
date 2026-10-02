@@ -17,6 +17,10 @@ void bigalloc_init(void);
  * no segment could be taken: every caller must fall back to malloc on NULL. */
 void *bigalloc(size_t n);
 
+/* Pool allocation at any size, for when newlib has already refused. NULL only
+ * if the pool is out too. */
+void *bigalloc_rescue(size_t n);
+
 /* True if p came from bigalloc. Cheap enough for the free path: a bounds test
  * per live segment, of which there are at most BIGALLOC_MAX_SEGS. */
 int bigalloc_owns(const void *p);

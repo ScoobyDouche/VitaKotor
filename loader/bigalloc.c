@@ -117,6 +117,9 @@ static unsigned s_nlive, s_nalloc, s_nfallback, s_nsegfail;
  * rather than implying one. */
 static uint32_t s_fb_max;
 static uint64_t s_fb_bytes;
+/* Requests newlib could not serve that the pool took instead. */
+static unsigned s_nrescue;
+static uint64_t s_rescue_bytes;
 
 static Hdr *hdr_of(void *p)          { return (Hdr *)((unsigned char *)p - HDR_SZ); }
 static void *payload_of(Hdr *h)      { return (unsigned char *)h + HDR_SZ; }
@@ -190,8 +193,8 @@ static void split(Seg *s, Hdr *h, uint32_t need) {
   if (after) after->prev = rest->size;
 }
 
-void *bigalloc(size_t n) {
-  if (!s_inited || n < BIGALLOC_MIN_BYTES) return NULL;
+static void *take(size_t n) {
+  if (!s_inited) return NULL;
   uint32_t need = (uint32_t)ALIGN_UP(n) + HDR_SZ;
   if (need < n) return NULL;                       /* overflow */
 
@@ -217,6 +220,29 @@ void *bigalloc(size_t n) {
   if (s_live > s_peak) s_peak = s_live;
   unlock();
   return payload_of(h);
+}
+
+void *bigalloc(size_t n) {
+  return n < BIGALLOC_MIN_BYTES ? NULL : take(n);
+}
+
+/* log199 died with 54.9 MB free in newlib and nothing larger than 128 KB to
+ * hand out, on a 250 KB request that sat just under the threshold, while this
+ * pool had 34 MB spare. When newlib refuses, the pool is a better answer than
+ * bad_alloc at any size. Small blocks in here cost contiguity, but only once
+ * newlib has none left to lose. */
+void *bigalloc_rescue(size_t n) {
+  void *p = take(n ? n : 1);
+  if (p) {
+    lock();
+    s_nrescue++;
+    s_rescue_bytes += n;
+    unlock();
+    if (s_nrescue <= 8 || !(s_nrescue & (s_nrescue - 1)))
+      log_printf("[big] RESCUE #%u: newlib refused %u bytes, served from the pool",
+                 s_nrescue, (unsigned)n);
+  }
+  return p;
 }
 
 /* Deliberately unlocked, and safe without one: s_nseg only ever grows, and it
@@ -284,7 +310,8 @@ void bigfree(void *p) {
 
 void *big_malloc(size_t n) {
   void *p = bigalloc(n);
-  return p ? p : malloc(n);
+  if (!p) p = malloc(n);
+  return p ? p : bigalloc_rescue(n);
 }
 
 void big_free(void *p) {
@@ -299,14 +326,25 @@ void *big_realloc(void *p, size_t n) {
     /* newlib's block. Growing past the threshold is the one case worth moving
      * into the pool, since that is exactly the request that would otherwise go
      * looking for a big contiguous run in the general heap. */
-    if (n < BIGALLOC_MIN_BYTES) return realloc(p, n);
+    if (n < BIGALLOC_MIN_BYTES) {
+      void *r = realloc(p, n);
+      if (r || !n) return r;
+      /* newlib's realloc leaves p alone on failure, so it can still be copied */
+      size_t have = malloc_usable_size(p);
+      if (!(r = bigalloc_rescue(n))) return NULL;
+      memcpy(r, p, have < n ? have : n);
+      free(p);
+      return r;
+    }
     /* How much of it may be read is newlib's to say. The first cut copied `n`
      * bytes on the theory that the old block was below the threshold and so
      * shorter -- which reads off the end of it, as ASan pointed out on the very
      * first host run. */
     size_t have = malloc_usable_size(p);
     void *q = bigalloc(n);
-    if (!q) return realloc(p, n);
+    if (!q && (q = realloc(p, n))) return q;
+    if (!q) q = bigalloc_rescue(n);
+    if (!q) return NULL;
     memcpy(q, p, have < n ? have : n);
     free(p);
     return q;
@@ -334,9 +372,10 @@ void bigalloc_log(const char *why) {
 
   log_printf("[big] %s%u/%u MB live in %u blocks (peak %u MB), %u free blocks, "
              "largest %u KB; %u served, %u fell back to malloc "
-             "(%u MB total, worst %u KB), %u segment fails",
+             "(%u MB total, worst %u KB), %u segment fails, %u rescued (%u KB)",
              why ? why : "", (unsigned)(s_live >> 20), (unsigned)(cap >> 20), s_nlive,
              (unsigned)(s_peak >> 20), nfree, largest / 1024u,
              s_nalloc, s_nfallback,
-             (unsigned)(s_fb_bytes >> 20), s_fb_max / 1024u, s_nsegfail);
+             (unsigned)(s_fb_bytes >> 20), s_fb_max / 1024u, s_nsegfail,
+             s_nrescue, (unsigned)(s_rescue_bytes >> 10));
 }

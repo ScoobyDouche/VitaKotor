@@ -683,14 +683,17 @@ static void free_diag(void *p) { big_free(p); }
 static void *Znwj_diag(size_t n) {
   MEM_TRACE("new", n); g_heap_last_new = n; heap_note_alloc(n);
   void *p = bigalloc(n);
-  /* On NULL fall through to the real operator new, which still runs the
-   * new-handler and still throws bad_alloc -- the pool must not change what
-   * failure looks like to the game. */
+  /* newlib next, then the pool at any size. Only if both refuse does the real
+   * operator new run, with its new-handler and its bad_alloc. */
+  if (!p) p = malloc(n);
+  if (!p) p = bigalloc_rescue(n);
   return p ? p : real_Znwj(n);
 }
 static void *Znaj_diag(size_t n) {
   MEM_TRACE("new[]", n); g_heap_last_new = n; heap_note_alloc(n);
   void *p = bigalloc(n);
+  if (!p) p = malloc(n);
+  if (!p) p = bigalloc_rescue(n);
   return p ? p : real_Znaj(n);
 }
 static void ZdlPv_diag(void *p) { if (bigalloc_owns(p)) bigfree(p); else real_ZdlPv(p); }
