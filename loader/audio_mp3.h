@@ -27,9 +27,13 @@ typedef struct {
  * IsPlaying() then reports nothing playing.
  *
  * STREAM_MAX must stay strictly below DECODER_POOL so a spare always exists.
- * SDK ceiling is SCE_AUDIODEC_MP3_MAX_NSTREAMS (6). */
-#define AUDIO_MP3_DECODER_POOL 4
-#define AUDIO_MP3_STREAM_MAX   2
+ * SDK ceiling is SCE_AUDIODEC_MP3_MAX_NSTREAMS (6).
+ *
+ * 4/2 -> 5/3 when voice lines started streaming too (AUDIO_STREAM_ALL): music
+ * plus a voice line is already two, so a third stream no longer has to fall
+ * back to a whole decode on the game thread. */
+#define AUDIO_MP3_DECODER_POOL 5
+#define AUDIO_MP3_STREAM_MAX   3
 
 // One-time hardware decoder library init. Safe to call repeatedly.
 int  audio_mp3_init_library(void);

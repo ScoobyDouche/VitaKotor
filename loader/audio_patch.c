@@ -1518,7 +1518,13 @@ static int Sys_createSound(void *self, const char *name, unsigned mode,
     AudioPcm est;
     if (audio_mp3_probe(buf, len, &est)) {
       unsigned need = est.nsamples * est.channels * 2u;
-      if (need > STREAM_PCM_MAX || g_pcm_bytes + need > PCM_BUDGET_BYTES) {
+      int too_big = need > STREAM_PCM_MAX || g_pcm_bytes + need > PCM_BUDGET_BYTES;
+      /* log201: every voice line was decoded whole, on the game thread, before
+       * createSound returned -- 200-350 ms of frozen frame per line of dialogue.
+       * Stream every stream-mode asset, not just the oversized ones; if that
+       * cannot be done (decoder cap, a format the streamer does not take) a
+       * sound that fits still gets the whole decode below. */
+      if (too_big || AUDIO_STREAM_ALL) {
 #if AUDIO_STREAM_LONG_ASSETS
         /* Too big to hold decoded, so stream it: the compressed bytes plus a
          * ring instead of the whole waveform, and no decode stall on start.
@@ -1559,16 +1565,19 @@ static int Sys_createSound(void *self, const char *name, unsigned mode,
           }
         }
 #endif
-        /* Could not stream it -- fall back to timed silence, which at least
-         * keeps the game's pacing and stops the retry loop. */
-        pcm = est;                                  /* est.pcm is already NULL */
-        ok = silent = 1;
-        if (g_overbudget < 12)
-          log_printf("[snd] stream too large and NOT streamable: id=%.32s needs %u KB "
-                     "(cap %u KB, in use %u KB, owned=%d) -- playing %u ms of SILENCE",
-                     name, need / 1024, STREAM_PCM_MAX / 1024,
-                     g_pcm_bytes / 1024, owned ? 1 : 0, est.ms);
-        g_overbudget++;
+        /* Could not stream it. A sound that fits is decoded whole after all;
+         * one that does not becomes timed silence, which at least keeps the
+         * game's pacing and stops the retry loop. */
+        if (too_big) {
+          pcm = est;                                  /* est.pcm is already NULL */
+          ok = silent = 1;
+          if (g_overbudget < 12)
+            log_printf("[snd] stream too large and NOT streamable: id=%.32s needs %u KB "
+                       "(cap %u KB, in use %u KB, owned=%d) -- playing %u ms of SILENCE",
+                       name, need / 1024, STREAM_PCM_MAX / 1024,
+                       g_pcm_bytes / 1024, owned ? 1 : 0, est.ms);
+          g_overbudget++;
+        }
       }
     }
   }

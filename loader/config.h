@@ -493,6 +493,20 @@
 // became a correctly-timed silent placeholder and the score was never audible.
 #define AUDIO_STREAM_LONG_ASSETS 1
 
+// Stream EVERY stream-mode asset (voice lines, ambient beds), not only those over
+// STREAM_PCM_MAX. log201: each voice line was decoded whole on the game thread
+// before it could start, freezing the frame for 200-350 ms per line. Anything the
+// streamer cannot take (decoder cap reached, RIFF PCM) still decodes whole.
+// Needs AUDIO_STREAM_LONG_ASSETS. 0 = stream only the oversized ones, as before.
+#define AUDIO_STREAM_ALL 1
+
+// Decompressed-resource cache (lzma_cache.c), in KB; 0 disables it. log202: a
+// sound the game replays several times a second (pl_doorstuck) cost ~36 ms per
+// play, 29 of them LZMA re-decompressing the same 47 KB -- the engine's own
+// resource cache lets go of it in between. One ring allocated at boot, so it
+// cannot fragment the heap; outputs over 2 MB (area-load textures) are not kept.
+#define LZMA_CACHE_KB (8 * 1024)
+
 // Upload textures as 16-bit instead of 32-bit.
 //
 // The live-texture census (log161) is emphatic that nothing leaks: 1,014,190 KB

@@ -71,6 +71,7 @@ add_executable(KOTOR
   loader/heap.c
   loader/bigalloc.c
   loader/gameprof.c
+  loader/lzma_cache.c
   loader/log.c
 )
 

@@ -38,6 +38,7 @@
 #include "log.h"
 #include "gxm_patcher.h"
 #include "gameprof.h"
+#include "lzma_cache.h"
 
 #include <pthread.h>
 
@@ -1158,7 +1159,20 @@ static int LzmaUncompress_probe(unsigned char *dest, size_t *destLen,
                                 const unsigned char *props, size_t propsSize) {
   size_t dl_in = destLen ? *destLen : 0;
   size_t sl_in = srcLen ? *srcLen : 0;
+#if LZMA_CACHE_KB
+  uint64_t key = 0;
+  if (lzma_cache_get(&key, dest, destLen, src, srcLen, props, propsSize)) {
+    g_lz_n++;
+    return 0;                                   /* SZ_OK, from the cache */
+  }
+  uint64_t t0 = sceKernelGetProcessTimeWide();
+#endif
   int rc = LzmaUncompress_orig(dest, destLen, src, srcLen, props, propsSize);
+#if LZMA_CACHE_KB
+  lzma_cache_note_miss_us(sceKernelGetProcessTimeWide() - t0);
+  if (rc == 0 && key)
+    lzma_cache_put(key, dl_in, sl_in, dest, *destLen, *srcLen);
+#endif
   if (g_lz_n < 64) {
     char p[24];
     p[0] = 0;
@@ -1178,6 +1192,9 @@ static int LzmaUncompress_probe(unsigned char *dest, size_t *destLen,
 }
 
 static void install_lzma_probe(void) {
+#if LZMA_CACHE_KB
+  lzma_cache_init((size_t)LZMA_CACHE_KB * 1024u);
+#endif
   uintptr_t lu = so_symbol(&lzma_mod, "LzmaUncompress");
   if (!lu) { log_printf("[lzma] LzmaUncompress symbol MISSING in libLzmaLib"); return; }
   // Confirm the companion's import actually bound here -- a silently unresolved
@@ -1937,18 +1954,18 @@ static void *(*SndSrcPlay_orig)(void *) = NULL;
  * the boundary can see that. If they track each other, the wedge is higher up. */
 static unsigned g_src_ctor = 0, g_src_play = 0, g_src_play_noint = 0;
 static unsigned g_demand = 0, g_demand_nores = 0, g_demand_fail = 0;
-static unsigned g_streaminit = 0, g_streaminit_fail = 0;
+static unsigned g_streaminit = 0;
 static unsigned g_fmod_create = 0, g_fmod_createstream = 0;
 static unsigned g_fmod_play = 0, g_fmod_play_null = 0;
 
 static void sound_pipeline_census(void) {
   log_printf("[snd?] pipeline: %u SoundSource ctor, %u Play (%u no internal), "
-             "%u Demand (%u no CRes / %u failed), %u StreamInit (%u failed), "
+             "%u Demand (%u no CRes / %u failed), %u StreamInit, "
              "%u CreateSound + %u CreateStream, %u PlaySound (%u returned null) "
              "-> %u reached the mixer  [gap %d]",
              g_src_ctor, g_src_play, g_src_play_noint,
              g_demand, g_demand_nores, g_demand_fail,
-             g_streaminit, g_streaminit_fail,
+             g_streaminit,
              g_fmod_create, g_fmod_createstream,
              g_fmod_play, g_fmod_play_null, audio_play_count(),
              (int)g_fmod_play - (int)audio_play_count());
@@ -1966,6 +1983,15 @@ static void *SndSrcCtor_probe(void *self, const void *resref) {
   n++; g_src_ctor++;
   return SndSrcCtor_orig(self, resref);
 }
+/* Where a slow sound start spends its time. log201's ambient-sound stutters
+ * (CSWCSoundObject::AIUpdate peaking at 160-290 ms, one 90-240 KB OBB read each,
+ * no decode logged) happen inside CExoSoundSource::Play; this splits that into
+ * the resource load (Demand) and our createSound, and names the asset. Game
+ * thread only, so plain globals. */
+static uint64_t g_play_demand_us, g_play_create_us;
+static char g_play_create_name[48];
+static unsigned g_play_slow_n;
+
 static void *SndSrcPlay_probe(void *self) {
   static unsigned n = 0;
   void *internal = self ? *(void **)((char *)self + 4) : NULL;  // m_pInternal
@@ -1973,12 +1999,26 @@ static void *SndSrcPlay_probe(void *self) {
     log_printf("[snd?] CExoSoundSource::Play() #%u m_pInternal=%p%s", n, internal,
                internal ? "" : "  <<< NULL internal, nothing can play");
   n++; g_src_play++; if (!internal) g_src_play_noint++;
-  return SndSrcPlay_orig(self);
+  g_play_demand_us = g_play_create_us = 0;
+  g_play_create_name[0] = 0;
+  uint64_t t0 = sceKernelGetProcessTimeWide();
+  void *rc = SndSrcPlay_orig(self);
+  uint64_t dt = sceKernelGetProcessTimeWide() - t0;
+  if (dt >= 25000) {
+    g_play_slow_n++;
+    log_printf("[snd] slow Play #%u: %u ms (Demand %u ms, CreateSound %u ms \"%.40s\")",
+               g_play_slow_n, (unsigned)(dt / 1000), (unsigned)(g_play_demand_us / 1000),
+               (unsigned)(g_play_create_us / 1000),
+               g_play_create_name[0] ? g_play_create_name : "-");
+  }
+  return rc;
 }
 
 static void *SndDemand_probe(void *self) {
   void *res = self ? *(void **)((char *)self + 8) : NULL;   // m_pRes: NULL == early bail
+  uint64_t t0 = sceKernelGetProcessTimeWide();
   void *rc = SndDemand_orig(self);
+  g_play_demand_us += sceKernelGetProcessTimeWide() - t0;
   static unsigned n = 0;
   if (n < 40)
     log_printf("[snd?] SoundSource::Demand #%u m_pRes=%p -> %p%s", n, res, rc,
@@ -1986,11 +2026,13 @@ static void *SndDemand_probe(void *self) {
   n++; g_demand++; if (!res) g_demand_nores++; if (!rc) g_demand_fail++;
   return rc;
 }
+/* InitializeSource is void: r0 on return is its stack-guard scratch, always 0,
+ * so there is no success flag to count (log198-200 read every call as failed). */
 static void *StreamInit_probe(void *self) {
   void *rc = StreamInit_orig(self);
   static unsigned n = 0;
-  if (n < 40) log_printf("[snd?] StreamingSource::InitializeSource #%u -> %p", n, rc);
-  n++; g_streaminit++; if (!rc) g_streaminit_fail++;
+  if (n < 40) log_printf("[snd?] StreamingSource::InitializeSource #%u", n);
+  n++; g_streaminit++;
   return rc;
 }
 static unsigned g_nclose = 0, g_nrelease = 0;   /* stream/sound teardown counts */
@@ -2004,7 +2046,13 @@ static void *FmodCreateSound_probe(void *self, char *name, int id, void *data,
   n++; g_fmod_create++;
   unsigned previous_id = audio_sfx_context_push((unsigned)id);
   audio_sfx_context_name(name);
+  uint64_t t0 = sceKernelGetProcessTimeWide();
   void *rc = FmodCreateSound_orig(self, name, id, data, size, e, f);
+  g_play_create_us += sceKernelGetProcessTimeWide() - t0;
+  if (name) {
+    strncpy(g_play_create_name, name, sizeof g_play_create_name - 1);
+    g_play_create_name[sizeof g_play_create_name - 1] = 0;
+  }
   audio_sfx_context_name(NULL);
   audio_sfx_context_pop(previous_id);
   return rc;
