@@ -217,6 +217,17 @@ void sdl_gamepad_probe_init(uintptr_t pressed, uintptr_t this_frame, uintptr_t m
              (void *)pressed, (void *)this_frame, (void *)map);
 }
 
+/* Per-axis JOYAXISMOTION stats for the current census window: count, big jumps
+ * between consecutive values, and range. Axes 0/1 = left stick, 2/3 = right. */
+static struct { int last, lo, hi; unsigned n, jumps; int seen; } g_axis[4];
+static volatile unsigned g_pumps = 0;
+
+static void axis_window_reset(void) {
+  for (int a = 0; a < 4; a++)
+    g_axis[a].n = g_axis[a].jumps = 0;
+  g_pumps = 0;
+}
+
 static void log_event(const char *via, const SDL_Event *e) {
   unsigned t = (unsigned)e->type, i;
   for (i = 0; i < g_evt_used; i++)
@@ -261,6 +272,27 @@ static void log_event(const char *via, const SDL_Event *e) {
                (unsigned)e->jhat.value, hat_n);
   }
 
+  // log215: on the Endar Spire the sticks moved in jerks while touch steering
+  // stayed smooth, and 0x600 ran at a flat ~2870 per window (8 per frame, every
+  // frame) against ~600 elsewhere -- while the raw read in input_patch.c saw the
+  // right stick centred almost throughout. That smells of values alternating
+  // between the real deflection and centre. A thumb cannot cross half the axis
+  // between two consecutive samples; a flickering source does it every time.
+  if (t == SDL_JOYAXISMOTION && e->jaxis.axis < 4) {
+    unsigned a = e->jaxis.axis;
+    int v = e->jaxis.value;
+    g_axis[a].n++;
+    if (g_axis[a].seen) {
+      int d = v - g_axis[a].last;
+      if (d < 0) d = -d;
+      if (d >= 16384) g_axis[a].jumps++;
+    }
+    if (g_axis[a].n == 1 || v < g_axis[a].lo) g_axis[a].lo = v;
+    if (g_axis[a].n == 1 || v > g_axis[a].hi) g_axis[a].hi = v;
+    g_axis[a].last = v;
+    g_axis[a].seen = 1;
+  }
+
   g_evt_total++;
 }
 
@@ -281,10 +313,18 @@ void sdl_input_census(void) {
   }
   log_printf("[input] delivered since last (total %u): %s", g_evt_total,
              p ? buf : "(no event type has ever arrived)");
+  p = 0;
+  for (int a = 0; a < 4; a++)
+    p += snprintf(buf + p, sizeof(buf) - p, "%sa%d n=%u jump=%u [%d..%d]",
+                  a ? " | " : "", a, g_axis[a].n, g_axis[a].jumps,
+                  g_axis[a].n ? g_axis[a].lo : 0, g_axis[a].n ? g_axis[a].hi : 0);
+  log_printf("[input] axes: %s; pumps=%u", buf, g_pumps);
+  axis_window_reset();
 }
 static void SDL_PumpEvents_hook(void) {
   static volatile int n = 0;
   int c = n++;
+  g_pumps++;
   if (c < 3 || (c & 2047) == 0)
     log_printf("[input] SDL_PumpEvents #%d (game is polling)", c);
   SDL_PumpEvents();

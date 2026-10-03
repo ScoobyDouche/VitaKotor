@@ -90,6 +90,8 @@ static unsigned s_rear_frames = 0;   /* ... with a finger on the REAR panel:
 static unsigned s_pushed = 0;        /* finger events handed to SDL */
 static unsigned s_push_fail = 0;     /* ... that SDL refused (queue full) */
 
+static void input_stick_census(void);
+
 void input_probe_census(void) {
   log_printf("[input] raw: %u frames, rstick off-centre %u (peak %u/127), "
              "touching %u, rear %u; pushed %u finger events, %u REFUSED by SDL",
@@ -98,6 +100,7 @@ void input_probe_census(void) {
   s_frames = s_rstick_frames = s_rstick_max = s_touch_frames = 0;
   s_rear_frames = 0;
   s_pushed = s_push_fail = 0;
+  input_stick_census();
 }
 
 /* Read the right stick straight from the pad. main() selects ANALOG_WIDE via
@@ -115,6 +118,49 @@ static void sample_rstick(void) {
     s_rstick_frames++;
     if (d > s_rstick_max) s_rstick_max = d;
   }
+}
+
+/* log215: jerky sticks with smooth touch steering. SDL's Vita backend reads the
+ * pad with sceCtrlPeekBufferPositive2 -- NOT the Ext2 reader above, and the two
+ * have separate sampling modes -- so read the stick both ways and count frames
+ * where a stick snaps between pushed (>48) and centred (<16) from one frame to
+ * the next. A thumb never does that at 30 fps; a reader that alternates does. */
+static struct { unsigned pushed, snaps; int was; } s_stk[2][2]; /* [reader][stick] */
+
+static unsigned stick_dev(unsigned char x, unsigned char y) {
+  int dx = (int)x - 128, dy = (int)y - 128;
+  if (dx < 0) dx = -dx;
+  if (dy < 0) dy = -dy;
+  return (unsigned)(dx > dy ? dx : dy);
+}
+
+static void stick_track(int r, int k, unsigned d) {
+  int now = d > 48 ? 1 : (d < 16 ? -1 : 0);
+  if (now == 1) s_stk[r][k].pushed++;
+  if (now && s_stk[r][k].was && now != s_stk[r][k].was) s_stk[r][k].snaps++;
+  if (now) s_stk[r][k].was = now;
+}
+
+static void sample_sticks(void) {
+  SceCtrlData pad;
+  for (int r = 0; r < 2; r++) {
+    memset(&pad, 0, sizeof(pad));
+    int got = r ? sceCtrlPeekBufferPositive2(0, &pad, 1)
+                : sceCtrlPeekBufferPositiveExt2(0, &pad, 1);
+    if (got <= 0) continue;
+    stick_track(r, 0, stick_dev(pad.lx, pad.ly));
+    stick_track(r, 1, stick_dev(pad.rx, pad.ry));
+  }
+}
+
+static void input_stick_census(void) {
+  log_printf("[input] sticks: Ext2 L pushed %u snaps %u, R pushed %u snaps %u | "
+             "Pos2(SDL) L pushed %u snaps %u, R pushed %u snaps %u",
+             s_stk[0][0].pushed, s_stk[0][0].snaps, s_stk[0][1].pushed, s_stk[0][1].snaps,
+             s_stk[1][0].pushed, s_stk[1][0].snaps, s_stk[1][1].pushed, s_stk[1][1].snaps);
+  for (int r = 0; r < 2; r++)
+    for (int k = 0; k < 2; k++)
+      s_stk[r][k].pushed = s_stk[r][k].snaps = 0;
 }
 
 static void push_finger(Uint32 type, float nx, float ny) {
@@ -148,6 +194,7 @@ void input_touch_pump(void) {
    * game whether or not the keyboard owns the panel. */
   s_frames++;
   sample_rstick();
+  sample_sticks();
   SceTouchData rear;
   if (sceTouchPeek(SCE_TOUCH_PORT_BACK, &rear, 1) > 0 && rear.reportNum > 0)
     s_rear_frames++;
