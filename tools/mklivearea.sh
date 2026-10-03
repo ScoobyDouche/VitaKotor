@@ -12,11 +12,16 @@ ROOT="${1:-/home/bird/Desktop/VitaKotor}"
 OUT="${2:-$ROOT/sce_sys}"
 LOGO="$ROOT/apk/res/drawable-hdpi/logo.png"
 LAUNCH="$ROOT/apk/res/mipmap-xxhdpi/ic_launcher.png"
+# Character art for bg.png: Revan on a white backdrop, Bastila on black.
+REVAN="$ROOT/apk/livearea/revan.jpeg"
+BASTILA="$ROOT/apk/livearea/bastila.jpeg"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 [ -f "$LOGO" ]   || { echo "missing $LOGO"   >&2; exit 1; }
 [ -f "$LAUNCH" ] || { echo "missing $LAUNCH" >&2; exit 1; }
+[ -f "$REVAN" ]   || { echo "missing $REVAN"   >&2; exit 1; }
+[ -f "$BASTILA" ] || { echo "missing $BASTILA" >&2; exit 1; }
 
 # The Vita package installer rejects the entire VPK with error 0x8010113D if any
 # sce_sys PNG is not 8-bit indexed, so everything here is written through PNG8.
@@ -43,7 +48,7 @@ stars() {  # stars <w> <h> <out>
 }
 
 # --------------------------------------------------------------------- bg.png
-# Deep space gradient, warm nebula glow, starfield, logo, vignette.
+# Deep space gradient, warm nebula glow, starfield, Revan and Bastila, vignette.
 #
 # NB: radial-gradient only reaches its end colour at the *corner* radius, so the
 # edge midpoints stay lit and the layer screens on as a visible rectangle. Every
@@ -63,24 +68,52 @@ convert "$TMP/base.png" "$TMP/neb.png" -compose screen -composite "$TMP/bg1.png"
 stars 840 500 "$TMP/stars.png"
 convert "$TMP/bg1.png" "$TMP/stars.png" -compose screen -composite "$TMP/bg2.png"
 
-# Warm bloom behind where the logo lands, so it sits in the scene.
-glow 620 360 175 95 '#7a5a1e' 60 0.55 "$TMP/bloom.png"
-convert "$TMP/bg2.png" "$TMP/bloom.png" \
-        -geometry +225+10 -compose screen -composite "$TMP/bg3.png"
+# Revan far left, Bastila right. No title: the gate and the bubble carry it.
+# Both are composited SOLID, with an alpha mask, after the vignette, so
+# nothing of the starfield shows through them and the vignette does not dim
+# them.
+RX=24
+BX=$(( 840 - 238 - 24 ))
 
-# Logo, right of the gate column so the LiveArea frame never covers it.
-convert "$LOGO" -resize 470x "$TMP/logo_bg.png"
-convert "$TMP/bg3.png" "$TMP/logo_bg.png" \
-        -gravity none -geometry +300+95 -compose over -composite "$TMP/bg4.png"
+# Revan comes on white. Flood-fill the white from the corners only, so light
+# patches inside him stay opaque, then pull the edge in a pixel and soften it
+# so no light fringe survives on the dark background.
+convert "$REVAN" -alpha set -fuzz 14% -fill none \
+        -draw "color 0,0 floodfill" -draw "color 334,0 floodfill" \
+        -draw "color 0,596 floodfill" -draw "color 334,596 floodfill" \
+        -channel A -morphology Erode Disk:1 -blur 0x0.7 +channel \
+        -resize x470 "$TMP/revan.png"
 
-# Vignette + a thin horizon line for depth.
+# Bastila comes on black (really ~5% grey JPEG noise). Her alpha is her own
+# brightness with a hard knee: the body is fully opaque, and only the saber's
+# faint halo fades out.
+convert "$BASTILA" -level 6%,100% -resize x470 "$TMP/bastila_c.png"
+convert "$TMP/bastila_c.png" -colorspace gray -level 1%,7% -blur 0x0.8 "$TMP/balpha.png"
+convert -size 238x470 xc:black -fill white -draw "rectangle 10,6 227,463" \
+        -blur 0x6 "$TMP/bframe.png"
+convert "$TMP/balpha.png" "$TMP/bframe.png" -compose multiply -composite "$TMP/balpha2.png"
+convert "$TMP/bastila_c.png" "$TMP/balpha2.png" -alpha off -compose copy_opacity \
+        -composite "$TMP/bastila.png"
+
+# A soft glow behind each, cold for Revan, warm for Bastila's saber. Drawn on
+# the full canvas and rolled into place: a blurred ellipse on a small canvas
+# gets its edges sliced off and shows as a column.
+glow 840 500 95 200 '#26304a' 70 0.8 "$TMP/rglow.png"
+glow 840 500 95 200 '#4a3010' 70 0.8 "$TMP/bglow.png"
+convert "$TMP/rglow.png" -roll +$(( RX + 132 - 420 ))+0 "$TMP/rglow2.png"
+convert "$TMP/bglow.png" -roll +$(( BX + 119 - 420 ))+0 "$TMP/bglow2.png"
+convert "$TMP/bg2.png" \
+        "$TMP/rglow2.png" -compose screen -composite \
+        "$TMP/bglow2.png" -compose screen -composite "$TMP/bg3.png"
+
+# Vignette for depth, then the two of them on top of it.
 convert -size 840x500 radial-gradient:white-'#5a5a5a' -resize 840x500\! "$TMP/vig.png"
-convert "$TMP/bg4.png" "$TMP/vig.png" -compose multiply -composite "$TMP/bg5.png"
+convert "$TMP/bg3.png" "$TMP/vig.png" -compose multiply -composite \
+        "$TMP/revan.png"   -gravity none -geometry +$RX+22 -compose over -composite \
+        "$TMP/bastila.png" -gravity none -geometry +$BX+22 -compose over -composite \
+        "$TMP/bg5.png"
 
 convert "$TMP/bg5.png" \
-        -fill '#c9a227' -stroke none \
-        -font DejaVu-Sans -pointsize 15 \
-        -gravity SouthEast -annotate +28+22 'PlayStation Vita port' \
         -alpha off "$TMP/bg_final.png"
 png8 "$TMP/bg_final.png" "$OUT/livearea/contents/bg.png"
 
