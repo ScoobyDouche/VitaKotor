@@ -391,6 +391,14 @@
 // Set to 0 if lighting or skinning ever looks stale, to rule this out.
 #define GL_FILTER_REDUNDANT_PROGS 1
 
+// Answer vitaGL's per-draw vertex-program request from a cache. vitaGL asks the
+// GXM shader patcher for the program on EVERY draw (log210: ~680 a frame, 618
+// distinct variants all session), and gxm_patcher.c then makes a second patcher
+// call to drop the extra reference. The answer depends only on the shader and
+// the vertex layout, so a repeat request is looked up here and both calls are
+// skipped. Set to 0 if geometry ever spikes or vanishes, to rule this out.
+#define GXMP_MEMO 1
+
 // Pad NPOT texture widths to a multiple of 8 on upload. Added to prove the
 // background-shear theory, and it did. The pad leaves the texture wider than
 // the game believes, so a quad sampling u across [0,1] also covers the pad;
