@@ -214,6 +214,74 @@ Things to know:
   numbers differ, the file was made for another edition of the game, and
   some lines may be missing or in the wrong place.
 
+## Mods
+
+> **This is a preview.** Mod support lives on the `restoration-mod` branch and
+> its pre-releases, not on `main`. One large mod, KOTOR 1 Restoration, has
+> been played through its first areas on a Vita. Nothing else has been tested yet.
+
+The game checks the memory card before the OBB files. Any file you put in the
+right folder replaces the game's own file with the same name. You don't need
+to repack or edit the OBBs, and you shouldn't.
+
+```
+ux0:data/kotor/
+├── tv_dialog.tlk        <- a mod's dialog.tlk, renamed (see below)
+├── override/            <- loose files: .2da, .tga, .tpc, .utc, .dlg, .ncs ...
+├── modules/             <- .mod files
+├── lips/
+└── streamwaves/
+```
+
+The Android game is the **controller** version of KOTOR. It reads
+`tv_dialog.tlk`, not `dialog.tlk`. If a mod ships or edits `dialog.tlk`, put
+it at the top of `ux0:data/kotor/` and rename it to `tv_dialog.tlk`.
+
+Start a new game after installing a mod that changes areas or the story. That
+is the usual KOTOR advice on PC too.
+
+### What works
+
+Each of these was checked on a Vita:
+
+- **Loose files in `override/`** replace the game's textures, 2DA tables and
+  other resources. That includes files packed inside the game's texture packs
+  and data archives.
+- **`.mod` files in `modules/`** replace the game's own version of that area.
+- **A modded talk table** (`tv_dialog.tlk`) with lines added at the end.
+  Fights no longer freeze with one installed. The table is now read into
+  memory once instead of one line at a time from the card.
+- **KOTOR 1 Restoration 1.2**, all options, played through the first areas.
+
+### Installer mods (TSLPatcher / HoloPatcher)
+
+Most big mods come with an installer that edits the game's files instead of
+just adding new ones. The installer can't run on a Vita, so you have to run
+it on a PC first:
+
+1. Run the installer on a PC copy of KOTOR (version 1.03).
+2. Copy what changed to the Vita: `Override/` into `override/`, the new
+   `.mod` files into `modules/`, and `dialog.tlk` to the top folder as
+   `tv_dialog.tlk`.
+
+Patching a PC install like this is untested. The Restoration build that was
+tested was patched against the Android game's own files instead.
+
+### What doesn't work, or hasn't been tested
+
+- **Mods that patch `swkotor.exe`** (widescreen or high-resolution menus,
+  4 GB patches and so on) can't work. There is no `.exe` on the Vita.
+- **Repacking the OBBs.** The game freezes. Use the card folders above.
+- **`.dds` textures** haven't been tested on a Vita.
+- **Replacement movies (`.bik`)** haven't been tested.
+- **Mods built for the PC talk table may show keyboard prompts** where the
+  controller version would name a button.
+- **Combining several installer mods** hasn't been tried. Install them in the
+  order each mod asks for, on the PC side, before copying anything across.
+
+If a mod misbehaves, attach `ux0:data/kotor/log.txt` to the report and name
+the mod and its version.
+
 ## Known issues
 
 ### Intermittent
@@ -253,6 +321,12 @@ you a save. They are listed because you may hit them. Save regularly.
 - **No trophies.**
 
 ### Recently fixed
+
+- **Sticks went dead after typing a name** *(mod preview)*. The on-screen
+  keyboard left the controller in digital mode, so both sticks read as
+  centred until you restarted. The port now switches analog back on.
+- **Sticks could flicker back to centre with reVita** *(mod preview)*. A
+  single-frame drop to centre while a stick is held is now ignored.
 
 - **Sticks stopped working with reVita installed** *(v0.3.1)*. reVita turns
   the rear touchpad back on every time it reads the controller, and the
