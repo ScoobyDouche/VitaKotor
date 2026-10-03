@@ -510,6 +510,43 @@ static SDL_RWops *obb_try_open(const char *fname) {
   return NULL;
 }
 
+// log222: a talk table on the card (a mod's tv_dialog.tlk, or a fan translation's
+// dialog.tlk) is read string by string -- a seek plus a small read per lookup, each
+// a syscall on the card. Combat GUI messages resolve so many StrRefs that they went
+// from ~5 ms to ~90 ms apiece and the fights froze. The OBB copy never did this.
+// Read the whole table into memory once and hand the game a memory stream.
+static Sint64 SDLCALL memtlk_size(SDL_RWops *rw) {
+  return (Sint64)(rw->hidden.mem.stop - rw->hidden.mem.base);
+}
+
+static int SDLCALL memtlk_close(SDL_RWops *rw) {
+  if (rw) {
+    free(rw->hidden.mem.base);
+    SDL_FreeRW(rw);
+  }
+  return 0;
+}
+
+static int is_tlk_name(const char *base) {
+  size_t n = strlen(base);
+  return n > 4 && strcasecmp(base + n - 4, ".tlk") == 0;
+}
+
+static SDL_RWops *tlk_into_memory(SDL_RWops *rw, const char *name) {
+  unsigned int len = 0;
+  void *buf = sdl_slurp_rwops_close(rw, &len);  // closes rw either way
+  if (!buf) {
+    log_printf("[SDL] tlk %s: could not read into memory", name);
+    return NULL;
+  }
+  SDL_RWops *mrw = SDL_RWFromConstMem(buf, (int)len);
+  if (!mrw) { free(buf); return NULL; }
+  mrw->size  = memtlk_size;
+  mrw->close = memtlk_close;
+  log_printf("[SDL] tlk %s held in memory (%u KB)", name, len / 1024);
+  return mrw;
+}
+
 static SDL_RWops *SDL_RWFromFile_hook(const char *fname, const char *mode) {
   // Read-only opens for VPK-bundled assets: prefer our bundled copy.
   if (fname && mode && (mode[0] == 'r')) {
@@ -526,6 +563,7 @@ static SDL_RWops *SDL_RWFromFile_hook(const char *fname, const char *mode) {
         log_printf("[tr] %s %s for %s", trw ? "served" : "!!! could not open",
                    tp, fname);
       }
+      if (trw && is_tlk_name(base)) return tlk_into_memory(trw, tp);
       if (trw) return trw;
     }
     if (is_shader_name(base)) {
@@ -550,6 +588,8 @@ static SDL_RWops *SDL_RWFromFile_hook(const char *fname, const char *mode) {
   char t[512];
   fs_translate(fname, t, sizeof(t));
   SDL_RWops *rw = SDL_RWFromFile(t, mode);
+  if (rw && mode && mode[0] == 'r' && is_tlk_name(t))
+    rw = tlk_into_memory(rw, t);
   if (!rw && mode && mode[0] == 'r') {
     // Not on the card -- ask the archives, using the ORIGINAL name (ObbFile wants
     // the game-relative path, not our ux0: translation).
