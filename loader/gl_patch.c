@@ -1099,11 +1099,30 @@ static void glTexImage2D_e(GLenum tg, GLint l, GLint ifmt, GLsizei w, GLsizei h,
     /* Only level 0 past the first cap: log151 spent all 48 lines on ONE cube's
      * mip chain and went blind afterwards, so a re-upload after an area change
      * -- the thing actually in question -- could not have been seen. */
-    if (nc < 48 || (l == 0 && nc < 4096))
-      log_printf("[GL] cube face %u: l=%d %dx%d ifmt=0x%x fmt=0x%x data=%s "
+    /* Areas bring their own small RGBA cubes (64x64, 32x32) on top of chrome1,
+     * and the Sith soldier's armour turns neon green in some areas (log213).
+     * The average colour of each face says whether that green is IN a cube or
+     * comes from how it is sampled; face 0's mip chain says whether the cube is
+     * complete. */
+    unsigned face = (unsigned)(tg - GL_TEXTURE_CUBE_MAP_POSITIVE_X);
+    if (nc < 48 || ((l == 0 || face == 0) && nc < 4096)) {
+      char avg[48] = "";
+      int ch = (f == GL_RGBA) ? 4 : (f == GL_RGB) ? 3 : 0;
+      if (l == 0 && px && ch && ty == GL_UNSIGNED_BYTE && w > 0 && h > 0) {
+        const unsigned char *q = (const unsigned char *)px;
+        unsigned long long sum[4] = { 0, 0, 0, 0 };
+        unsigned n = (unsigned)w * (unsigned)h;
+        for (unsigned i = 0; i < n; i++, q += ch)
+          for (int c = 0; c < ch; c++) sum[c] += q[c];
+        snprintf(avg, sizeof(avg), " avg=(%u,%u,%u,%u)", (unsigned)(sum[0] / n),
+                 (unsigned)(sum[1] / n), (unsigned)(sum[2] / n),
+                 ch == 4 ? (unsigned)(sum[3] / n) : 255u);
+      }
+      log_printf("[GL] cube face %u: tex=%u l=%d %dx%d ifmt=0x%x fmt=0x%x type=0x%x data=%s%s "
                  "(faces seen 0x%02x)",
-                 (unsigned)(tg - GL_TEXTURE_CUBE_MAP_POSITIVE_X), l, (int)w, (int)h,
-                 (unsigned)ifmt, (unsigned)f, px ? "yes" : "NULL", faces);
+                 face, (unsigned)g_cur_cubetex, l, (int)w, (int)h, (unsigned)ifmt,
+                 (unsigned)f, (unsigned)ty, px ? "yes" : "NULL", avg, faces);
+    }
     nc++;
     tex_charge(g_cur_cubetex, tg, l, w, h, fmt_bpp(f));   /* cubes bind their own id */
     glTexImage2D(tg, l, ifmt, w, h, b, f, ty, px);
@@ -1224,7 +1243,17 @@ static void glTexSubImage2D_e(GLenum tg, GLint l, GLint xo, GLint yo, GLsizei w,
 #endif
   glTexSubImage2D(tg, l, xo, yo, w, h, f, ty, px);
 }
-static void glTexParameteri_e(GLenum tg, GLenum p, GLint v) { GLLOG("glTexParameteri(0x%x,0x%x,%d)", (unsigned)tg, (unsigned)p, v); glTexParameteri(tg, p, v); }
+static void glTexParameteri_e(GLenum tg, GLenum p, GLint v) {
+  GLLOG("glTexParameteri(0x%x,0x%x,%d)", (unsigned)tg, (unsigned)p, v);
+  /* A mipmapping min filter on a cube with only level 0 uploaded is incomplete,
+   * and what an incomplete cube samples is undefined. */
+  static unsigned ncp = 0;
+  if (tg == GL_TEXTURE_CUBE_MAP && p == GL_TEXTURE_MIN_FILTER && ncp < 200) {
+    ncp++;
+    log_printf("[GL] cube tex=%u min filter 0x%x", (unsigned)g_cur_cubetex, (unsigned)v);
+  }
+  glTexParameteri(tg, p, v);
+}
 static void glGenFramebuffers_e(GLsizei n, GLuint *f) { GLLOG("glGenFramebuffers(%d)", (int)n); glGenFramebuffers(n, f); }
 static void glBindFramebuffer_e(GLenum tg, GLuint f) { GLLOG("glBindFramebuffer(0x%x,%u)", (unsigned)tg, (unsigned)f); glBindFramebuffer(tg, f); }
 static void glGenRenderbuffers_e(GLsizei n, GLuint *r) { GLLOG("glGenRenderbuffers(%d)", (int)n); glGenRenderbuffers(n, r); }
