@@ -37,9 +37,6 @@ spikes. Sessions of close to 90 minutes now end as healthy as they started.
 What remains is frame rate and a few rough edges. Nothing crashes and no save
 has been lost. See [Known issues](#known-issues).
 
-The wait before the main menu is now dressed in the game's own loading art, with
-a hint to read while it works *(new in v0.1.10)*.
-
 So: worth starting a proper playthrough on now. Save regularly all the same.
 
 | | |
@@ -142,9 +139,7 @@ Vita has no L2/R2 for the Android layout's triggers. The rear touch panel is
 off, so holding the console never taps anything.
 
 **Typing a name** — your character's, or a save's — opens the Vita's on-screen
-keyboard. Select the name field and confirm to bring it up, then type and accept. *(New in v0.1.9.1.
-On v0.1.9 and earlier there is no way to enter a name at all, which leaves
-character creation with no way forward.)*
+keyboard. Select the name field and confirm to bring it up, then type and accept.
 
 ## Language
 
@@ -286,33 +281,8 @@ you a save. They are listed because you may hit them. Save regularly.
   The GPU's vertex-shader pool filled up and new shaders silently failed.
   The pool is four times larger and now reclaims idle entries; an 83-minute
   session had no failures.
-- **Audio mixer lock contention:** the Vita mixer now snapshots active channels,
-  mixes outside the game-facing mutex, and batches FMOD completion scanning under
-  one lock. A real-Vita smoke test preserved working audio; the frame-rate effect
-  still needs a controlled A/B. See the
-  [investigation note](docs/specs/2026-09-12-audio-lock-contention.md).
-- **Movies were skipped.** Bink cutscenes now play, video and sound, confirmed
-  on hardware. Tapping the screen or pressing a button skips them.
-- **Touchscreen is back.** It had been switched off in favour of the gamepad
-  mapping; now both work at the same time.
-- **Voice lines silent during in-game cutscenes** (v0.1.9.2). The MP3 decoder
-  sized its output buffer by assuming every frame was the smallest one the
-  format allows, which asked for 2.25x what a voice line actually needs — a
-  13-second line wanted 1.8 MB when the heap could offer 1 MB, so it failed and
-  the game played silence over the scene. It now sizes from the stream's own
-  bitrate.
-- **The area-transition crash** (v0.1.9.1). Large allocations now come from a
-  pool of their own instead of being mixed in with the game's thousands of small
-  long-lived objects, which is what shredded the heap. If you are on v0.1.9 or
-  earlier, this is the 10–20 minute crash you will hit.
-- **No way to name your character** (v0.1.9.1), which left character creation
-  with nothing to press and no way on. The field asked the platform for a
-  keyboard the Vita never provided, so it could not receive a letter. It now
-  opens the Vita's own on-screen keyboard; the same fix covers save names.
-- **Sound taking the game down with it** (v0.1.9.1). The engine was never told
-  when a sound finished, so it never reused a voice or closed a music stream;
-  the leak exhausted both file handles and memory and ended the session. That
-  crash is gone.
+
+Older fixes are listed in the notes for each [release](../../releases).
 
 ## Troubleshooting
 
