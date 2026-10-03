@@ -44,11 +44,12 @@ So: worth starting a proper playthrough on now. Save regularly all the same.
 | Startup | ~2 min on first launch, then under a minute |
 | Area loads | Under a second to load; the loading screen then stays up 15–20 s while textures upload |
 | Frame rate | ~30–38 fps typical, dips into the low 20s in dense scenes, with stutters |
-| Session length | ~90 min tested with nothing fatal and nothing wearing down |
+| Session length | ~100 min tested with nothing fatal and nothing wearing down |
 | Audio | Effects, voice and music all work |
 | Cutscenes | Bink movies play with sound; tap or press a button to skip |
 | Input | Touchscreen, sticks and buttons — see [Controls](#controls) |
 | Saves | Work, stored on the Vita |
+| Mods | Work — KOTOR 1 Restoration plus six more played together; see [Mods](#mods) |
 
 `main` is usually ahead of the newest [release](../../releases); the issue list
 below says which fixes have not been released yet.
