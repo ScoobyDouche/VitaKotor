@@ -221,6 +221,9 @@ void sdl_gamepad_probe_init(uintptr_t pressed, uintptr_t this_frame, uintptr_t m
  * between consecutive values, and range. Axes 0/1 = left stick, 2/3 = right. */
 static struct { int last, lo, hi; unsigned n, jumps; int seen; } g_axis[4];
 static volatile unsigned g_pumps = 0;
+/* Stick-flicker filter (SDL_PollEvent_hook): centres dropped as flicker, and
+ * centres held back then let through as real releases. */
+static unsigned g_stick_dropped, g_stick_released;
 
 static void axis_window_reset(void) {
   for (int a = 0; a < 4; a++)
@@ -318,7 +321,9 @@ void sdl_input_census(void) {
     p += snprintf(buf + p, sizeof(buf) - p, "%sa%d n=%u jump=%u [%d..%d]",
                   a ? " | " : "", a, g_axis[a].n, g_axis[a].jumps,
                   g_axis[a].n ? g_axis[a].lo : 0, g_axis[a].n ? g_axis[a].hi : 0);
-  log_printf("[input] axes: %s; pumps=%u", buf, g_pumps);
+  log_printf("[input] axes: %s; pumps=%u; stick filter dropped %u released %u",
+             buf, g_pumps, g_stick_dropped, g_stick_released);
+  g_stick_dropped = g_stick_released = 0;
   axis_window_reset();
 }
 static void SDL_PumpEvents_hook(void) {
@@ -353,9 +358,67 @@ static void normalize_joy_event(SDL_Event *e) {
     e->jbutton.button = vita_to_android_button(e->jbutton.button);
 }
 
+/* log216: with reVita installed the pad itself flickers -- a held stick reads
+ * centred on 58% of frames (log217/218 without it: 3-5%), at the raw sceCtrl
+ * read as well as in SDL, so the game sees the stick let go and grabbed again
+ * many times a second. Other plugins can do the same, so filter it here rather
+ * than tell people what to uninstall: when a pushed axis drops to centre, hold
+ * that event back for STICK_HOLD_MS. If the stick comes back inside the window
+ * it was flicker and the centre is dropped; if not, it was a real release and
+ * the centre goes through, STICK_HOLD_MS late. SDL only sends an axis when its
+ * value changes, so a held-back centre must be released by us -- nothing else
+ * will ever arrive to carry it. */
+#define STICK_HOLD_MS 60
+#define STICK_CENTRE  4096    /* |value| below this is centred (16/128) */
+#define STICK_PUSHED  12288   /* |value| above this is pushed (48/128) */
+static struct { int last, pending; Uint32 since; SDL_Event ev; } g_stick[4];
+static int stick_abs(int v) { return v < 0 ? -v : v; }
+
+/* A held-back centre whose window has run out, or -1. */
+static int stick_expired(void) {
+  Uint32 now = SDL_GetTicks();
+  for (int a = 0; a < 4; a++)
+    if (g_stick[a].pending && now - g_stick[a].since >= STICK_HOLD_MS)
+      return a;
+  return -1;
+}
+
+/* 1 = swallow this event (held back as a possible flicker). */
+static int stick_filter(const SDL_Event *e) {
+  if (e->type != SDL_JOYAXISMOTION || e->jaxis.axis >= 4) return 0;
+  unsigned a = e->jaxis.axis;
+  int v = e->jaxis.value;
+  if (stick_abs(v) < STICK_CENTRE &&
+      (g_stick[a].pending || stick_abs(g_stick[a].last) > STICK_PUSHED)) {
+    if (!g_stick[a].pending) g_stick[a].since = SDL_GetTicks();
+    g_stick[a].pending = 1;
+    g_stick[a].ev = *e;
+    return 1;
+  }
+  if (g_stick[a].pending) {    /* back before the window closed: flicker */
+    g_stick[a].pending = 0;
+    g_stick_dropped++;
+  }
+  g_stick[a].last = v;
+  return 0;
+}
+
 static int SDL_PollEvent_hook(SDL_Event *e) {
-  int r = SDL_PollEvent(e);
-  if (r && e) {
+  int a = stick_expired();
+  if (a >= 0) {
+    if (!e) return 1;
+    *e = g_stick[a].ev;
+    g_stick[a].pending = 0;
+    g_stick[a].last = e->jaxis.value;
+    g_stick_released++;
+    log_event("PollEvent", e);
+    return 1;
+  }
+  int r;
+  if (!e) return SDL_PollEvent(NULL);
+  while ((r = SDL_PollEvent(e)) && stick_filter(e))
+    ;
+  if (r) {
     normalize_joy_event(e);
     log_event("PollEvent", e);
   }
