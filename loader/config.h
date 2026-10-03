@@ -310,7 +310,9 @@
 #define LOG_OFF 0
 #endif
 
-#define LOG_BUFFER_KB  8
+// Two buffers of this size: one fills while the writer thread empties the
+// other (see log.c). A busy second is ~10-20 KB, so 64 KB leaves headroom.
+#define LOG_BUFFER_KB  64
 #define LOG_FLUSH_MS   1000
 
 // Heap tracing. gl_patch.c arms it at the last GL cap query (entering engine
