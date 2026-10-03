@@ -3,6 +3,7 @@
 #include <vitasdk.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 
 #include "config.h"
 #include "main.h"
@@ -60,20 +61,12 @@ typedef struct {
 } hook_t;
 
 static hook_t g_hook[] = {
-  /* client side, inside CClientAIMaster::UpdateState */
-  { "_ZN12CSWCCreature8AIUpdateEv",               "cCreature"  },
-  { "_ZN13CSWCPlaceable8AIUpdateEv",              "cPlaceable" },
-  { "_ZN8CSWCDoor8AIUpdateEv",                    "cDoor"      },
-  { "_ZN16CSWCVisualEffect8AIUpdateEv",           "cVfx"       },
-  { "_ZN15CSWCSoundObject8AIUpdateEv",            "cSoundObj"  },
-  { "_ZN11CSWCTrigger8AIUpdateEv",                "cTrigger"   },
-  { "_ZN22CSWCAreaOfEffectObject8AIUpdateEv",     "cAoE"       },
+  /* client side, inside CClientAIMaster::UpdateState. The per-object timers
+   * (creature/placeable/door/... AIUpdate, Gob::Animate, particles) were
+   * dropped after log208: hundreds of calls a frame, and their answer is in. */
   { "_ZN8CSWCArea6UpdateEf",                      "cArea"      },
   { "_ZN16CSWCAmbientSound6UpdateEv",             "cAmbient"   },
-  /* the model/animation layer, wherever it is called from */
-  { "_ZN3Gob7AnimateEf",                          "gobAnim"    },
   { "_ZN5Scene7AnimateEf",                        "sceneAnim"  },
-  { "_ZN11PartEmitter16AnimateParticlesEf",       "particles"  },
   /* server side */
   { "_ZN15CServerAIMaster11UpdateStateEv",        "sAI"        },
   { "_ZN8CSWSArea8AIUpdateEv",                    "sArea"      },
@@ -91,6 +84,31 @@ static hook_t g_hook[] = {
   { "_ZN13CSWPartyTable13UpdateMembersEi",        "party"      },
   /* and the client applying what the server sent */
   { "_ZN11CSWCMessage27HandleServerToPlayerMessageEPhm", "cMsg"  },
+  /* log204: inside render, vitaGL's draws are only a third; the rest is the
+   * engine. One call each a frame. log208 split the per-mesh path below
+   * these (engine ~13 ms, port setup ~3, vitaGL ~10 of ~700 draws); those
+   * timers cost ~17 ms a frame themselves and are gone. */
+  { "_ZN5Scene6RenderEv",                         "scRender"   },
+  { "_ZN5Scene16RenderSinglePassEv",              "singlePass" },
+  { "_ZN5Scene20RenderStaticGeometryEv",          "staticGeo"  },
+  { "_ZN5Scene21RenderDynamicGeometryEv",         "dynGeo"     },
+  { "_Z14ManageSceneBSPP5Scene",                  "bsp"        },
+  { "_ZN5Scene13RenderShadowsEiiii",              "shadows"    },
+  /* log204: cMsg is 32 ms of an Upper City South frame -- as much as render.
+   * Which kind of object update it is. */
+  { "_ZN11CSWCMessage36HandleServerToPlayerGameObjectUpdateEh",            "objUpd"   },
+  { "_ZN11CSWCMessage33HandleServerToPlayerUpdate_UpdateEv",               "upd"      },
+  { "_ZN11CSWCMessage41HandleServerToPlayerCreatureUpdate_UpdateEmm",      "creUpd"   },
+  { "_ZN11CSWCMessage42HandleServerToPlayerPlaceableUpdate_UpdateEmm",     "plcUpd"   },
+  { "_ZN11CSWCMessage37HandleServerToPlayerDoorUpdate_UpdateEmm",          "doorUpd"  },
+  { "_ZN11CSWCMessage46HandleServerToPlayerGenericObjectUpdate_UpdateEmm", "genUpd"   },
+  { "_ZN11CSWCMessage30HandleServerToPlayerUpdate_AddEv",                  "updAdd"   },
+  { "_ZN11CSWCMessage33HandleServerToPlayerUpdate_DeleteEv",               "updDel"   },
+  { "_ZN11CSWCMessage37HandleServerToPlayerUpdate_AppearanceEv",           "updApp"   },
+  { "_ZN11CSWCMessage38HandleServerToPlayerUpdate_GuiElementsEv",          "updGui"   },
+  { "_ZN11CSWCMessage37HandleServerToPlayerUpdate_PlayerInfoEv",           "updPlayer"},
+  { "_ZN11CSWCMessage39HandleServerToPlayerUpdate_GuiInventoryEv",         "updInv"   },
+  { "_ZN11CSWCMessage39HandleServerToPlayerUpdateVisualEffectsEP10CSWCObject", "updVfx" },
 };
 #define HOOK_N (sizeof g_hook / sizeof g_hook[0])
 
@@ -114,18 +132,49 @@ static inline uint64_t timed(hook_t *h, uint32_t a, uint32_t b, uint32_t c, uint
 #define P(i) static uint64_t probe_##i(uint32_t a, uint32_t b, uint32_t c, uint32_t d, \
                                      uint32_t e, uint32_t f) \
   { return timed(&g_hook[i], a, b, c, d, e, f); }
-P(0) P(1) P(2) P(3) P(4) P(5) P(6) P(7) P(8) P(9) P(10) P(11) P(12) P(13) P(14) P(15) P(16)
-P(17) P(18) P(19) P(20) P(21) P(22)
+P(0) P(1) P(2) P(3) P(4) P(5) P(6) P(7) P(8) P(9) P(10) P(11) P(12) P(14) P(15) P(16)
+P(17) P(18) P(19) P(20) P(21) P(22) P(23) P(24) P(25) P(26) P(27) P(28) P(29) P(30) P(31)
+P(32)
 #undef P
+
+/* log205: cMsg is 20-25 ms a frame in the cities but object updates are ~6 of
+ * it, and it runs less than once a frame -- one message type is costing 40+ ms
+ * a call. The buffer is 'P', major, minor, payload (CSWCMessage::
+ * HandleServerToPlayerMessage reads exactly those three bytes and switches on
+ * the major), so time it per type. */
+#define CMSG_HOOK 13
+static uint64_t g_cmsg_us[64][32];
+static unsigned g_cmsg_n[64][32];
+
+static uint64_t probe_cmsg(uint32_t a, uint32_t b, uint32_t c, uint32_t d,
+                           uint32_t e, uint32_t f) {
+  const unsigned char *m = (const unsigned char *)(uintptr_t)b;
+  int outer = g_hook[CMSG_HOOK].depth == 0;
+  uint64_t t0 = sceKernelGetProcessTimeWide();
+  uint64_t r = timed(&g_hook[CMSG_HOOK], a, b, c, d, e, f);
+  if (outer && m && c >= 3) {
+    unsigned maj = m[1] & 63, min = m[2] & 31;
+    g_cmsg_us[maj][min] += sceKernelGetProcessTimeWide() - t0;
+    g_cmsg_n[maj][min]++;
+  }
+  return r;
+}
+
 static fn6_t const g_probe[] = {
   probe_0, probe_1, probe_2, probe_3, probe_4, probe_5, probe_6, probe_7, probe_8,
-  probe_9, probe_10, probe_11, probe_12, probe_13, probe_14, probe_15, probe_16,
-  probe_17, probe_18, probe_19, probe_20, probe_21, probe_22,
+  probe_9, probe_10, probe_11, probe_12, probe_cmsg, probe_14, probe_15, probe_16,
+  probe_17, probe_18, probe_19, probe_20, probe_21, probe_22, probe_23, probe_24,
+  probe_25, probe_26, probe_27, probe_28, probe_29, probe_30, probe_31, probe_32,
 };
 _Static_assert(sizeof g_probe / sizeof g_probe[0] == HOOK_N, "one probe per hook");
 
 void gameprof_install(void) {
   unsigned eng = 0, hooked = 0;
+  if (strcmp(g_hook[CMSG_HOOK].tag, "cMsg")) {
+    log_printf("[prof] CMSG_HOOK is %s, not cMsg -- per-type timing would be wrong; "
+               "profiler not armed", g_hook[CMSG_HOOK].tag);
+    return;
+  }
   for (unsigned i = 0; i < ENG_N; i++) {
     g_eng[i].p = (volatile float *)so_symbol(&kotor_mod, g_eng[i].sym);
     if (g_eng[i].p) eng++;
@@ -163,10 +212,15 @@ void gameprof_window_report(void) {
                     g_eng[i].sum / n, (double)g_eng[i].max);
     log_printf("%s", b);
 
-    /* ms per update, then calls per update; functions that did not run are left out */
+    /* ms per update, then calls per update; functions that did not run are left
+     * out. Wrapped so no line runs off the end of the buffer. */
     o = snprintf(b, sizeof b, "[prof]   timed ms(calls) per update:");
-    for (unsigned i = 0; i < HOOK_N && o < (int)sizeof b - 40; i++) {
+    for (unsigned i = 0; i < HOOK_N; i++) {
       if (!g_hook[i].calls) continue;
+      if (o > (int)sizeof b - 48) {
+        log_printf("%s", b);
+        o = snprintf(b, sizeof b, "[prof]     ...");
+      }
       o += snprintf(b + o, sizeof b - o, " %s=%.1f(%.0f)", g_hook[i].tag,
                     (double)g_hook[i].us / 1000.0 / n, (double)g_hook[i].calls / n);
     }
@@ -175,7 +229,24 @@ void gameprof_window_report(void) {
     if (o < (int)sizeof b - 24)
       snprintf(b + o, sizeof b - o, " glDraw=%.1f", (double)g_prof_draw_us / 1000.0 / n);
     log_printf("%s", b);
+
+    /* the eight most expensive message types this window, as major.minor */
+    o = snprintf(b, sizeof b, "[prof]   cMsg by type ms(calls) per update:");
+    for (int k = 0; k < 8; k++) {
+      unsigned bm = 0, bn = 0;
+      uint64_t best = 0;
+      for (unsigned M = 0; M < 64; M++)
+        for (unsigned N = 0; N < 32; N++)
+          if (g_cmsg_us[M][N] > best) { best = g_cmsg_us[M][N]; bm = M; bn = N; }
+      if (!best) break;
+      o += snprintf(b + o, sizeof b - o, " %u.%u=%.1f(%.2f)", bm, bn,
+                    (double)best / 1000.0 / n, (double)g_cmsg_n[bm][bn] / n);
+      g_cmsg_us[bm][bn] = 0;            /* consumed; the rest is cleared below */
+    }
+    log_printf("%s", b);
   }
+  memset(g_cmsg_us, 0, sizeof g_cmsg_us);
+  memset(g_cmsg_n, 0, sizeof g_cmsg_n);
   for (unsigned i = 0; i < ENG_N; i++) { g_eng[i].sum = 0; g_eng[i].max = 0; }
   for (unsigned i = 0; i < HOOK_N; i++) { g_hook[i].us = 0; g_hook[i].calls = 0; }
   g_prof_draw_us = 0;

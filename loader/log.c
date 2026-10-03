@@ -107,6 +107,41 @@ int log_jni_enabled(void) {
   return 1;
 }
 
+/* Retired probes: tags whose bug is closed, dropped in every build. Their
+ * hooks stay (several do real work besides logging); only the lines go.
+ *   [model]  resource/model-load probes from the chargen pool block (July)
+ *   [vtx]    uniform/attribute layout dumps from the geometry spikes
+ *   [GLSRC   shader source dump from the varying-overflow crash
+ *   [res]    entry[...]  save-game key-table listing, ~70 lines per save
+ * Failures still get through: the keep-rule below runs first. */
+static const char *const k_log_retired[] = {
+  "[model]", "[vtx]", "[GLSRC", "[res]    entry[",
+  "[GL] glShaderSource(sh=%u, count=%d) ===", "[GL] glShaderSource(sh=%u) ===",
+};
+static const char *const k_log_keep[] = {
+  "fail", "FAIL", "error", "ERROR", "Error", "WARNING", "warning",
+  "MISSING", "missing", "abort", "ABORT", "CRASH", "unresolved",
+};
+
+static int log_has_tag(const char *fmt, const char *const *tags, unsigned n_tags) {
+  for (unsigned i = 0; i < n_tags; i++)
+    if (!strncmp(fmt, tags[i], strlen(tags[i]))) return 1;
+  return 0;
+}
+
+static int log_kept(const char *fmt) {
+  for (unsigned i = 0; i < sizeof k_log_keep / sizeof k_log_keep[0]; i++)
+    if (strstr(fmt, k_log_keep[i])) return 1;
+  return 0;
+}
+
+static int log_retired(const char *fmt) {
+  if (!fmt || fmt[0] != '[') return 0;
+  if (!log_has_tag(fmt, k_log_retired, sizeof k_log_retired / sizeof k_log_retired[0]))
+    return 0;
+  return !log_kept(fmt);
+}
+
 #if !LOG_DIAGNOSTICS
 /* Release quiet. Tags are literal prefixes of the format string, so this runs
  * before any formatting: a suppressed line costs a handful of byte compares and
@@ -120,21 +155,9 @@ static const char *const k_log_noisy[] = {
   "[big]", "[wd]", "[wd:t0]", "[wd:t1]", "[vgl]", "[input]", "[touch]",
   "[load]", "[model]",
 };
-static const char *const k_log_keep[] = {
-  "fail", "FAIL", "error", "ERROR", "Error", "WARNING", "warning",
-  "MISSING", "missing", "abort", "ABORT", "CRASH", "unresolved",
-};
-
 static int log_suppressed(const char *fmt) {
-  if (!fmt || fmt[0] != '[') return 0;
-  for (unsigned i = 0; i < sizeof k_log_keep / sizeof k_log_keep[0]; i++)
-    if (strstr(fmt, k_log_keep[i])) return 0;
-  for (unsigned i = 0; i < sizeof k_log_noisy / sizeof k_log_noisy[0]; i++) {
-    const char *t = k_log_noisy[i];
-    size_t n = strlen(t);
-    if (!strncmp(fmt, t, n)) return 1;
-  }
-  return 0;
+  if (!fmt || fmt[0] != '[' || log_kept(fmt)) return 0;
+  return log_has_tag(fmt, k_log_noisy, sizeof k_log_noisy / sizeof k_log_noisy[0]);
 }
 #endif
 
@@ -145,6 +168,7 @@ void log_printf(const char *fmt, ...) {
   if (!g_panic) return;
 #endif
 
+  if (!g_panic && log_retired(fmt)) return;
 #if !LOG_DIAGNOSTICS
   if (!g_panic && log_suppressed(fmt)) return;
 #endif
