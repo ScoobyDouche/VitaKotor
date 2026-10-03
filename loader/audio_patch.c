@@ -1162,6 +1162,7 @@ static unsigned g_ends_rescued = 0, g_ends_lost = 0;
  * count first and only then decide whether to re-home these. If the killed
  * total tracks the deficit, this is it. */
 static unsigned g_rel_calls = 0, g_rel_kill_live = 0, g_rel_kill_pend = 0;
+static unsigned g_rel_waited = 0;   /* releases that had to stop a progressive load */
 static unsigned g_play_calls = 0, g_play_badsnd = 0, g_play_nochan = 0;
 
 /* Channel::stop is the ONE exit from a channel that clears it without raising
@@ -1923,6 +1924,22 @@ static int Sys_getChannel(void *self, int idx, void **out) {
 static int Snd_release(void *self) {
   if (!snd_valid(self)) return FMOD_ERR_INVALID_PARAM;
   Snd *s = (Snd *)self;
+#if AUDIO_STREAM_PROGRESSIVE
+  /* The loader reads through the companion's file object, and the game frees
+   * that object as soon as release returns. Closing the stream later on the
+   * audio thread is too late: log225 faulted in SystemReadCallback on the
+   * loader, which then never cleared `loading`, so the audio thread waited in
+   * stream_close forever and every sound went silent. Stop the loader here,
+   * before the game can free anything. Only this thread clears s->st and the
+   * stream is freed only after we hand it over below, so `pst` is still live. */
+  Stream *pst = s->st;
+  if (pst && __atomic_load_n(&pst->loading, __ATOMIC_ACQUIRE)) {
+    __atomic_store_n(&pst->cancel, 1, __ATOMIC_RELEASE);
+    while (__atomic_load_n(&pst->loading, __ATOMIC_ACQUIRE)) sceKernelDelayThread(1000);
+    if (g_rel_waited++ < 16)
+      log_printf("[snd] release of \"%s\" stopped its progressive load first", pst->name);
+  }
+#endif
   lock();
   g_rel_calls++;
   VoSnap rv; int rvo = 0;
