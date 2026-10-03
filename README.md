@@ -217,10 +217,6 @@ Things to know:
 
 ## Mods
 
-> **This is a preview.** Mod support lives on the `restoration-mod` branch and
-> its pre-releases, not on `main`. One large mod, KOTOR 1 Restoration, has
-> been played through its first areas on a Vita. Nothing else has been tested yet.
-
 The game checks the memory card before the OBB files. Any file you put in the
 right folder replaces the game's own file with the same name. You don't need
 to repack or edit the OBBs, and you shouldn't.
@@ -240,6 +236,39 @@ it at the top of `ux0:data/kotor/` and rename it to `tv_dialog.tlk`.
 
 Start a new game after installing a mod that changes areas or the story. That
 is the usual KOTOR advice on PC too.
+
+### Mod sets (the MODS button)
+
+The main menu's Google Play button is a **MODS** button on the Vita. It lets
+you keep several mod setups on the card and switch between them without
+moving files around.
+
+Each mod set is a folder in `ux0:data/kotor/mods/`, laid out like the top
+folder above:
+
+```
+ux0:data/kotor/mods/
+├── Restoration/
+│   ├── tv_dialog.tlk
+│   ├── override/
+│   ├── modules/
+│   ├── lips/
+│   └── streamwaves/
+└── Textures only/
+    └── override/
+```
+
+Press **MODS** on the main menu. The game restarts into a list with
+**VANILLA** first, then every folder in `mods/`. Pick one and the game starts
+with it. To switch again, press MODS again.
+
+- A set only needs the files its mods change. Anything it doesn't have comes
+  from the top folder, then from the OBB, as usual.
+- **VANILLA** uses the top folder alone, exactly as before mod sets existed.
+  Mods you already installed there keep working.
+- **Saves are shared** between sets. A save made with a mod may not load
+  properly without it, so switch sets with that in mind.
+- The choice is remembered in `ux0:data/kotor/mods/active.txt`.
 
 ### What works
 
@@ -299,8 +328,9 @@ you a save. They are listed because you may hit them. Save regularly.
 
 - **Frame drops.** Besides the dense-scene dips below, some areas stutter
   about once a second: one frame in thirty takes around 100 ms, while nothing on
-  screen changes. That time goes on the game's own update rather than drawing,
-  and it is being investigated.
+  screen changes. The port's own log was writing to the card in the middle of
+  about half of those frames; since v0.4.0 it writes from a thread of its own,
+  and whether that was the whole cause is still being checked.
 - **Voices over the loading screen.** The game starts running as soon as the
   area data is in, while the loading screen is still up for the texture upload,
   so the new area's sounds and conversations can start before you see it. Once,
@@ -323,10 +353,20 @@ you a save. They are listed because you may hit them. Save regularly.
 
 ### Recently fixed
 
-- **Sticks went dead after typing a name** *(mod preview)*. The on-screen
+- **The MODS button** *(v0.4.0)*. Google Play on the main menu now switches
+  between mod sets on the card. See [Mod sets](#mod-sets-the-mods-button).
+- **Sound could die after leaving an area** *(v0.4.0)*. A sound still loading
+  in the background could be freed underneath its loader, which crashed the
+  sound thread and left the game silent. Loading now stops before the sound is
+  released.
+- **Leaving an area could freeze for several seconds** *(v0.4.0)*, most of
+  all with large mods. The game saves the area's state on the way out, and
+  that went to the card in about a thousand tiny writes. Files are now written
+  in large blocks, and those frames are about half as long.
+- **Sticks went dead after typing a name** *(v0.4.0)*. The on-screen
   keyboard left the controller in digital mode, so both sticks read as
   centred until you restarted. The port now switches analog back on.
-- **Sticks could flicker back to centre with reVita** *(mod preview)*. A
+- **Sticks could flicker back to centre with reVita** *(v0.4.0)*. A
   single-frame drop to centre while a stick is held is now ignored.
 
 - **Sticks stopped working with reVita installed** *(v0.3.1)*. reVita turns
