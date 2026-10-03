@@ -547,6 +547,23 @@ static SDL_RWops *tlk_into_memory(SDL_RWops *rw, const char *name) {
   return mrw;
 }
 
+// log226: leaving an area the game writes that area's state to currentgame/
+// (884 KB for K1R's Lower City), and the frame that does it took 5-12 s. SDL's
+// file RWops sit on newlib stdio with a 1 KB buffer, so the save went to the card
+// in about 900 small writes. Give write-only files a big stdio buffer instead.
+// The RWops must stay a real SDL_RWOPS_STDFILE: the game reaches past it and
+// calls fputs on hidden.stdio.fp (log227 -- wrapping it faulted in _fputs_r).
+#define WRITE_BUF_BYTES (1024 * 1024)
+
+static void big_write_buffer(SDL_RWops *rw, const char *name) {
+  if (rw->type != SDL_RWOPS_STDFILE || !rw->hidden.stdio.fp) return;
+  // NULL buffer: stdio allocates it and frees it in fclose.
+  if (setvbuf(rw->hidden.stdio.fp, NULL, _IOFBF, WRITE_BUF_BYTES) != 0) {
+    static unsigned fail_n = 0;
+    if (fail_n++ < 8) log_printf("[SDL] setvbuf failed for %s -- writing unbuffered", name);
+  }
+}
+
 static SDL_RWops *SDL_RWFromFile_hook(const char *fname, const char *mode) {
   // Read-only opens for VPK-bundled assets: prefer our bundled copy.
   if (fname && mode && (mode[0] == 'r')) {
@@ -590,6 +607,9 @@ static SDL_RWops *SDL_RWFromFile_hook(const char *fname, const char *mode) {
   SDL_RWops *rw = SDL_RWFromFile(t, mode);
   if (rw && mode && mode[0] == 'r' && is_tlk_name(t))
     rw = tlk_into_memory(rw, t);
+  // Plain "w"/"wb" only: anything that may read back ("w+", "r+", "a") stays direct.
+  if (rw && mode && mode[0] == 'w' && !strchr(mode, '+'))
+    big_write_buffer(rw, fname ? fname : t);
   if (!rw && mode && mode[0] == 'r') {
     // Not on the card -- ask the archives, using the ORIGINAL name (ObbFile wants
     // the game-relative path, not our ux0: translation).
