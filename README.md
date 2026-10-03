@@ -243,18 +243,15 @@ you a save. They are listed because you may hit them. Save regularly.
   after dying and reloading, a line from the fight that killed you played over
   the loading screen; that one is being traced.
 - **Some shiny armour looks off.** Reflective materials can shine too strongly
-  or with a colour tint — Sith armour is the clearest example. The environment
-  map and its mask reach the shader correctly, so the remaining suspect is how
-  the reflection is blended with the lit colour.
-- **The Undercity runs at 5–8 fps.** Measured against 30–40 fps in the areas
-  above it. It draws roughly three and a half times as many objects per frame as
-  the streets of Taris — about 480 draw calls a frame against 140 — and frame
-  time scales with that almost exactly, so the port is spending its time issuing
-  draws rather than the console being out of its depth. Playable, not pleasant.
-- **Stutter in dense scenes.** Busy areas issue around 700 draw calls a frame
-  and the frame rate drops into the low 20s. Video memory is also full for most
-  of a session, so textures loaded after the first minute are served from
-  ordinary RAM, which likely contributes.
+  or with a colour tint, and Sith armour can turn a bright solid colour (green
+  has been seen) that changes from one area to the next. Each area loads its
+  own reflection maps, and which of them goes wrong is being traced.
+- **Busy areas run at around 20 fps.** The Lower City holds about 40 fps, while
+  the Upper City and the Undercity sit near 20 with a crowd on screen. Nearly
+  all of that frame time is the game's own rendering code on one CPU core,
+  preparing several hundred objects a frame; the graphics chip is not the
+  limit. Video memory is also full for most of a session, so textures loaded
+  after the first minute are served from ordinary RAM.
 - **Not every movie has been checked.** The ones played so far run with
   sound and hand back to the game cleanly; 48 kHz movies and localized
   subtitles have not been specifically tested.
@@ -262,6 +259,19 @@ you a save. They are listed because you may hit them. Save regularly.
 
 ### Recently fixed
 
+- **Sticks stopped working with reVita installed** *(v0.3.1)*. reVita turns
+  the rear touchpad back on every time it reads the controller, and the
+  fingers holding the back of the Vita then reached the game as screen
+  drags. The port no longer reads the rear touchpad at all.
+- **A one-second hitch whenever a sound started** *(v0.3.1)*. Voice lines
+  were decoded whole before they played, ambient loops were decompressed again
+  on every play, and long music tracks were read in one go. Voice lines now
+  stream, ambient sounds are cached, and music is read in the background:
+  on Taris the hitches fell by about half.
+- **A freeze ending in a crash on an area load** *(v0.3.1)*. The heap had
+  plenty of memory free but no single piece big enough for one request, and
+  the game gave up. Requests the heap refuses are now served from the pool
+  kept for large blocks.
 - **Footsteps, doors and containers were very quiet** *(v0.3.0)*.
   Early builds of the port misread decimal numbers in `swkotor.ini`, and the
   engine saved its 2D/3D sound balance at its lowest setting, which plays every
