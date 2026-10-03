@@ -183,6 +183,12 @@ void ime_pump(void) {
   sceImeDialogTerm();
   s_state = IME_IDLE;
 
+  // The common dialog leaves the pad in digital sampling, so every later read
+  // reports both sticks centred. Put back what main() selected.
+  sceCtrlSetSamplingMode(SCE_CTRL_MODE_ANALOG_WIDE);
+  sceCtrlSetSamplingModeExt(SCE_CTRL_MODE_ANALOG_WIDE);
+  log_printf("[ime] pad sampling restored to analog");
+
   if (res.button != SCE_IME_DIALOG_BUTTON_ENTER) {
     log_printf("[ime] dialog cancelled (button=%d)", (int)res.button);
     return;
