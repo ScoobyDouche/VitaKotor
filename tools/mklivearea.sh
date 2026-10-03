@@ -113,7 +113,11 @@ convert "$TMP/bg3.png" "$TMP/vig.png" -compose multiply -composite \
         "$TMP/bastila.png" -gravity none -geometry +$BX+22 -compose over -composite \
         "$TMP/bg5.png"
 
+# A small caption centred along the bottom, between the two of them.
 convert "$TMP/bg5.png" \
+        -fill '#c9a227' -stroke none \
+        -font DejaVu-Sans -pointsize 15 \
+        -gravity South -annotate +0+12 'PlayStation Vita port' \
         -alpha off "$TMP/bg_final.png"
 png8 "$TMP/bg_final.png" "$OUT/livearea/contents/bg.png"
 
