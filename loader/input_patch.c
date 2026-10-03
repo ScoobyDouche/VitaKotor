@@ -84,15 +84,19 @@ static unsigned s_frames = 0;        /* pump calls this window */
 static unsigned s_rstick_frames = 0; /* ... with the right stick off centre */
 static unsigned s_rstick_max = 0;    /* ... peak deflection, 0..127 */
 static unsigned s_touch_frames = 0;  /* ... with a finger on the panel */
+static unsigned s_rear_frames = 0;   /* ... with a finger on the REAR panel:
+                                      * nonzero means someone (reVita) turned
+                                      * rear sampling back on behind us */
 static unsigned s_pushed = 0;        /* finger events handed to SDL */
 static unsigned s_push_fail = 0;     /* ... that SDL refused (queue full) */
 
 void input_probe_census(void) {
   log_printf("[input] raw: %u frames, rstick off-centre %u (peak %u/127), "
-             "touching %u; pushed %u finger events, %u REFUSED by SDL",
+             "touching %u, rear %u; pushed %u finger events, %u REFUSED by SDL",
              s_frames, s_rstick_frames, s_rstick_max, s_touch_frames,
-             s_pushed, s_push_fail);
+             s_rear_frames, s_pushed, s_push_fail);
   s_frames = s_rstick_frames = s_rstick_max = s_touch_frames = 0;
+  s_rear_frames = 0;
   s_pushed = s_push_fail = 0;
 }
 
@@ -144,6 +148,9 @@ void input_touch_pump(void) {
    * game whether or not the keyboard owns the panel. */
   s_frames++;
   sample_rstick();
+  SceTouchData rear;
+  if (sceTouchPeek(SCE_TOUCH_PORT_BACK, &rear, 1) > 0 && rear.reportNum > 0)
+    s_rear_frames++;
 
   /* While the on-screen keyboard is up, the panel belongs to it: the taps are
    * aimed at its keys, and forwarding them would also press whatever GUI

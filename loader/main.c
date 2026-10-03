@@ -40,6 +40,9 @@
 #include "gameprof.h"
 #include "lzma_cache.h"
 
+// SDL.h would #define main to SDL_main; this is the only SDL call made here.
+extern int SDL_setenv(const char *name, const char *value, int overwrite);
+
 #include <pthread.h>
 
 so_module kotor_mod;
@@ -2841,6 +2844,11 @@ int main(int argc, char *argv[]) {
   langsel_watch_begin();
   sceTouchSetSamplingState(SCE_TOUCH_PORT_FRONT, SCE_TOUCH_SAMPLING_STATE_START);
   sceTouchSetSamplingState(SCE_TOUCH_PORT_BACK, SCE_TOUCH_SAMPLING_STATE_STOP);
+  // Stopping the rear panel is not enough on its own: reVita turns rear
+  // sampling back on in every pad read it intercepts, and SDL's touch backend
+  // then turns the fingers resting on the back into finger events the game
+  // treats as screen drags. SDL skips the rear port entirely with this set.
+  SDL_setenv("VITA_DISABLE_TOUCH_BACK", "1", 1);
 
   scePowerSetArmClockFrequency(444);
   scePowerSetBusClockFrequency(222);
