@@ -14,6 +14,13 @@ with a from-scratch FMOD audio implementation over `sceAudiodec` and
 > code or data — only the loader, plus artwork used for the LiveArea. It does
 > nothing on its own. You supply the game.
 
+## Screenshots
+
+<p align="center">
+  <img src="docs/screenshots/livearea.png" width="49%" alt="The VitaKotor LiveArea, with Revan and Bastila either side of the Start gate">
+  <img src="docs/screenshots/rancor.png" width="49%" alt="The rancor on Taris, running on a PlayStation Vita">
+</p>
+
 ---
 
 ## Status
