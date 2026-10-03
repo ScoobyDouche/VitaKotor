@@ -21,3 +21,8 @@ backups/
 # Local tooling config -- regenerates on every permission grant, machine-specific
 .claude/
 test-translation/
+
+# Built mod packages (third-party mod content + game data)
+mods/
+# Backup of the Vita card (ux0:data/kotor) -- game libs, saves
+OGHARDWARE/
