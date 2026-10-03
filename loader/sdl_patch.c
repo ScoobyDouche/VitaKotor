@@ -455,6 +455,20 @@ static int is_font_txi_name(const char *base) {
   return dot && !strcmp(dot, ".txi");
 }
 
+// The Google Play button opens the mod menu (modset.h), and its art is bundled
+// at app0:override/ saying MODS (tools/mods_button.py). Every language's button
+// gets it: the label is the same word in all five. Returns the bundled path for
+// ios_mm_gp_<lang>.tga / ios_mm_gp2_<lang>.tga, NULL for anything else.
+static const char *mods_button_path(const char *base) {
+  if (strncasecmp(base, "ios_mm_gp", 9) != 0) return NULL;
+  const char *rest = base + 9;
+  int hl = rest[0] == '2';
+  if (hl) rest++;
+  if (rest[0] != '_' || strlen(rest) != 7 || strcasecmp(rest + 3, ".tga") != 0)
+    return NULL;
+  return hl ? "app0:override/ios_mm_gp2_en.tga" : "app0:override/ios_mm_gp_en.tga";
+}
+
 // OBB fallback for plain file opens.
 //
 // The game reads game data through two different doors, and only one of them
@@ -610,6 +624,13 @@ static SDL_RWops *SDL_RWFromFile_hook(const char *fname, const char *mode) {
   // Plain "w"/"wb" only: anything that may read back ("w+", "r+", "a") stays direct.
   if (rw && mode && mode[0] == 'w' && !strchr(mode, '+'))
     big_write_buffer(rw, fname ? fname : t);
+  if (!rw && mode && mode[0] == 'r') {
+    // Not on the card, so a card override still wins over the bundled art.
+    const char *slash = fname ? strrchr(fname, '/') : NULL;
+    const char *bp = fname ? mods_button_path(slash ? slash + 1 : fname) : NULL;
+    if (bp && (rw = SDL_RWFromFile(bp, mode)) != NULL)
+      log_printf("[mods] button art from %s for %s", bp, fname);
+  }
   if (!rw && mode && mode[0] == 'r') {
     // Not on the card -- ask the archives, using the ORIGINAL name (ObbFile wants
     // the game-relative path, not our ux0: translation).

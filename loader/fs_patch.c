@@ -26,6 +26,7 @@
 #include "fs_patch.h"
 #include "so_util.h"
 #include "log.h"
+#include "modset.h"
 
 #define ASSET_PATH DATA_PATH "/assets"
 
@@ -43,7 +44,12 @@ static const char *android_prefixes[] = {
 #define FS_REL_LOG_LIMIT 600
 static unsigned g_rel_log_n = 0;
 
-static const char *fs_translate_ex(const char *in, char *out, int outsz, int do_log);
+static const char *fs_translate_set(const char *in, char *out, int outsz,
+                                    int do_log, int use_set);
+
+static const char *fs_translate_ex(const char *in, char *out, int outsz, int do_log) {
+  return fs_translate_set(in, out, outsz, do_log, 1);
+}
 
 const char *fs_translate(const char *in, char *out, int outsz) {
   return fs_translate_ex(in, out, outsz, 1);
@@ -51,8 +57,18 @@ const char *fs_translate(const char *in, char *out, int outsz) {
 
 // `do_log` exists for stat(): CExoBaseInternal::GetDirectoryList stats every
 // candidate name in a directory, so logging each translation would bury the log.
-static const char *fs_translate_ex(const char *in, char *out, int outsz, int do_log) {
+//
+// `use_set` 0 gives the card root's own path even where the active mod set
+// (modset.h) has the file -- opendir needs both to merge their listings.
+static const char *fs_translate_set(const char *in, char *out, int outsz,
+                                    int do_log, int use_set) {
   if (!in) { out[0] = 0; return out; }
+
+  // The active mod set stands in for the card root's game-data files it has,
+  // whichever spelling of the card root the game used.
+  if (use_set && strncmp(in, DATA_PATH "/", sizeof(DATA_PATH)) == 0 &&
+      modset_redirect(in + sizeof(DATA_PATH), out, outsz))
+    return out;
 
   // Already a Vita path -- leave it alone.
   if (strncmp(in, "ux0:", 4) == 0 || strncmp(in, "app0:", 5) == 0 ||
@@ -64,6 +80,7 @@ static const char *fs_translate_ex(const char *in, char *out, int outsz, int do_
   for (unsigned i = 0; i < sizeof(android_prefixes) / sizeof(*android_prefixes); i++) {
     size_t plen = strlen(android_prefixes[i]);
     if (strncmp(in, android_prefixes[i], plen) == 0) {
+      if (use_set && modset_redirect(in + plen, out, outsz)) return out;
       snprintf(out, outsz, "%s%s", DATA_PATH, in + plen);   // keep tail after prefix
       if (do_log) log_printf("[FS] %s -> %s", in, out);
       return out;
@@ -79,6 +96,7 @@ static const char *fs_translate_ex(const char *in, char *out, int outsz, int do_
   }
 
   // Relative path -- resolve against the writable root.
+  if (use_set && modset_redirect(in, out, outsz)) return out;
   snprintf(out, outsz, "%s/%s", DATA_PATH, in);
   // log97: in-game the game reopens the texture packs per texture load --
   // swpc_tex_gui.erf alone was translated 449 times -- and each log line is an
@@ -101,12 +119,38 @@ static int fs_access(const char *path, int mode) {
   if (r != 0) log_printf("[FS] access MISS: %s", t);
   return r;
 }
+// What the game holds as its DIR *: up to two directories read one after the
+// other. `over` is the active mod set's copy of the directory (modset.h) and
+// is listed first; `base` is the card root's, minus any name `over` also has,
+// so the game sees each name once and opens the set's copy of it. Without a
+// set, or when the set lacks this directory, only `base` is open. The game
+// imports nothing but opendir/readdir/closedir, so it never looks inside.
+typedef struct {
+  DIR *over;
+  DIR *base;
+  char over_path[512];
+} FsDir;
+
 static DIR *fs_opendir(const char *path) {
-  char t[512];
+  char t[512], root[512];
   fs_translate(path, t, sizeof(t));
-  DIR *d = opendir(t);
-  if (!d) log_printf("[FS] opendir MISS: %s", t);
-  return d;
+  fs_translate_set(path, root, sizeof(root), 0, 0);
+
+  FsDir *fd = calloc(1, sizeof *fd);
+  if (!fd) return NULL;
+  if (strcmp(t, root) != 0) {
+    fd->over = opendir(t);
+    snprintf(fd->over_path, sizeof fd->over_path, "%s", t);
+  }
+  fd->base = opendir(root);
+  if (!fd->over && !fd->base) {
+    log_printf("[FS] opendir MISS: %s", root);
+    free(fd);
+    return NULL;
+  }
+  if (fd->over)
+    log_printf("[FS] opendir %s over %s%s", t, root, fd->base ? "" : " (absent)");
+  return (DIR *)fd;
 }
 // log90 ROOT CAUSE: `stat` was bound straight to newlib's with NO path
 // translation, so every call went to a bare relative path and always failed.
@@ -188,8 +232,27 @@ _Static_assert(__builtin_offsetof(struct bionic_dirent, d_name) == 19,
 static struct bionic_dirent g_bdirent;   // readdir's return is caller-borrowed
 static unsigned g_readdir_n = 0;
 
+static struct dirent *next_entry(FsDir *fd) {
+  if (fd->over) {
+    struct dirent *e = readdir(fd->over);
+    if (e) return e;
+    closedir(fd->over);
+    fd->over = NULL;
+  }
+  while (fd->base) {
+    struct dirent *e = readdir(fd->base);
+    if (!e) return NULL;
+    if (!fd->over_path[0]) return e;
+    char p[800];
+    struct stat st;
+    snprintf(p, sizeof p, "%s/%s", fd->over_path, e->d_name);
+    if (stat(p, &st) != 0) return e;      // the set has no such name
+  }
+  return NULL;
+}
+
 static void *fs_readdir(DIR *d) {
-  struct dirent *e = readdir(d);
+  struct dirent *e = next_entry((FsDir *)d);
   if (!e) return NULL;
   memset(&g_bdirent, 0, sizeof g_bdirent);
   g_bdirent.d_ino    = ++g_readdir_n;          // some callers skip ino == 0
@@ -201,7 +264,14 @@ static void *fs_readdir(DIR *d) {
                g_bdirent.d_type, g_readdir_n);
   return &g_bdirent;
 }
-static int fs_closedir(DIR *d)           { return closedir(d); }
+static int fs_closedir(DIR *d) {
+  FsDir *fd = (FsDir *)d;
+  if (!fd) return -1;
+  if (fd->over) closedir(fd->over);
+  int r = fd->base ? closedir(fd->base) : 0;
+  free(fd);
+  return r;
+}
 static int fs_unlink(const char *path) {
   char t[512];
   fs_translate(path, t, sizeof(t));

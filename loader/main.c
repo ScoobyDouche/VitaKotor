@@ -25,6 +25,7 @@
 #include "ini.h"
 #include "langsel.h"
 #include "translation.h"
+#include "modset.h"
 #include "audio_patch.h"
 #include "bink_patch.h"
 #include "fs_patch.h"
@@ -2441,6 +2442,26 @@ static void offer_language_picker(void) {
   write_language(picked, folder);
 }
 
+// The mod menu, when the Google Play button asked for it on the last run (see
+// modset.h). Same window and same screen as the language picker, and for the
+// same reasons; row 0 is the card root as it was before mod sets existed.
+static void offer_mod_menu(void) {
+  if (!modset_menu_requested()) return;
+
+  const char *rows[MODSET_MAX + 1];
+  int count = 0;
+  rows[count++] = "VANILLA";
+  for (int i = 0; i < modset_count(); i++) rows[count++] = modset_label(i);
+
+  int picked = modset_active() + 1;
+  if (!langsel_list("CHOOSE A MOD SET",
+                    count > 1 ? "CHANGE THIS AGAIN WITH THE GOOGLE PLAY BUTTON"
+                              : "ADD MOD SETS AS FOLDERS IN UX0:DATA/KOTOR/MODS/",
+                    rows, count, picked, &picked))
+    return;
+  modset_choose(picked - 1);
+}
+
 static void dump_ini(const char *path) {
   SceIoStat st;
   memset(&st, 0, sizeof(st));
@@ -2808,6 +2829,7 @@ static void *game_main_thread(void *arg) {
   // above, and the bar draws from this thread via the archive read path.
   // A prebuilt .idx means the mount replays from cache and startup is about a
   // minute shorter, so the bar needs the matching estimate.
+  offer_mod_menu();
   offer_language_picker();
 
   int warm = 0;
@@ -2917,6 +2939,7 @@ int main(int argc, char *argv[]) {
   install_load_probe();
   gameprof_install();
   install_sound_probe();
+  modset_install_button();
 
   // NOTE: vitaGL is initialised on the game thread (see game_main_thread), not
   // here -- GXM context must live on the thread that issues GL calls.
@@ -2925,6 +2948,7 @@ int main(int argc, char *argv[]) {
   // game polls getCurrentLanguage from its first frame onwards.
   resolve_language();
   repair_sound_bias();
+  modset_scan();          // before the game opens anything on the card
 
   // Build the fake JNI tables (this build has no JNI_OnLoad; see RECON-JNI.md).
   jni_setup();

@@ -52,6 +52,7 @@ add_executable(KOTOR
   loader/ini.c
   loader/langsel.c
   loader/translation.c
+  loader/modset.c
   loader/trname.c
   loader/audio_patch.c
   loader/audio_mp3.c
@@ -174,6 +175,41 @@ foreach(f ${FONT_TXI_SRCS})
   list(APPEND FONT_VPK_FILES ${f} "fonts/${fn}")
 endforeach()
 
+# The main menu's Google Play button opens the mod menu (loader/modset.h), so it
+# gets a "MODS" label, made from the game's own button art in patch.obb by
+# tools/mods_button.py and served from app0:override/ by the SDL_RWFromFile hook.
+# Without an OBB to build from, the button keeps its Google Play art.
+set(KOTOR_PATCH_OBB "" CACHE PATH "patch.obb (zip or extracted folder) for the MODS button art")
+if(NOT KOTOR_PATCH_OBB)
+  foreach(c "${CMAKE_SOURCE_DIR}/com.aspyr.swkotor/patch.obb"
+            "${CMAKE_SOURCE_DIR}/com.aspyr.swkotor/patch.53.com.aspyr.swkotor.obb")
+    if(EXISTS "${c}" AND NOT KOTOR_PATCH_OBB)
+      set(KOTOR_PATCH_OBB "${c}")
+    endif()
+  endforeach()
+endif()
+set(MODS_BUTTON_VPK_FILES "")
+if(KOTOR_PATCH_OBB)
+  find_package(Python3 COMPONENTS Interpreter)
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+               "${CMAKE_SOURCE_DIR}/tools/mods_button.py")
+  execute_process(
+    COMMAND ${Python3_EXECUTABLE} "${CMAKE_SOURCE_DIR}/tools/mods_button.py"
+            "${KOTOR_PATCH_OBB}" "${CMAKE_BINARY_DIR}/override"
+    RESULT_VARIABLE MODS_BUTTON_RC)
+  if(MODS_BUTTON_RC EQUAL 0)
+    foreach(fn ios_mm_gp_en.tga ios_mm_gp2_en.tga)
+      list(APPEND MODS_BUTTON_VPK_FILES "${CMAKE_BINARY_DIR}/override/${fn}" "override/${fn}")
+    endforeach()
+    message(STATUS "MODS button art built from ${KOTOR_PATCH_OBB}")
+  else()
+    message(WARNING "tools/mods_button.py failed -- the button keeps its Google Play art")
+  endif()
+else()
+  message(WARNING "No patch.obb under com.aspyr.swkotor/ (set KOTOR_PATCH_OBB) -- "
+                  "the mod menu button keeps its Google Play art")
+endif()
+
 vita_create_self(eboot.bin KOTOR UNSAFE)
 vita_create_vpk(KOTOR.vpk ${VITA_TITLEID} eboot.bin
   VERSION ${VITA_VERSION}
@@ -184,6 +220,7 @@ vita_create_vpk(KOTOR.vpk ${VITA_TITLEID} eboot.bin
        ${CMAKE_SOURCE_DIR}/sce_sys/livearea/contents/template.xml sce_sys/livearea/contents/template.xml
        ${SHADER_VPK_FILES}
        ${FONT_VPK_FILES}
+       ${MODS_BUTTON_VPK_FILES}
 )
 
 # Keep the last few builds (vpk + matching source tarball) under backups/ so a

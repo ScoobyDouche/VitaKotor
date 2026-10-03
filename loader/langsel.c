@@ -59,7 +59,8 @@ static void row(const char *s, int slot, int on) {
           on ? 0.70f : 0.42f, on ? 0.82f : 0.49f, on ? 1.00f : 0.60f);
 }
 
-static void draw(const char *const *rows, int count, int sel, int top,
+static void draw(const char *title, const char *hint,
+                 const char *const *rows, int count, int sel, int top,
                  const char *footer) {
   glDisable(GL_SCISSOR_TEST);
   glDisable(GL_DEPTH_TEST);
@@ -82,7 +83,7 @@ static void draw(const char *const *rows, int count, int sel, int top,
   glMatrixMode(GL_MODELVIEW);
   glLoadIdentity();
 
-  centred("CHOOSE A LANGUAGE", (float)LANGSEL_TITLE_Y, LANGSEL_TITLE_SCALE,
+  centred(title, (float)LANGSEL_TITLE_Y, LANGSEL_TITLE_SCALE,
           0.588f, 0.667f, 0.784f);
 
   for (int i = top; i < count && i < top + LANGSEL_VISIBLE_ROWS; i++)
@@ -96,8 +97,7 @@ static void draw(const char *const *rows, int count, int sel, int top,
     centred("...", (float)ROW_Y(LANGSEL_VISIBLE_ROWS), 1.0f,
             0.43f, 0.63f, 0.92f);
 
-  centred("CHANGE THIS LATER BY HOLDING L WHILE THE GAME STARTS",
-          (float)LANGSEL_HINT_Y, 1.0f, 0.33f, 0.40f, 0.50f);
+  centred(hint, (float)LANGSEL_HINT_Y, 1.0f, 0.33f, 0.40f, 0.50f);
   centred(footer, (float)LANGSEL_FOOTER_Y, 1.0f, 0.43f, 0.63f, 0.92f);
 
   /* Leave the matrices as we found them rather than handing the game our
@@ -224,13 +224,40 @@ int langsel_run(int current, int have_key, const char *const *extra, int nextra,
 
   if (have_key && !held) return 0;
 
+  const char *rows[LANGSEL_MAX_ROWS];
+  int count = 0;
+  for (int i = 0; i < LANGSEL_BUILTIN; i++) rows[count++] = kNames[i];
+  for (int i = 0; i < nextra && count < LANGSEL_MAX_ROWS; i++)
+    rows[count++] = extra[i];
+
+  log_printf("[langsel] open (current row %d, %s, %d fan translation%s)",
+             current, have_key ? "L held" : "no Language key yet",
+             count - LANGSEL_BUILTIN, count - LANGSEL_BUILTIN == 1 ? "" : "s");
+
+  int sel = (current >= 0 && current < count) ? current : INI_LANG_EN;
+  if (!langsel_list("CHOOSE A LANGUAGE",
+                    "CHANGE THIS LATER BY HOLDING L WHILE THE GAME STARTS",
+                    rows, count, sel, &sel))
+    return 0;
+
+  *out = sel;
+  if (sel < LANGSEL_BUILTIN)
+    log_printf("[langsel] chose %s (id %d)", ini_language_code(sel), sel);
+  else
+    log_printf("[langsel] chose fan translation row %d (%s)", sel, rows[sel]);
+  return 1;
+}
+
+int langsel_list(const char *title, const char *hint,
+                 const char *const *rows, int count, int current, int *out) {
+  if (count <= 0) return 0;
+
   /* The atlas is left loaded on purpose: loadscreen's own font_load() is a
    * no-op once it is up, so the picker costs the boot screen nothing. */
   ObbZip *z = obbzip_open(OBB_PATCH_PATH);
   if (z) { font_load(z); obbzip_close(z); }
   if (!font_ready()) {
-    log_printf("[langsel] no font -- skipping the picker (language stays %s)",
-               ini_language_code(current));
+    log_printf("[langsel] no font -- skipping \"%s\"", title);
     return 0;
   }
 
@@ -238,22 +265,16 @@ int langsel_run(int current, int have_key, const char *const *extra, int nextra,
   const char *footer;
   enter_buttons(&btn_ok, &btn_cancel, &footer);
 
-  const char *rows[LANGSEL_MAX_ROWS];
-  int count = 0;
-  for (int i = 0; i < LANGSEL_BUILTIN; i++) rows[count++] = kNames[i];
-  for (int i = 0; i < nextra && count < LANGSEL_MAX_ROWS; i++)
-    rows[count++] = extra[i];
+  SceCtrlData pad;
+  memset(&pad, 0, sizeof pad);
+  sceCtrlPeekBufferPositiveExt2(0, &pad, 1);
 
-  int sel = (current >= 0 && current < count) ? current : INI_LANG_EN;
+  int sel = (current >= 0 && current < count) ? current : 0;
   int top = 0;
   if (sel >= LANGSEL_VISIBLE_ROWS) top = sel - LANGSEL_VISIBLE_ROWS + 1;
   unsigned prev = pad.buttons;
   uint64_t idle = sceKernelGetProcessTimeWide();
   int confirmed = 0;
-
-  log_printf("[langsel] open (current row %d, %s, %d fan translation%s)",
-             current, have_key ? "L held" : "no Language key yet",
-             count - LANGSEL_BUILTIN, count - LANGSEL_BUILTIN == 1 ? "" : "s");
 
   for (;;) {
     memset(&pad, 0, sizeof pad);
@@ -280,7 +301,7 @@ int langsel_run(int current, int have_key, const char *const *extra, int nextra,
       break;
     }
 
-    draw(rows, count, sel, top, footer);
+    draw(title, hint, rows, count, sel, top, footer);
 
     /* Whether vglSwapBuffers waits for vblank is vitaGL's business, not ours,
      * so the poll rate is pinned here: fast enough that a press never feels
@@ -288,15 +309,8 @@ int langsel_run(int current, int have_key, const char *const *extra, int nextra,
     sceKernelDelayThread(10000);
   }
 
-  if (confirmed) {
-    *out = sel;
-    if (sel < LANGSEL_BUILTIN)
-      log_printf("[langsel] chose %s (id %d)", ini_language_code(sel), sel);
-    else
-      log_printf("[langsel] chose fan translation row %d (%s)", sel, rows[sel]);
-  } else {
-    log_printf("[langsel] dismissed without choosing");
-  }
+  if (confirmed) *out = sel;
+  else log_printf("[langsel] \"%s\" dismissed without choosing", title);
   return confirmed;
 }
 
@@ -307,6 +321,12 @@ void langsel_watch_begin(void) { }
 int langsel_run(int current, int have_key, const char *const *extra, int nextra,
                 int *out) {
   (void)current; (void)have_key; (void)extra; (void)nextra; (void)out;
+  return 0;
+}
+
+int langsel_list(const char *title, const char *hint,
+                 const char *const *rows, int count, int current, int *out) {
+  (void)title; (void)hint; (void)rows; (void)count; (void)current; (void)out;
   return 0;
 }
 

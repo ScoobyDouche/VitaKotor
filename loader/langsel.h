@@ -55,4 +55,12 @@ void langsel_watch_begin(void);
 int langsel_run(int current, int have_key, const char *const *extra, int nextra,
                 int *out);
 
+/* The same screen for any list: `title` above the rows, `hint` below them,
+ * `rows` CP1252 labels, starting on row `current`. Always opens (no L check).
+ * Returns 1 with the confirmed row in *out; 0 when it could not run, was
+ * cancelled, or timed out, leaving *out untouched. The mod menu (modset.h)
+ * uses it. */
+int langsel_list(const char *title, const char *hint,
+                 const char *const *rows, int count, int current, int *out);
+
 #endif
