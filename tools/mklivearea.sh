@@ -15,6 +15,8 @@ LAUNCH="$ROOT/apk/res/mipmap-xxhdpi/ic_launcher.png"
 # Character art for bg.png: Revan on a white backdrop, Bastila on black.
 REVAN="$ROOT/apk/livearea/revan.jpeg"
 BASTILA="$ROOT/apk/livearea/bastila.jpeg"
+# A Sith holocron on a curtain backdrop, centred between the gate and the caption.
+HOLOCRON="$ROOT/apk/livearea/holocron.png"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
@@ -22,6 +24,7 @@ trap 'rm -rf "$TMP"' EXIT
 [ -f "$LAUNCH" ] || { echo "missing $LAUNCH" >&2; exit 1; }
 [ -f "$REVAN" ]   || { echo "missing $REVAN"   >&2; exit 1; }
 [ -f "$BASTILA" ] || { echo "missing $BASTILA" >&2; exit 1; }
+[ -f "$HOLOCRON" ] || { echo "missing $HOLOCRON" >&2; exit 1; }
 
 # The Vita package installer rejects the entire VPK with error 0x8010113D if any
 # sce_sys PNG is not 8-bit indexed, so everything here is written through PNG8.
@@ -113,8 +116,29 @@ convert "$TMP/bg3.png" "$TMP/vig.png" -compose multiply -composite \
         "$TMP/bastila.png" -gravity none -geometry +$BX+22 -compose over -composite \
         "$TMP/bg5.png"
 
+# The holocron, cut out of its curtain backdrop along the triangle (apex and
+# base corners measured on the 116x120 source; the mask is drawn at 4x and
+# pulled in a pixel so no curtain survives at the edges), then scaled to fill
+# the gap between the gate's bottom edge (y ~301 on this canvas) and the
+# caption (top ~471) with a few pixels to spare at each end. The source is
+# dark; a mild level lift keeps it from sinking into the starfield.
+HOLO_H=164
+HOLO_Y=304
+convert -size 464x480 xc:black -fill white \
+        -draw "polygon 232,20 14,474 450,474" \
+        -morphology Erode Disk:4 -blur 0x2 -resize 116x120\! "$TMP/hmask.png"
+convert "$HOLOCRON" "$TMP/hmask.png" -alpha off -compose copy_opacity -composite \
+        -crop 110x116+3+4 +repage -resize x$HOLO_H -level 0%,80% "$TMP/holocron.png"
+HOLO_W=$(identify -format '%w' "$TMP/holocron.png")
+glow 840 500 70 70 '#4a1410' 40 0.7 "$TMP/hglow.png"
+convert "$TMP/hglow.png" -roll +0+$(( HOLO_Y + HOLO_H / 2 + 16 - 250 )) "$TMP/hglow2.png"
+convert "$TMP/bg5.png" "$TMP/hglow2.png" -compose screen -composite \
+        "$TMP/holocron.png" -gravity none \
+        -geometry +$(( (840 - HOLO_W) / 2 ))+$HOLO_Y -compose over -composite \
+        "$TMP/bg6.png"
+
 # A small caption centred along the bottom, between the two of them.
-convert "$TMP/bg5.png" \
+convert "$TMP/bg6.png" \
         -fill '#c9a227' -stroke none \
         -font DejaVu-Sans -pointsize 15 \
         -gravity South -annotate +0+12 'PlayStation Vita port' \
