@@ -224,6 +224,8 @@ static volatile unsigned g_pumps = 0;
 /* Stick-flicker filter (SDL_PollEvent_hook): centres dropped as flicker, and
  * centres held back then let through as real releases. */
 static unsigned g_stick_dropped, g_stick_released;
+/* Axis events re-delivered after a menu closed (resync_next). */
+static unsigned g_resync_n;
 
 static void axis_window_reset(void) {
   for (int a = 0; a < 4; a++)
@@ -321,9 +323,11 @@ void sdl_input_census(void) {
     p += snprintf(buf + p, sizeof(buf) - p, "%sa%d n=%u jump=%u [%d..%d]",
                   a ? " | " : "", a, g_axis[a].n, g_axis[a].jumps,
                   g_axis[a].n ? g_axis[a].lo : 0, g_axis[a].n ? g_axis[a].hi : 0);
-  log_printf("[input] axes: %s; pumps=%u; stick filter dropped %u released %u",
-             buf, g_pumps, g_stick_dropped, g_stick_released);
+  log_printf("[input] axes: %s; pumps=%u; stick filter dropped %u released %u; "
+             "re-synced %u",
+             buf, g_pumps, g_stick_dropped, g_stick_released, g_resync_n);
   g_stick_dropped = g_stick_released = 0;
+  g_resync_n = 0;
   axis_window_reset();
 }
 static void SDL_PumpEvents_hook(void) {
@@ -403,7 +407,73 @@ static int stick_filter(const SDL_Event *e) {
   return 0;
 }
 
+/* Stick re-sync after a menu closes.
+ *
+ * Opening the menu while running and closing it sent the character on
+ * forward by itself. The game learns the stick only from JOYAXISMOTION
+ * events -- it imports no SDL_JoystickGetAxis -- and while a menu is up the
+ * menu is what consumes them, the release to centre included. The movement
+ * code is left holding the last value it saw, "pushed", and nothing corrects
+ * it: SDL sends an axis only when it changes, and a stick resting at centre
+ * does not change.
+ *
+ * Menus close on a button or a tap, so after either one, re-deliver all four
+ * axes at their CURRENT values -- twice, once the close has had a frame to
+ * land and again a little later -- so stale state cannot outlive the menu.
+ * Re-sending a value the game already holds changes nothing. */
+#define RESYNC_FIRST_MS  120
+#define RESYNC_SECOND_MS 450
+static SDL_JoystickID g_axis_joy = -1;     /* instance id from the first axis event */
+static Uint32 g_resync_at[2];              /* 0 = not scheduled */
+static int g_resync_axis = -1;             /* next axis to send, -1 = idle */
+
+static void resync_schedule(void) {
+  Uint32 now = SDL_GetTicks();
+  g_resync_at[0] = now + RESYNC_FIRST_MS;
+  g_resync_at[1] = now + RESYNC_SECOND_MS;
+  if (!g_resync_at[0]) g_resync_at[0] = 1;  /* 0 means unscheduled */
+  if (!g_resync_at[1]) g_resync_at[1] = 1;
+}
+
+static void resync_note(const SDL_Event *e) {
+  if (e->type == SDL_JOYAXISMOTION && g_axis_joy < 0) g_axis_joy = e->jaxis.which;
+  if (e->type == SDL_JOYBUTTONUP || e->type == SDL_FINGERUP) resync_schedule();
+}
+
+/* One synthetic axis event per call while a re-sync is running, else 0. */
+static int resync_next(SDL_Event *e) {
+  if (g_resync_axis < 0) {
+    Uint32 now = SDL_GetTicks();
+    int due = 0;
+    for (int i = 0; i < 2; i++)
+      if (g_resync_at[i] && (Sint32)(now - g_resync_at[i]) >= 0) { g_resync_at[i] = 0; due = 1; }
+    if (!due) return 0;
+    g_resync_axis = 0;
+  }
+  SDL_Joystick *js = g_axis_joy >= 0 ? SDL_JoystickFromInstanceID(g_axis_joy) : NULL;
+  while (js && g_resync_axis < 4) {
+    int a = g_resync_axis++;
+    if (g_stick[a].pending) continue;     /* the flicker filter owns this axis */
+    Sint16 v = SDL_JoystickGetAxis(js, a);
+    memset(e, 0, sizeof *e);
+    e->jaxis.type = SDL_JOYAXISMOTION;
+    e->jaxis.timestamp = SDL_GetTicks();
+    e->jaxis.which = g_axis_joy;
+    e->jaxis.axis = (Uint8)a;
+    e->jaxis.value = v;
+    g_stick[a].last = v;
+    g_resync_n++;
+    return 1;
+  }
+  g_resync_axis = -1;
+  return 0;
+}
+
 static int SDL_PollEvent_hook(SDL_Event *e) {
+  if (e && resync_next(e)) {
+    log_event("PollEvent", e);
+    return 1;
+  }
   int a = stick_expired();
   if (a >= 0) {
     if (!e) return 1;
@@ -419,6 +489,7 @@ static int SDL_PollEvent_hook(SDL_Event *e) {
   while ((r = SDL_PollEvent(e)) && stick_filter(e))
     ;
   if (r) {
+    resync_note(e);
     normalize_joy_event(e);
     log_event("PollEvent", e);
   }
@@ -429,6 +500,7 @@ static int SDL_PeepEvents_hook(SDL_Event *e, int num, SDL_eventaction action,
   int r = SDL_PeepEvents(e, num, action, minType, maxType);
   if (r > 0 && e && action != SDL_ADDEVENT)
     for (int i = 0; i < r && i < num; i++) {
+      if (action == SDL_GETEVENT) resync_note(&e[i]);
       normalize_joy_event(&e[i]);
       log_event("PeepEvents", &e[i]);
     }
