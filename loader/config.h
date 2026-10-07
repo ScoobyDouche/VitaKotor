@@ -114,6 +114,21 @@
 //   SCE_GXM_MULTISAMPLE_4X    original, prettiest, slowest
 #define GL_MSAA_MODE SCE_GXM_MULTISAMPLE_NONE
 
+// ---- CPU cores ---------------------------------------------------------------
+// The game thread (SDL_main and every GL call) is the frame-time bottleneck and
+// cannot be split. With pinning on it gets core 0 to itself; the game's worker
+// threads alternate between cores 2 and 1, the audio mixer sits on core 1, and
+// the log writer, sound loader, watchdog and vitaGL's garbage collector share
+// core 2. 0 leaves every thread on the kernel's default placement, which is
+// what v0.4.0 and earlier did. See threads.h.
+#define THREAD_PINNING 1
+
+// The audio mixer's priority. It sleeps in sceAudioOutOutput nearly all the
+// time, so ranking it above the game's workers (which now share its core)
+// costs them almost nothing and keeps a busy worker from making it underrun.
+// If the kernel refuses this value the mixer falls back to the default.
+#define AUDIO_MIXER_PRIORITY 0x100000F0
+
 // ---- Archive mount speed & feedback ----------------------------------------
 // Mounting main.obb reads a ~46-byte local header at each of ~16k entries,
 // scattered across 1.75 GB. Measured from the real archive: mean gap between

@@ -74,6 +74,7 @@ add_executable(KOTOR
   loader/gameprof.c
   loader/lzma_cache.c
   loader/log.c
+  loader/threads.c
 )
 
 target_compile_definitions(KOTOR PRIVATE KOTOR_USE_BINK_OPENSL=1)
