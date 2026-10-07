@@ -53,6 +53,20 @@ static int rec_find(const Rec *r, int n, long target) {
 
 /* ---- load ----------------------------------------------------------------- */
 
+/* The file is only trusted as far as its header: a card that lost power during
+ * the write, or a hand-copied .idx from another setup, can carry records that
+ * point outside the blob, and obbidx_serve would memcpy from there. Every
+ * record must sit inside the blob and inside the archive, in sorted order. */
+static int recs_valid(const Rec *r, int n, int nblob, long archive_size) {
+  for (int i = 0; i < n; i++) {
+    if (r[i].len <= 0 || r[i].len > OBB_INDEX_MAX_RANGE) return 0;
+    if (r[i].blob < 0 || r[i].blob > nblob - r[i].len) return 0;
+    if (r[i].off < 0 || r[i].off > archive_size - r[i].len) return 0;
+    if (i > 0 && r[i].off < r[i - 1].off) return 0;
+  }
+  return 1;
+}
+
 static int idx_load(ObbIndex *ix) {
   SceUID fd = sceIoOpen(ix->path, SCE_O_RDONLY, 0);
   if (fd < 0) return 0;
@@ -68,7 +82,8 @@ static int idx_load(ObbIndex *ix) {
     unsigned char *b = (unsigned char *)malloc((size_t)h.nblob);
     if (r && b &&
         sceIoRead(fd, r, h.nrec * (int)sizeof(Rec)) == h.nrec * (int)sizeof(Rec) &&
-        sceIoRead(fd, b, h.nblob) == h.nblob) {
+        sceIoRead(fd, b, h.nblob) == h.nblob &&
+        recs_valid(r, h.nrec, h.nblob, ix->archive_size)) {
       ix->rec = r; ix->nrec = h.nrec;
       ix->blob = b; ix->nblob = h.nblob;
       ix->serving = 1;
@@ -107,7 +122,9 @@ int obbidx_serve(ObbIndex *ix, long off, void *dst, long len) {
   int i = rec_find(ix->rec, ix->nrec, off);
   if (i < 0) return 0;
   const Rec *r = &ix->rec[i];
-  if (off + len > r->off + r->len) return 0;          /* not fully covered */
+  /* Not fully covered. Written without off + len: the main OBB is within a
+   * few percent of LONG_MAX, and that sum can wrap. */
+  if (len > r->len || off - r->off > r->len - len) return 0;
   memcpy(dst, ix->blob + r->blob + (off - r->off), (size_t)len);
   return 1;
 }

@@ -346,6 +346,20 @@ you a save. They are listed because you may hit them. Save regularly.
   preparing several hundred objects a frame; the graphics chip is not the
   limit. Video memory is also full for most of a session, so textures loaded
   after the first minute are served from ordinary RAM.
+- **Characters can jump position in combat.** When a frame runs slow, the
+  Android game runs extra catch-up updates before drawing; the port skips
+  them because they made stutters worse. If you see your character jump away
+  when an attack starts, try letting one catch-up update through, at some cost
+  in frame rate, by adding this to `ux0:data/kotor/swkotor.ini`:
+
+  ```ini
+  [Vita Options]
+  CatchUpUpdates=1
+  ```
+
+  `0` (the default) is the old behaviour; up to `10` is accepted. The log's
+  `[perf]` line says which value is in use. Whether this cures the jumps is
+  not confirmed yet, so reports either way help.
 - **Not every movie has been checked.** The ones played so far run with
   sound and hand back to the game cleanly; 48 kHz movies and localized
   subtitles have not been specifically tested.

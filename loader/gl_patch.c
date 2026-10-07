@@ -767,7 +767,10 @@ static void glUniform1i_e(GLint location, GLint v) {
 static void glActiveTexture_e(GLenum t) {
   GLLOG("glActiveTexture(0x%x)", (unsigned)t);
   unsigned u = (unsigned)t - 0x84C0u;               /* GL_TEXTURE0 */
-  g_active_unit = (u < GL_MAX_TEXUNITS) ? u : 0;
+  /* A unit past the shadow table is left untracked (GL_MAX_TEXUNITS) rather
+   * than folded onto unit 0, which would let unit 0's filter skip a bind it
+   * never saw. */
+  g_active_unit = (u < GL_MAX_TEXUNITS) ? u : GL_MAX_TEXUNITS;
   glActiveTexture(t);
 }
 
@@ -905,7 +908,9 @@ static void glBindTexture_e(GLenum tg, GLuint t) {
     w2++;
   }
 #if GL_FILTER_REDUNDANT_BINDS
-  if (tg == GL_TEXTURE_2D) {
+  if (g_active_unit >= GL_MAX_TEXUNITS) {
+    /* untracked unit: always forward */
+  } else if (tg == GL_TEXTURE_2D) {
     if (g_bound2d[g_active_unit] == t) {
       g_bind_skipped_win++; g_bind_skipped_frame++; g_cur_tex = t; return;
     }
