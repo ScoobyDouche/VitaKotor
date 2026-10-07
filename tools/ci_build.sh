@@ -28,5 +28,8 @@ make install
 
 cd "$ROOT"
 cmake -S . -B build -DCMAKE_TOOLCHAIN_FILE="$VITASDK/share/vita.toolchain.cmake"
+arm-vita-eabi-gcc --version | head -1
+cmake --build build --target KOTOR -j"$(nproc)"
+arm-vita-eabi-readelf -lW build/KOTOR | sed -n '1,30p'
 cmake --build build -j"$(nproc)"
 ls -l build/eboot.bin build/KOTOR.vpk
