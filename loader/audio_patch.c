@@ -68,6 +68,7 @@
 #include "bigalloc.h"
 #include "sdl_patch.h"
 #include "log.h"
+#include "threads.h"
 
 /* ---- output format -------------------------------------------------------
  * Sources are mono at 32000 or 22050 Hz (measured across the OBB). We mix to one
@@ -1094,8 +1095,14 @@ static void audio_start(void) {
                        SCE_AUDIO_VOLUME_FLAG_L_CH | SCE_AUDIO_VOLUME_FLAG_R_CH, vol);
   audio_mp3_init_library();
   g_running = 1;
-  g_thread = sceKernelCreateThread("kotor_snd", audio_thread, 0x10000100, 0x10000,
-                                   0, 0, NULL);
+  g_thread = sceKernelCreateThread("kotor_snd", audio_thread, AUDIO_MIXER_PRIORITY, 0x10000,
+                                   0, thread_mask(CPU_AUX_A), NULL);
+  if (g_thread < 0) {                     /* never lose sound over the priority */
+    log_printf("[snd] mixer priority 0x%x refused (0x%08X) -- using the default",
+               (unsigned)AUDIO_MIXER_PRIORITY, (unsigned)g_thread);
+    g_thread = sceKernelCreateThread("kotor_snd", audio_thread, 0x10000100, 0x10000,
+                                     0, thread_mask(CPU_AUX_A), NULL);
+  }
   if (g_thread < 0) {
     log_printf("[snd] output thread create failed 0x%08X", (unsigned)g_thread);
     g_running = 0;
@@ -1113,6 +1120,7 @@ static void audio_start(void) {
     g_port = -1;
     return;
   }
+  thread_census_add(g_thread, "audio-mixer");
   log_printf("[snd] output up: port=%d %dHz stereo grain=%d", g_port, OUT_RATE, OUT_GRAIN);
 }
 
@@ -1432,12 +1440,13 @@ static int prog_start(void) {
   if (g_prog_sema < 0) return 0;
   /* Below the game thread: it should soak up idle time, not take it. */
   g_prog_thid = sceKernelCreateThread("kotor_sndload", prog_thread, 0x10000110, 0x4000,
-                                      0, 0, NULL);
+                                      0, thread_mask(CPU_AUX_B), NULL);
   if (g_prog_thid < 0 || sceKernelStartThread(g_prog_thid, 0, NULL) < 0) {
     log_printf("[snd] progressive loader thread failed -- streams load whole");
     g_prog_thid = -1;
     return 0;
   }
+  thread_census_add(g_prog_thid, "audio-loader");
   return 1;
 }
 
