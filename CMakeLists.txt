@@ -43,6 +43,7 @@ add_executable(KOTOR
   loader/so_util.c
   loader/dynlib.c
   loader/obb_index.c
+  loader/obb_cache.c
   loader/loadscreen.c
   loader/obbzip.c
   loader/tga.c

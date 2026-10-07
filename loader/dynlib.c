@@ -34,6 +34,7 @@
 #include "main.h"
 #include "config.h"
 #include "obb_index.h"
+#include "obb_cache.h"
 #include "bigalloc.h"
 #include "loadscreen.h"
 
@@ -345,6 +346,7 @@ static void io_dump_open(void) {
  * anyway. rpos is kept only for the seek-ratio diagnostic now. */
 typedef struct {
   int refs; SceUID fd; long size; long rpos; char path[72]; ObbIndex *idx;
+  int cache_id;   /* path hash: stays the same if the archive is reopened in another slot */
 } SharedFile;
 typedef struct { int used; SharedFile *sf; long pos; int eof, err; } VFile;
 
@@ -352,6 +354,7 @@ static SharedFile g_sf[SF_MAX];
 static VFile      g_vf[VF_MAX];
 static SceUID     g_io_mutex = -1;
 static unsigned   g_vreads = 0, g_vseeks = 0, g_vhits = 0;
+static unsigned g_vcache_hits;   /* reads served by obb_cache (RAM) */
 static uint64_t   g_vread_bytes = 0, g_vread_us = 0;
 static int        g_vlive = 0;
 
@@ -416,6 +419,9 @@ static FILE *fopen_shared(const char *path, const char *mode) {
     sf->refs = 0;
     snprintf(sf->path, sizeof sf->path, "%s", path);
     sf->idx  = obbidx_open(path, sf->size);
+    unsigned h = 2166136261u;
+    for (const char *c = path; *c; c++) h = (h ^ (unsigned char)*c) * 16777619u;
+    sf->cache_id = (int)(h ^ (unsigned)sf->size);
     g_files_open++;
     log_printf("[io] shared archive opened: %s (%ld bytes) -- further opens "
                "share this one handle", path, sf->size);
@@ -440,7 +446,7 @@ void io_perf_snapshot(io_perf_t *out) {
   if (!out) return;
   io_lock();
   out->reads = g_vreads;
-  out->hits = g_vhits;
+  out->hits = g_vhits + g_vcache_hits;   /* index replay + RAM cache */
   out->seeks = g_vseeks;
   out->card_bytes = g_vread_bytes;
   out->card_us = g_vread_us;
@@ -573,6 +579,11 @@ static size_t fread_diag(void *p, size_t sz, size_t n, FILE *f) {
     if (obbidx_serve(sf->idx, v->pos, p, want)) {
       got = want;
       g_vhits++;
+    } else if (obb_cache_get(sf->cache_id, v->pos, want, p)) {
+      /* 1b. Recently read in game: the equipment preview re-reads the same
+       *     textures on every hover. */
+      got = want;
+      g_vcache_hits++;
     } else {
       /* 2. One positional read; no seek, no newlib buffer to invalidate. */
       if (sf->rpos != v->pos) g_vseeks++;      /* diagnostic only now */
@@ -584,6 +595,7 @@ static size_t fread_diag(void *p, size_t sz, size_t n, FILE *f) {
       g_vread_bytes += (unsigned)got;
       sf->rpos = v->pos + got;
       if (got > 0) obbidx_record(sf->idx, v->pos, p, got);
+      if (got == want) obb_cache_put(sf->cache_id, v->pos, got, p);
       g_vreads++;
     }
 

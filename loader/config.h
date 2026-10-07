@@ -524,6 +524,12 @@
 // cannot fragment the heap; outputs over 2 MB (area-load textures) are not kept.
 #define LZMA_CACHE_KB (8 * 1024)
 
+// Archive read cache (obb_cache.c), in KB; 0 disables it. log_4: each hover on
+// the equipment screen re-read the same ~1.3 MB of textures from the card for
+// the character preview, ~140 ms a time. One ring allocated at boot, like the
+// LZMA cache. swkotor.ini [Vita Options] ObbCacheKB overrides it.
+#define OBB_READ_CACHE_KB (8 * 1024)
+
 // Upload textures as 16-bit instead of 32-bit.
 //
 // The live-texture census (log161) is emphatic that nothing leaks: 1,014,190 KB

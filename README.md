@@ -357,6 +357,10 @@ you a save. They are listed because you may hit them. Save regularly.
   CatchUpUpdates=1
   ```
 
+  `ObbCacheKB=8192` in the same section sets how much RAM keeps recent game
+  data reads (default 8192, `0` turns it off). It is what makes repeated
+  hovers on the equipment screen skip the memory card.
+
   `0` (the default) is the old behaviour; up to `10` is accepted. The log's
   `[perf]` line says which value is in use. Whether this cures the jumps is
   not confirmed yet, so reports either way help.
