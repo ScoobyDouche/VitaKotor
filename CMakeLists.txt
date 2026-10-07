@@ -74,9 +74,15 @@ add_executable(KOTOR
   loader/gameprof.c
   loader/lzma_cache.c
   loader/log.c
+  loader/sce_pad.c
 )
 
 target_compile_definitions(KOTOR PRIVATE KOTOR_USE_BINK_OPENSL=1)
+
+# Bytes of read-only padding to shift the RX segment's end (see loader/sce_pad.c).
+set(KOTOR_SCE_PAD 0 CACHE STRING "Read-only padding so vita-elf-create has room for its SCE data")
+set_source_files_properties(loader/sce_pad.c PROPERTIES
+  COMPILE_DEFINITIONS "KOTOR_SCE_PAD=${KOTOR_SCE_PAD}")
 if(KOTOR_NO_LOG)
   target_compile_definitions(KOTOR PRIVATE LOG_OFF=1)
 endif()
