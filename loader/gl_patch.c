@@ -39,6 +39,7 @@
 #include "gxm_patcher.h"
 #include "gameprof.h"
 #include "lzma_cache.h"
+#include "obb_cache.h"
 
 static inline float u2f(uint32_t u) { union { uint32_t u; float f; } c; c.u = u; return c.f; }
 
@@ -616,6 +617,7 @@ void gl_patch_on_swap(uint64_t swap_begin_us, uint64_t swap_end_us) {
     gxmp_window_report();
     gameprof_window_report();
     lzma_cache_report();
+    obb_cache_report();
 #if GEOM_PROBE
     geo_window_report();
 #endif

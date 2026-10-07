@@ -40,6 +40,7 @@
 #include "gxm_patcher.h"
 #include "gameprof.h"
 #include "lzma_cache.h"
+#include "obb_cache.h"
 
 // SDL.h would #define main to SDL_main; this is the only SDL call made here.
 extern int SDL_setenv(const char *name, const char *value, int overwrite);
@@ -2337,10 +2338,11 @@ static char *read_whole_ini(const char *path) {
   return text;
 }
 
-// [Vita Options] CatchUpUpdates=<0..10>: see g_catchup_cap. Read whole rather
+// [Vita Options] CatchUpUpdates=<0..10>: see g_catchup_cap. Also ObbCacheKB. Read whole rather
 // than through slurp_ini's 4 KB, since a section added at the end of a long
 // ini is exactly where a player would put it.
 static void read_vita_options(void) {
+  int cache_kb = OBB_READ_CACHE_KB;
   for (int i = 0; i < INI_PATH_COUNT; i++) {
     char *text = read_whole_ini(kIniPaths[i]);
     if (!text) continue;
@@ -2349,9 +2351,15 @@ static void read_vita_options(void) {
       int n = atoi(v);
       g_catchup_cap = n < 0 ? 0 : (n > 10 ? 10 : n);
     }
+    // [Vita Options] ObbCacheKB: RAM for recent archive reads (obb_cache.h).
+    if (ini_get(text, "Vita Options", "ObbCacheKB", v, sizeof(v)) && v[0]) {
+      int n = atoi(v);
+      cache_kb = n < 0 ? 0 : (n > 32 * 1024 ? 32 * 1024 : n);
+    }
     free(text);
     break;
   }
+  obb_cache_init((size_t)cache_kb);
   log_printf("[perf] [Vita Options] CatchUpUpdates=%d (%s)", g_catchup_cap,
              g_catchup_cap ? "slow frames may run catch-up updates"
                            : "every update presents");
