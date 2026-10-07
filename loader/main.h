@@ -26,6 +26,10 @@ typedef struct {
   unsigned policy_seq, selected_skip;
   float selector_ai_ms, next_ai_ms, display_fps;
   int movie_fps;
+  /* model construction (NewCAurObject, outermost call) and the archive reads
+   * under it (IODispatcher::ReadSync), lifetime totals */
+  unsigned model_calls, model_read_calls;
+  uint64_t model_us, model_read_us;
 } engine_perf_t;
 
 void engine_perf_snapshot(engine_perf_t *out, uint64_t now_us);

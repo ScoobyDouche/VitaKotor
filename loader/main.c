@@ -955,6 +955,14 @@ static int ExtLoad_probe(void *self, void *gff, void *st) {
 static void *(*LoadModel_orig)(void *self, const void *resref, unsigned part) = NULL;
 static unsigned g_lm_n = 0;
 
+/* Time spent building models and reading them out of the archive, for the
+ * [hitch] line: the menu-tab freezes read no card data and upload no textures,
+ * and the open question is whether the equipment screen's character preview
+ * being rebuilt is where that second goes. Only the game thread is timed, and
+ * the depth counts keep nested calls from being timed twice. */
+static unsigned g_model_calls, g_model_read_calls, g_model_depth, g_read_depth;
+static uint64_t g_model_us, g_model_read_us;
+
 // log63 closed the chain. CSWCAnimBase::GetModel is five instructions:
 //     cmp r1,#255 ; ite eq ; ldreq r0,[r0,#0xb8] ; movne r0,#0 ; bx lr
 // so GetModel(255) is literally `return this->[0xb8]`. LoadModel IS called with
@@ -1042,7 +1050,13 @@ static void *ResDataBytes_probe(unsigned long n, void *res) {
 static void *ReadSync_probe(void *self, char *name) {
   const char *prev = g_rs_name;
   g_rs_name = name;                 // tag the RDB reads this ReadSync makes
+  int timed = sceKernelGetThreadId() == g_game_thid;
+  uint64_t t0 = (timed && !g_read_depth++) ? sceKernelGetProcessTimeWide() : 0;
   void *r = ReadSync_orig(self, name);
+  if (timed && --g_read_depth == 0) {
+    g_model_read_us += sceKernelGetProcessTimeWide() - t0;
+    g_model_read_calls++;
+  }
   g_rs_name = prev;
   if (g_rs_n < 48) {
     int tag = r ? (int)(*(unsigned char *)((char *)r + 0x4c) & 0x7f) : -1;
@@ -1239,7 +1253,13 @@ static void *(*NewCAurObject_orig)(char *name, char *type, void *rw1, void *rw2)
 static unsigned g_nao_n = 0;
 
 static void *NewCAurObject_probe(char *name, char *type, void *rw1, void *rw2) {
+  int timed = sceKernelGetThreadId() == g_game_thid;
+  uint64_t t0 = (timed && !g_model_depth++) ? sceKernelGetProcessTimeWide() : 0;
   void *r = NewCAurObject_orig(name, type, rw1, rw2);
+  if (timed && --g_model_depth == 0) {
+    g_model_us += sceKernelGetProcessTimeWide() - t0;
+    g_model_calls++;
+  }
   if (g_nao_n < 96)
     log_printf("[model] NewCAurObject(\"%.20s\", \"%.12s\", rw=%p/%p) -> %p%s",
                name ? name : "(null)", type ? type : "(null)", rw1, rw2, r,
@@ -1501,6 +1521,10 @@ void engine_perf_snapshot(engine_perf_t *out, uint64_t now_us) {
   out->next_ai_ms = g_last_ai_ms;
   out->display_fps = g_display_fps ? *g_display_fps : -1.0f;
   out->movie_fps = g_movie_fps ? *g_movie_fps : -1;
+  out->model_calls = g_model_calls;
+  out->model_us = g_model_us;
+  out->model_read_calls = g_model_read_calls;
+  out->model_read_us = g_model_read_us;
 }
 
 void engine_perf_presented(void) {
