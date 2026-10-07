@@ -1,0 +1,70 @@
+# Build the loader and publish an installable VPK for testing on hardware.
+#
+# The shaders and font files a release VPK carries come from the APK, which is
+# never committed, so a VPK built here alone would lack them. Instead the new
+# eboot.bin is swapped into the latest published release's KOTOR.vpk, which
+# already holds them. The result is uploaded as a workflow artifact and, for
+# pushes, as the "fixingit-latest" pre-release so it can be fetched from a
+# phone without signing in.
+name: Build VPK
+
+on:
+  push:
+    branches: [fixingIt]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-vpk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build eboot.bin (vitasdk container)
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src vitasdk/vitasdk:latest sh tools/ci_build.sh
+          sudo chown -R "$(id -u):$(id -g)" build
+
+      - name: Repack the latest release VPK with the new eboot.bin
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          tag=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName)
+          echo "base release: $tag"
+          gh release download "$tag" --repo "$GITHUB_REPOSITORY" --pattern KOTOR.vpk --dir base
+          mkdir vpk && cd vpk
+          unzip -q ../base/KOTOR.vpk
+          cp ../build/eboot.bin eboot.bin
+          rm -f ../KOTOR-fixingIt.vpk
+          zip -q -r -X ../KOTOR-fixingIt.vpk .
+          cd ..
+          unzip -l KOTOR-fixingIt.vpk | tail -n 20
+          short=$(git rev-parse --short HEAD)
+          echo "SHORT=$short" >> "$GITHUB_ENV"
+          echo "BASE=$tag" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: KOTOR-fixingIt-${{ env.SHORT }}
+          path: |
+            KOTOR-fixingIt.vpk
+            build/eboot.bin
+
+      - name: Publish the fixingit-latest pre-release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          gh release delete fixingit-latest --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes || true
+          gh release create fixingit-latest KOTOR-fixingIt.vpk build/eboot.bin \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease \
+            --title "fixingIt test build ($SHORT)" \
+            --notes "Untested build of branch fixingIt at $SHORT, packed on top of $BASE's KOTOR.vpk (for its shaders and fonts). Install KOTOR-fixingIt.vpk over your current install, or replace ux0:app/KOTR00001/eboot.bin with eboot.bin. Saves and ux0:data/kotor/ are not touched."

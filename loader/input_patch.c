@@ -38,6 +38,9 @@ static Uint32 s_window_id = 0;    // focused window, for the event's windowID
 static float s_last_x = 0.0f;     // last contact position, so FINGERUP can carry
 static float s_last_y = 0.0f;     // it (SDL semantics; UI that acts on release
                                   // otherwise sees every tap at the top-left).
+static int   s_finger_id = -1;    // panel report id of the finger being followed
+static int   s_wait_clear = 0;    // followed finger lifted while others stayed:
+                                  // ignore the panel until it is empty
 
 void input_touch_init(void) {
   int r = sceTouchSetSamplingState(SCE_TOUCH_PORT_FRONT, SCE_TOUCH_SAMPLING_STATE_START);
@@ -217,6 +220,26 @@ void input_touch_pump(void) {
   int touching = (n >= 0 && td.reportNum > 0);
   if (touching) s_touch_frames++;
 
+  /* Follow ONE finger by its report id. report[0] is just whichever contact
+   * the panel lists first: with a thumb resting on the screen and a tap
+   * elsewhere, lifting the thumb used to turn report[0] into the other finger,
+   * and the game saw the one finger it knows about jump across the screen in
+   * a single MOTION -- a drag, or a tap somewhere it was never aimed. When the
+   * followed finger lifts, release it where it was, and leave any finger still
+   * resting there alone until the panel is clear: picking it up would press
+   * whatever sits under a thumb that never meant to tap. */
+  int ri = 0;
+  if (!touching) {
+    s_wait_clear = 0;
+  } else if (s_finger_down) {
+    ri = -1;
+    for (int k = 0; k < td.reportNum && k < SCE_TOUCH_MAX_REPORT; k++)
+      if (td.report[k].id == s_finger_id) { ri = k; break; }
+    if (ri < 0) { touching = 0; s_wait_clear = 1; }
+  } else if (s_wait_clear) {
+    touching = 0;
+  }
+
   // log144 spent its whole budget in the first five minutes of a 31-minute
   // session, and log143 -- where the chargen name screen would not advance --
   // recorded no touch at all, leaving "the panel reported nothing" and "the
@@ -225,8 +248,8 @@ void input_touch_pump(void) {
   static int log_budget = 400;
 
   if (touching) {
-    float nx = ((float)td.report[0].x - s_min_x) / (s_max_x - s_min_x);
-    float ny = ((float)td.report[0].y - s_min_y) / (s_max_y - s_min_y);
+    float nx = ((float)td.report[ri].x - s_min_x) / (s_max_x - s_min_x);
+    float ny = ((float)td.report[ri].y - s_min_y) / (s_max_y - s_min_y);
     if (nx < 0.0f) nx = 0.0f; else if (nx > 1.0f) nx = 1.0f;
     if (ny < 0.0f) ny = 0.0f; else if (ny > 1.0f) ny = 1.0f;
 
@@ -235,8 +258,9 @@ void input_touch_pump(void) {
     if (!s_finger_down && log_budget > 0) {
       log_budget--;
       log_printf("[touch] DOWN raw=(%d,%d) norm=(%.3f,%.3f) -> SDL_FINGERDOWN",
-                 (int)td.report[0].x, (int)td.report[0].y, nx, ny);
+                 (int)td.report[ri].x, (int)td.report[ri].y, nx, ny);
     }
+    s_finger_id = td.report[ri].id;
     s_last_x = nx; s_last_y = ny;
     s_finger_down = 1;
   } else if (s_finger_down) {

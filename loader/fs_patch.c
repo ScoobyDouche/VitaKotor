@@ -116,7 +116,14 @@ static int fs_access(const char *path, int mode) {
   char t[512];
   fs_translate(path, t, sizeof(t));
   int r = access(t, mode);
-  if (r != 0) log_printf("[FS] access MISS: %s", t);
+  // Budgeted like the other path traces: a game that probes in a loop must not
+  // turn every miss into a card write.
+  static unsigned miss_n = 0;
+  if (r != 0 && miss_n < FS_REL_LOG_LIMIT) {
+    log_printf("[FS] access MISS: %s", t);
+    if (++miss_n == FS_REL_LOG_LIMIT)
+      log_printf("[FS] access MISS trace silenced after %d lines", FS_REL_LOG_LIMIT);
+  }
   return r;
 }
 // What the game holds as its DIR *: up to two directories read one after the
@@ -322,6 +329,7 @@ static void *AAssetManager_open(void *mgr, const char *filename, int mode) {
   long sz = ftell(fp);
   fseek(fp, 0, SEEK_SET);
   FakeAsset *a = calloc(1, sizeof(FakeAsset));
+  if (!a) { fclose(fp); return NULL; }
   a->fp = fp; a->size = sz; a->pos = 0;
   log_printf("[ASSET] open: %s (%ld bytes)", filename ? filename : "?", sz);
   return a;
