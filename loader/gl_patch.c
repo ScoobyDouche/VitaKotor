@@ -566,6 +566,13 @@ void gl_patch_on_swap(uint64_t swap_begin_us, uint64_t swap_end_us) {
                     sdl.delay_max_us / 1000u,
                     hitch_suppressed,
                    hitch_suppressed_max / 1000u, (hitch_suppressed_max % 1000u) / 100u);
+        if (engine.model_calls != prev_engine.model_calls ||
+            engine.model_read_calls != prev_engine.model_read_calls)
+          log_printf("[hitch]   models built=%u in %u ms, read from archive=%u in %u ms",
+                     engine.model_calls - prev_engine.model_calls,
+                     (unsigned)((engine.model_us - prev_engine.model_us) / 1000u),
+                     engine.model_read_calls - prev_engine.model_read_calls,
+                     (unsigned)((engine.model_read_us - prev_engine.model_read_us) / 1000u));
         last_hitch_log = swap_end_us;
         hitch_suppressed = hitch_suppressed_max = 0;
       } else {
