@@ -31,6 +31,7 @@
 #include "translation.h"
 #include "log.h"
 #include "gameprof.h"
+#include "main.h"   /* kotor_mod */
 
 extern int ret0(void);   // from dynlib.c
 
@@ -771,6 +772,24 @@ done:;
   g_rwopen_frame_us += dt;
   g_rwopen_frame_n++;
   gameprof_io_note(rw ? "rwopen" : "rwMISS", fname ? t : "?", dt);
+  /* log240-244: entering the equip tab opens swkotor.ini 55 times in one
+   * frame, and a RAM copy of it was dropped every time -- so some of those
+   * opens write. Which, and from where in the game. */
+  if (fname) {
+    const char *a = strrchr(fname, '/'), *b = strrchr(fname, '\\');
+    const char *base = a > b ? a + 1 : b ? b + 1 : fname;
+    static unsigned ini_n = 0;
+    if (strcasecmp(base, "swkotor.ini") == 0 && ini_n < 400) {
+      ini_n++;
+      uintptr_t lr = (uintptr_t)__builtin_return_address(0);
+      int in_game = lr >= kotor_mod.text_base && lr < kotor_mod.text_base + kotor_mod.text_size;
+      log_printf("[ini] open #%u mode=%s %s in %u.%u ms, caller %s+0x%x",
+                 ini_n, mode ? mode : "?", rw ? "ok" : "FAILED",
+                 (unsigned)(dt / 1000u), (unsigned)(dt % 1000u) / 100u,
+                 in_game ? "libKOTOR" : "?",
+                 (unsigned)(in_game ? lr - kotor_mod.text_base : lr));
+    }
+  }
   return rw;
 }
 
