@@ -530,10 +530,17 @@
 #define FRAME_LOCK_FPS 30
 
 // Draw distance cap, in metres; 0 = the area's own fog end. The engine culls
-// at the fog end, which is 500 m in Dantooine's open areas, so distance culls
-// nothing there. Only areas that have fog on are capped. swkotor.ini
-// [Vita Options] DrawDistance overrides it.
-#define DRAW_DISTANCE_M 150
+// at the fog end, which is 500 m in Dantooine's open areas. Only areas that
+// have fog on are capped. log250: a 150 m cap left Dantooine's render cost
+// unchanged (18.2 vs 18.4 ms) and only added haze, so it is off by default.
+// swkotor.ini [Vita Options] DrawDistance overrides it.
+#define DRAW_DISTANCE_M 0
+
+// Grass wind. With Grass on, CAurTriangleBin::UpdateGrassForWind re-bends every
+// blade on the CPU each frame; log250: Grass+Shadows+Frame Buffer took Dantooine
+// from 26-29 fps to 18-20. 0 clears the engine's enablegrasswind so the grass
+// stands still. swkotor.ini [Vita Options] GrassWind overrides it.
+#define GRASS_WIND 0
 
 // Upload textures as 16-bit instead of 32-bit.
 //

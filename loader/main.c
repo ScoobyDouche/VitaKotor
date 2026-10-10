@@ -832,6 +832,7 @@ static void hook_named(const char *sym, uintptr_t probe, void **orig, const char
  * Scene: +96 fog on, +100 fog start, +104 fog end (floats, metres). Areas with
  * fog off are left alone: forcing fog on would change how they look. */
 static int g_draw_distance = DRAW_DISTANCE_M;   // [Vita Options] DrawDistance
+static int g_grass_wind = GRASS_WIND;           // [Vita Options] GrassWind
 static void (*DoFog_orig)(void *scene) = NULL;
 
 static void DoFog_probe(void *scene) {
@@ -1290,11 +1291,20 @@ static void read_vita_options(void) {
       g_frame_lock_fps = atoi(v);
     if (ini_get(text, "Vita Options", "DrawDistance", v, sizeof(v)) && v[0])
       g_draw_distance = atoi(v);
+    if (ini_get(text, "Vita Options", "GrassWind", v, sizeof(v)) && v[0])
+      g_grass_wind = atoi(v) != 0;
     free(text);
     break;
   }
   obb_cache_init((size_t)cache_kb);
   log_printf("[perf] draw distance cap: %d m (0 = the area's own fog)", g_draw_distance);
+
+  // Read by UpdateGrassForWind on every call, so setting it before the game
+  // starts is enough.
+  volatile int *wind = (volatile int *)so_symbol(&kotor_mod, "enablegrasswind");
+  if (wind) *wind = g_grass_wind;
+  log_printf("[perf] grass wind: %s%s", g_grass_wind ? "on" : "off",
+             wind ? "" : " (enablegrasswind symbol missing)");
 }
 
 // FRAME_LOCK_FPS -> vblanks per flip. vitaGL's display callback waits that
