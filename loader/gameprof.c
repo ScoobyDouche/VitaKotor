@@ -138,10 +138,33 @@ static hook_t g_hook[] = {
   { "_ZN19CSWGuiInGameJournal12OnPanelAddedEv",                "jouAdd"       },
   { "_ZN15CSWGuiInGameMap12OnPanelAddedEv",                    "mapAdd"       },
   { "_ZN20CSWGuiInGameMessages12OnPanelAddedEv",               "msgAdd"       },
+  /* log238: equip hovers re-create 18-29 textures (up to 3 MB) and inventory
+   * 89 icons (1.3 MB) every time, ~5 ms a texture with the bytes already in
+   * RAM; and the equip tab's ~1 s is outside every menu hook above. The
+   * texture path from resource to GL, and the per-frame GUI draw/update. */
+  { "_ZN16CAurTextureBasic4InitEPc",                           "texInit"      },
+  { "_ZN16CAurTextureBasic9LoadImageEv",                       "texLoadImage" },
+  { "_ZN16CAurTextureBasic7glImageEb",                         "texGlImage"   },
+  { "_ZN11CAurTexture7glImageEbPh",                            "texGlImage2"  },
+  { "_ZN7CResTGA18OnResourceServicedEv",                       "tgaServiced"  },
+  { "_ZN7CResTGA18ReadUnmappedRLETGAEv",                       "tgaRLE"       },
+  { "_ZN7CResTGA21ReadColorMappedRLETGAEv",                    "tgaRLEmap"    },
+  { "_ZN7CResTPC18OnResourceServicedEv",                       "tpcServiced"  },
+  { "_ZN13CSWGuiManager4DrawEf",                               "guiDraw"      },
+  { "_ZN13CSWGuiManager6UpdateEf",                             "guiUpdate"    },
+  { "_ZN13CSWGuiManager16HandleInputEventEii",                 "guiInput"     },
+  { "_ZN16CSWGuiInGameMenu16HandleInputEventEii",              "menuInput"    },
+  { "_ZN17CSWGuiInGameEquip16HandleInputEventEii",             "equipInput"   },
+  { "_ZN17CSWGuiInGameEquip4DrawEf",                           "equipDraw"    },
+  { "_ZN21CSWGuiInGameCharacter4DrawEf",                       "charDraw"     },
+  { "_ZN21CSWGuiInGameInventory4DrawEf",                       "invDraw"      },
+  { "_ZN21CSWGuiInGameInventory15CreateItemEntryEP12CSWCCreatureRiR13CExoArrayListIP13CSWGuiControlEP8CSWSItemii", "invEntry" },
 };
 #define HOOK_N (sizeof g_hook / sizeof g_hook[0])
 
 uint64_t g_prof_draw_us;
+uint64_t g_prof_tex_frame_us;
+unsigned g_prof_tex_frame_n;
 
 static inline uint64_t timed(hook_t *h, uint32_t a, uint32_t b, uint32_t c, uint32_t d,
                              uint32_t e, uint32_t f) {
@@ -166,7 +189,8 @@ static inline uint64_t timed(hook_t *h, uint32_t a, uint32_t b, uint32_t c, uint
 P(0) P(1) P(2) P(3) P(4) P(5) P(6) P(7) P(8) P(9) P(10) P(11) P(12) P(14) P(15) P(16)
 P(17) P(18) P(19) P(20) P(21) P(22) P(23) P(24) P(25) P(26) P(27) P(28) P(29) P(30) P(31)
 P(32) P(33) P(34) P(35) P(36) P(37) P(38) P(39) P(40) P(41) P(42) P(43) P(44) P(45) P(46)
-P(47) P(48) P(49) P(50) P(51) P(52) P(53)
+P(47) P(48) P(49) P(50) P(51) P(52) P(53) P(54) P(55) P(56) P(57) P(58) P(59) P(60) P(61)
+P(62) P(63) P(64) P(65) P(66) P(67) P(68) P(69) P(70)
 #undef P
 
 /* log205: cMsg is 20-25 ms a frame in the cities but object updates are ~6 of
@@ -199,7 +223,9 @@ static fn6_t const g_probe[] = {
   probe_25, probe_26, probe_27, probe_28, probe_29, probe_30, probe_31, probe_32,
   probe_33, probe_34, probe_35, probe_36, probe_37, probe_38, probe_39, probe_40,
   probe_41, probe_42, probe_43, probe_44, probe_45, probe_46, probe_47, probe_48,
-  probe_49, probe_50, probe_51, probe_52, probe_53,
+  probe_49, probe_50, probe_51, probe_52, probe_53, probe_54, probe_55, probe_56,
+  probe_57, probe_58, probe_59, probe_60, probe_61, probe_62, probe_63, probe_64,
+  probe_65, probe_66, probe_67, probe_68, probe_69, probe_70,
 };
 _Static_assert(sizeof g_probe / sizeof g_probe[0] == HOOK_N, "one probe per hook");
 
@@ -310,16 +336,26 @@ void gameprof_hitch_blame(void) {
                   (unsigned)(g_hook[best].frame_us / 1000u));
     shown++;
   }
+  /* our GL texture wrappers + vitaGL under them, wherever they were called from */
+  if (g_prof_tex_frame_us >= 2000 && o < (int)sizeof b - 32) {
+    o += snprintf(b + o, sizeof b - o, " glTex=%u(%u calls)",
+                  (unsigned)(g_prof_tex_frame_us / 1000u), g_prof_tex_frame_n);
+    shown++;
+  }
   if (shown) log_printf("%s ms", b);
   else log_printf("[hitch]   in: none of the timed functions (outside them all)");
 }
 
 void gameprof_frame_reset(void) {
   for (unsigned i = 0; i < HOOK_N; i++) g_hook[i].frame_us = 0;
+  g_prof_tex_frame_us = 0;
+  g_prof_tex_frame_n = 0;
 }
 
 #else
 uint64_t g_prof_draw_us;
+uint64_t g_prof_tex_frame_us;
+unsigned g_prof_tex_frame_n;
 void gameprof_hitch_blame(void) {}
 void gameprof_frame_reset(void) {}
 void gameprof_install(void) {}

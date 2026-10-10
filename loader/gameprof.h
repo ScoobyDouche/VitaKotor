@@ -19,6 +19,10 @@
 /* Microseconds spent inside glDrawArrays/glDrawElements this window; the GL
  * wrappers add to it. */
 extern uint64_t g_prof_draw_us;
+/* This frame's time and calls inside the texture upload wrappers (ours plus
+ * vitaGL), for the hitch blame line. */
+extern uint64_t g_prof_tex_frame_us;
+extern unsigned g_prof_tex_frame_n;
 
 void gameprof_install(void);
 /* Call after every GameUpdate: samples the engine's stopwatch globals. */
