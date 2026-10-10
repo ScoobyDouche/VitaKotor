@@ -753,62 +753,20 @@ void sdl_ini_cache_forget(const char *path) {
   miss_unlock();
 }
 
-/* The game reads the ini with fgets on rw->hidden.stdio.fp (log243: a memory
- * RWops there faulted in memchr under _fgets_r), so the copy must be a real
- * SDL_RWOPS_STDFILE: a stdio FILE over the RAM bytes, which frees them on
- * fclose. */
-typedef struct { char *buf; size_t len, pos; } IniCookie;
-
-static ssize_t ini_cookie_read(void *c, char *out, size_t n) {
-  IniCookie *k = (IniCookie *)c;
-  size_t left = k->len - k->pos;
-  if (n > left) n = left;
-  memcpy(out, k->buf + k->pos, n);
-  k->pos += n;
-  return (ssize_t)n;
-}
-
-#ifdef __LARGE64_FILES
-static int ini_cookie_seek(void *c, _off64_t *off, int whence) {
-#else
-static int ini_cookie_seek(void *c, off_t *off, int whence) {
-#endif
-  IniCookie *k = (IniCookie *)c;
-  long long base = whence == SEEK_SET ? 0 : whence == SEEK_CUR ? (long long)k->pos
-                                                               : (long long)k->len;
-  long long to = base + (long long)*off;
-  if (to < 0 || to > (long long)k->len) return -1;
-  k->pos = (size_t)to;
-  *off = to;
-  return 0;
-}
-
-static int ini_cookie_close(void *c) {
-  IniCookie *k = (IniCookie *)c;
-  free(k->buf);
-  free(k);
-  return 0;
-}
-
 static SDL_RWops *ini_from_cache(void) {
   miss_lock();
-  IniCookie *k = g_ini_buf ? (IniCookie *)calloc(1, sizeof *k) : NULL;
-  if (k) {
-    k->buf = (char *)malloc(g_ini_len ? g_ini_len : 1);
-    if (k->buf) { memcpy(k->buf, g_ini_buf, g_ini_len); k->len = g_ini_len; }
-    else { free(k); k = NULL; }
-  }
+  char *copy = g_ini_buf ? (char *)malloc(g_ini_len ? g_ini_len : 1) : NULL;
+  if (copy) memcpy(copy, g_ini_buf, g_ini_len);
+  unsigned len = g_ini_len;
   miss_unlock();
-  if (!k) return NULL;
-  cookie_io_functions_t io = { ini_cookie_read, NULL, ini_cookie_seek, ini_cookie_close };
-  FILE *fp = fopencookie(k, "rb", io);
-  if (!fp) { ini_cookie_close(k); return NULL; }
-  SDL_RWops *rw = SDL_RWFromFP(fp, SDL_TRUE);
-  if (!rw) { fclose(fp); return NULL; }
+  if (!copy) return NULL;
+  SDL_RWops *mrw = SDL_RWFromConstMem(copy, (int)len);
+  if (!mrw) { free(copy); return NULL; }
+  mrw->size  = memtlk_size;
+  mrw->close = memtlk_close;      /* frees the copy */
   if (++g_ini_served == 1 || (g_ini_served & 255) == 0)
-    log_printf("[SDL] swkotor.ini served from RAM (%u bytes, stdio), %u times so far",
-               (unsigned)k->len, g_ini_served);
-  return rw;
+    log_printf("[SDL] swkotor.ini served from RAM (%u bytes), %u times so far", len, g_ini_served);
+  return mrw;
 }
 
 static SDL_RWops *ini_open(const char *fname, const char *mode) {
