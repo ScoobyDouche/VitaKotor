@@ -33,7 +33,7 @@ looks and sounds like the game.
 
 The two faults that used to wear a long session down are **fixed**: sound no
 longer thins out and goes silent, and the world geometry no longer tears into
-spikes. Sessions of close to 90 minutes now end as healthy as they started.
+spikes. Sessions of close to 100 minutes now end as healthy as they started.
 What remains is frame rate and a few rough edges. Nothing crashes and no save
 has been lost. See [Known issues](#known-issues).
 
@@ -205,11 +205,8 @@ Things to know:
   English**: they are pictures, not text. The boot-screen tips use the
   translation's text.
 - The game's fonts only have Western European letters. Accented Latin text
-  (Portuguese, Polish without ł/ś/ż, and so on) shows up, but Cyrillic and
-  other scripts show up as the wrong letters. A translation can include
-  replacement font files in its folder: any file there overrides the game
-  file with the same name. It is not yet confirmed that the game picks up fonts
-  this way.
+  (Portuguese, Polish without ł/ś/ż, and so on) shows up; Cyrillic and other
+  scripts show up as the wrong letters and are not supported.
 - The game's own text tables all have 49,265 entries. The log says how many
   entries your file has (`ux0:data/kotor/log.txt`, look for `[tr]`). If the
   numbers differ, the file was made for another edition of the game, and
@@ -328,9 +325,9 @@ you a save. They are listed because you may hit them. Save regularly.
 
 - **Frame drops.** Besides the dense-scene dips below, some areas stutter
   about once a second: one frame in thirty takes around 100 ms, while nothing on
-  screen changes. The port's own log was writing to the card in the middle of
-  about half of those frames; since v0.4.0 it writes from a thread of its own,
-  and whether that was the whole cause is still being checked.
+  screen changes. The port's log no longer writes from the game's thread
+  (v0.4.0), and the game's thread now has a CPU core to itself; the hitches
+  that remain are inside the game's own code.
 - **Voices over the loading screen.** The game starts running as soon as the
   area data is in, while the loading screen is still up for the texture upload,
   so the new area's sounds and conversations can start before you see it. Once,
@@ -357,13 +354,17 @@ you a save. They are listed because you may hit them. Save regularly.
   CatchUpUpdates=1
   ```
 
-  `ObbCacheKB=8192` in the same section sets how much RAM keeps recent game
-  data reads (default 8192, `0` turns it off). It is what makes repeated
-  hovers on the equipment screen skip the memory card.
-
   `0` (the default) is the old behaviour; up to `10` is accepted. The log's
   `[perf]` line says which value is in use. Whether this cures the jumps is
   not confirmed yet, so reports either way help.
+- **Menus can freeze for a moment.** Switching to the equipment tab used to
+  stall for about a second, because the game rewrote `swkotor.ini` on the
+  card some fifty times with the same values. Writes that change nothing are
+  now skipped; that fix has not been checked on a Vita yet. Hovering items and
+  opening the inventory are already quicker: recent game data is kept in RAM,
+  and files that don't exist are no longer looked for again and again.
+  `ObbCacheKB=8192` under `[Vita Options]` sets how much RAM that keeps
+  (default 8192, `0` turns it off).
 - **Not every movie has been checked.** The ones played so far run with
   sound and hand back to the game cleanly; 48 kHz movies and localized
   subtitles have not been specifically tested.
@@ -430,22 +431,8 @@ a bug report.
 | Hangs at the loading spinner | An `.obb` is missing, misnamed, or still copying |
 | Textures look wrong | Set `GL_FILTER_REDUNDANT_BINDS 0` in `loader/config.h` and rebuild |
 
-Builds require the vitaGL packed-VBO patch and shader cache documented in
-`SETUP.md`. Without
-it, the game's large vertex offsets truncate above 64 KiB and skinned layouts
-can underflow when shader attribute order differs from memory order, causing
-geometry to stretch or explode. Build vitaGL with `HAVE_SHADER_CACHE=1` so
-compiled variants persist under `ux0:data/shader_cache/KOTR00001/`; otherwise
-first-use effects can block for several seconds. Use `NO_SPLASHSCREEN=1` for
-Vita3K packages.
-
-Intermittent slow frames are reported as `[hitch]` lines in
-`ux0:data/kotor/log.txt`. Each line separates game-thread work from buffer-swap
-wait and includes that frame's draw, texture, buffer, OBB I/O, and audio decode
-activity, plus time inside the engine's `GameUpdate` and `UpdateScreen` calls.
-The trace is event-driven and rate-limited so it does not log every frame.
-KOTOR's adaptive render suppression is disabled by default because it amplified
-one expensive AI update into as many as eleven updates before presenting again.
+Slow frames are reported as `[hitch]` lines in the log, with what the game
+thread spent that frame on. If you report stutter, attach the log.
 
 A "freeze" is usually not a freeze: the crash handler parks the app in place so
 the log survives. Check the end of `log.txt` for a `[CRASH]` block before
@@ -457,6 +444,11 @@ assuming it hung.
 
 Needs [VitaSDK](https://vitasdk.org/) with vitaGL, vitashark, SceShaccCgExt,
 mathneon, FreeType and SDL2 installed. `SETUP.md` covers the toolchain.
+
+vitaGL must be built with the packed-VBO patch and `HAVE_SHADER_CACHE=1`, both
+in `SETUP.md`. Without the patch, vertex offsets above 64 KB are truncated and
+models stretch into spikes; without the cache, effects stall for seconds the
+first time they appear.
 
 ```bash
 export VITASDK=$HOME/vitasdk
