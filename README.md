@@ -347,6 +347,11 @@ you a save. They are listed because you may hit them. Save regularly.
 
 ### Recently fixed
 
+- **Uneven motion** *(v0.4.1)*. Frames are locked to 30 fps, so each one is
+  shown for the same time.
+- **The equipment screen froze for a second** *(v0.4.1)*. Opening it rewrote
+  `swkotor.ini` 54 times with the same values.
+- **The character walked off alone after closing a menu** *(v0.4.1)*.
 - **Sound could die after leaving an area** *(v0.4.0)*. A sound still loading
   in the background could be freed underneath its loader, which crashed the
   sound thread and left the game silent.
