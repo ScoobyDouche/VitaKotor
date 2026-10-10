@@ -15,13 +15,6 @@ void gl_patch_on_swap(uint64_t swap_begin_us, uint64_t swap_end_us);
 /* When the last frame was presented; the hitch sampler measures from it. */
 extern volatile uint64_t g_last_swap_end_us;
 
-/* Set around CAurGUIStringInternal::Draw (see main.c) so the GL layer logs the
- * draw calls the text path actually issues, with the texture bound at the time.
- * Text has metrics and an uploaded atlas yet renders nothing, so the open question
- * is whether glyph quads reach GL at all -- and if so, against which texture.
- * Scoped this way the trace stays tiny instead of drowning the log. */
-extern int g_gl_text_draw;
-
 /* Scope for KOTOR's nested AurGUI viewport stack. */
 extern int g_gl_gui_viewport_scope;
 

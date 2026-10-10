@@ -180,7 +180,7 @@ void log_panic(void) {
 }
 
 /* First LOG_JNI_BUDGET lines only; see LOG_JNI in log.h. */
-#define LOG_JNI_BUDGET 3000
+#define LOG_JNI_BUDGET 100
 int log_jni_enabled(void) {
   static int budget = LOG_JNI_BUDGET;
   if (budget <= 0) return 0;

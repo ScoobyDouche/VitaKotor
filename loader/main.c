@@ -475,11 +475,7 @@ static void Draw_guard(void *self, uint32_t xf) {
   }
   static int once2 = 0;
   if (!once2) { once2 = 1; log_printf("[font] Draw: fontInfo live -> render (text enabled)"); }
-  // Scope the GL text-draw trace to exactly this call so glyph draws are
-  // distinguishable from scene draws (see g_gl_text_draw in gl_patch.h).
-  g_gl_text_draw = 1;
   Draw_orig(self, xf);
-  g_gl_text_draw = 0;
 }
 
 // ---- FONT METRICS: serve bundled .txi as a MEMORY-backed resource --------------
@@ -677,41 +673,6 @@ static void install_aurresget_hook(void) {
 #endif  // FONT_TXI_MEMORY_INJECT
 
 // ---- GUI IMAGE PIPELINE probe ----------------------------------------------
-// Widget images load but never draw. log50/51: exactly 4 textured quads per frame
-// (1024x512 + 512x1024 + 2x 32x32) with 756x106 (the ten ios_mm_*_en.tga menu
-// buttons) and 256x256 (font atlas) at ZERO for entire runs -- on every screen, and
-// a GUI screen with no background art renders pure black. DPI was not the cause.
-//
-// log52 settled the emit side. FlushBuffer opens with
-//     r5 = &cm_nGUIBufferSizeUsed; ldr r0,[r5]; cmp r0,#1; blt <store 0, return>
-// and it ran 97921 times with the draw histogram frozen at 32x32/512x1024/1024x512
-// -- so every flush early-outs on an empty buffer and the loss is upstream, on the
-// accumulate side. (The old counter hooked CAurGUIImageInternal::Draw(float), a
-// 112-byte WEAK convenience overload nothing calls; the live entries are the 8-arg
-// Draw/DrawBuffered(ffffhfRK6Vectorf) pair. imageDraw=0 measured dead code.)
-//
-// So probe the widget-level entry instead. CSWGuiImage::Draw(float) is three
-// stacked silent early-outs before it dispatches to image->vtable[0x1c]:
-//     r0 = this[0x24]        cbz    -> return   (image object null)
-//     r1 = this[0x0c]        cmp 0  \ itt ne
-//     r1 = this[0x10]        cmpne 0/ bne draw  -> else return  (extent w/h zero)
-// A zero extent silences every widget on every screen while non-widget background
-// art still renders -- which is the symptom, and it explains why the histogram did
-// not move when the game switched from the main menu to chargen. Log which gate
-// bites plus the raw values; the field offsets are inferred, the values are not.
-//
-// Floats arrive in core registers (softfp caller), hence uint32_t params. Both
-// hooked prologues are 8 clean bytes (push/add r7/str.w) with no PC-relative loads.
-static void log_screen_globals(const char *when);  // defined with the probes below
-static void gui_autoscale_if_needed(void *self, int w, int h);  // defined with ScaleExt below
-
-static void (*SWImgDraw_orig)(void *self, uint32_t f) = NULL;
-static void (*FlushBuf_orig)(void *self, uint32_t f) = NULL;
-static const volatile int32_t *g_gui_buf_used = NULL;
-static unsigned g_flush_n = 0, g_flush_nonempty = 0;
-static int32_t g_flush_max_used = 0;
-static unsigned g_sw_n = 0, g_sw_gate_obj = 0, g_sw_gate_w = 0, g_sw_gate_h = 0, g_sw_pass = 0;
-
 /* KOTOR uses AurGUISetupViewport/AurGUICloseViewport as a nested GUI clipping
  * stack, but glViewport is only a coordinate transform. Mirror this semantic
  * GUI boundary to scissor while preserving any caller-owned scissor state. */
@@ -787,236 +748,6 @@ static void AurGUICloseViewport_scissor(void) {
   gui_scissor_restore(&state);
 }
 
-/* Which widgets actually went through ScaleExtentForResolution.
- *
- * Two theories about the oversized minimap and the fog panel have now died on
- * hardware -- the extent counters (log155: 1200 loaded, 2047 scaled) and the
- * NPOT pad content (log156: resampled 81 times, boxes unchanged). The counter
- * comparison was never evidence in the first place: ExtentLoad and ScaleExtent
- * are tallies over DIFFERENT objects, one widget can be scaled repeatedly, and
- * SetExtent installs extents that ExtentLoad never saw. A total tells you
- * nothing about whether THIS widget was scaled.
- *
- * So record the identity, not the count. Every widget that passes through
- * ScaleExtent goes in this set; any large image reports, once, whether its own
- * pointer is in it. An element left at authored size inside a frame scaled by
- * 0.7083 is 1.41x too big for that frame, which is precisely how both the
- * minimap and the fog panel overflow. If the offending widget comes back
- * scaled=NO, that is the bug and the fix is to scale it. If it comes back
- * scaled=YES, the extent path is exonerated for good and the cause is in the
- * draw itself. */
-#define GUI_PTRSET_SLOTS 1024              /* power of two; open addressing */
-typedef struct { uint32_t slot[GUI_PTRSET_SLOTS]; unsigned n, overflow; } GuiPtrSet;
-static GuiPtrSet g_gui_scaled;             /* widgets ScaleExtent has touched */
-static GuiPtrSet g_gui_reported;           /* big images already logged once */
-
-static unsigned gui_ptr_hash(uint32_t p) { return ((p >> 2) * 2654435761u) & (GUI_PTRSET_SLOTS - 1); }
-
-/* Returns 1 if p was ALREADY present. Insert-and-test in one pass so the draw
- * path can use it directly as a once-only gate. */
-static int gui_ptrset_add(GuiPtrSet *s, uint32_t p) {
-  if (!p) return 1;
-  unsigned h = gui_ptr_hash(p);
-  for (unsigned i = 0; i < GUI_PTRSET_SLOTS; i++) {
-    unsigned k = (h + i) & (GUI_PTRSET_SLOTS - 1);
-    if (s->slot[k] == p) return 1;
-    if (!s->slot[k]) { s->slot[k] = p; s->n++; return 0; }
-  }
-  s->overflow++;                            /* full: report rather than lie */
-  return 1;
-}
-static int gui_ptrset_has(const GuiPtrSet *s, uint32_t p) {
-  unsigned h = gui_ptr_hash(p);
-  for (unsigned i = 0; i < GUI_PTRSET_SLOTS; i++) {
-    unsigned k = (h + i) & (GUI_PTRSET_SLOTS - 1);
-    if (s->slot[k] == p) return 1;
-    if (!s->slot[k]) return 0;
-  }
-  return 0;
-}
-static unsigned g_bigimg_logged = 0;
-#if GUI_AUTOSCALE_UNSCALED_IMAGES
-static unsigned g_autoscaled = 0;
-#endif
-
-static void SWImgDraw_probe(void *self, uint32_t f) {
-  const uint32_t *o = (const uint32_t *)self;
-  uint32_t img = o[9];  // +0x24
-  uint32_t w = o[3];    // +0x0c
-  uint32_t h = o[4];    // +0x10
-  if (!img)     g_sw_gate_obj++;
-  else if (!w)  g_sw_gate_w++;
-  else if (!h)  g_sw_gate_h++;
-  else          g_sw_pass++;
-  /* The boxes are big. Report each large image once, with the one fact that
-   * separates the two remaining theories. Capped, and the cap is printed --
-   * a capped counter read as a finding has cost this port two hardware runs. */
-  if (img && (int)w >= 200 && (int)h >= 200 && g_bigimg_logged < 200) {
-    uint32_t sp = (uint32_t)(uintptr_t)self;
-    if (!gui_ptrset_add(&g_gui_reported, sp)) {
-      g_bigimg_logged++;
-      log_printf("[gui] big image #%u self=0x%08x img=0x%08x w=%d h=%d scaled=%s"
-                 "  (scaled set %u entries, %u overflowed)",
-                 g_bigimg_logged, sp, (unsigned)img, (int)w, (int)h,
-                 gui_ptrset_has(&g_gui_scaled, sp) ? "YES" : "NO",
-                 g_gui_scaled.n, g_gui_scaled.overflow);
-    }
-    gui_autoscale_if_needed(self, (int)w, (int)h);
-  }
-  if ((g_sw_n++ % 2400) == 0) {
-    log_printf("[gui] SWImage::Draw n=%u gates objnull=%u w0=%u h0=%u PASS=%u "
-               "(last img=0x%08x w=%d h=%d)",
-               g_sw_n, g_sw_gate_obj, g_sw_gate_w, g_sw_gate_h, g_sw_pass,
-               (unsigned)img, (int)w, (int)h);
-    // Also sample at draw time: the globals may be set long after ImgInit ran.
-    if ((g_sw_n % 24000) == 1) log_screen_globals("at draw");
-  }
-  SWImgDraw_orig(self, f);
-}
-
-static void FlushBuf_probe(void *self, uint32_t f) {
-  int32_t used = g_gui_buf_used ? *g_gui_buf_used : -1;
-  if (used > 0) g_flush_nonempty++;
-  if (used > g_flush_max_used) g_flush_max_used = used;
-  if ((g_flush_n++ % 2400) == 0)
-    log_printf("[gui] flushBuffer=%u bufUsed=%d nonEmpty=%u maxUsed=%d swDraw=%u",
-               g_flush_n, (int)used, g_flush_nonempty, (int)g_flush_max_used, g_sw_n);
-  FlushBuf_orig(self, f);
-}
-
-// log53: 8161/8161 widget draws bailed on extent.width==0, with extent.height==480
-// and a valid image object. SetExtent proves the layout -- it does
-//     vld1.32 {d16-d17},[r1] ; adds r5,r4,#4 ; vst1.32 {d16-d17},[r5]
-// i.e. it blits the whole CSWGuiExtent {x,y,w,h} to this+0x04..+0x13, so
-// +0x0c IS width and +0x10 IS height. 480 is KOTOR's authoring height (GUIs are
-// laid out in a 640x480 virtual space), so height survived the trip and width did
-// not -- width is computed somewhere else and lands at 0.
-//
-// Find that somewhere: log the incoming extent AND the caller. The hook is
-// installed as LDR PC,[PC] over the first 8 bytes -- a branch, not a call -- so LR
-// still holds the original call site and __builtin_return_address(0) recovers it.
-// Resolve the printed off= against libKOTOR.so's dynsym table to name the caller.
-// Prologue is 8 clean bytes (push/add r7/mov r4,r0/ldr r0,[r0,#36]); the vld1 that
-// would matter starts at +8. Signature is (this, const CSWGuiExtent*) -- no floats.
-static void (*SetExtent_orig)(void *self, const void *ext) = NULL;
-static unsigned g_se_n = 0, g_se_w0 = 0;
-
-// log56: SetExtent NEVER receives a good width -- because it is not how the extent
-// gets in. CSWGuiImage::Initialize writes it DIRECTLY:
-//     vld1.32 {d16-d17},[r1] ; adds r1,r0,#4 ; vst1.32 {d16-d17},[r1] ; b.w SetParams
-// no SetExtent call at all. Every SetExtent we logged was downstream code
-// re-applying &this->extent (SetImage/operator= pass this+4 to themselves) long
-// after it was already zero. So hook the real writer and log what it is handed.
-// Site is 0-mod-4 and the first 8 bytes are vld1(4)+adds(2)+adds(2) -- clean.
-static void (*ImgInit_orig)(void *self, const void *ext, const void *params) = NULL;
-static unsigned g_ii_n = 0, g_ii_w0 = 0;
-
-// log57: the port asks JNI for GetScreenHeightPixel (we answer 544) and
-// GetScreenHeightInch -- and NEVER asks for a width. So width is derived inside
-// libKOTOR, and `g_nScreenWidth`/`g_nScreenHeight` (adjacent globals, 0x5b0538 /
-// 0x5b053c) are where it lands. A zero width there would explain every symptom at
-// once: extents with a good h and w=0, on every widget, on every screen.
-static const volatile int32_t *g_scr_w = NULL, *g_scr_h = NULL;
-static const volatile int32_t *g_scr_wp2 = NULL, *g_scr_hp2 = NULL;
-
-static void log_screen_globals(const char *when) {
-  log_printf("[gui] screen: g_nScreenWidth=%d g_nScreenHeight=%d "
-             "cm_nScreenWidthPow2=%d cm_nScreenHeightPow2=%d  (%s)",
-             g_scr_w ? (int)*g_scr_w : -1, g_scr_h ? (int)*g_scr_h : -1,
-             g_scr_wp2 ? (int)*g_scr_wp2 : -1, g_scr_hp2 ? (int)*g_scr_hp2 : -1,
-             when);
-}
-
-static void ImgInit_probe(void *self, const void *ext, const void *params) {
-  const int32_t *e = (const int32_t *)ext;
-  if (e && e[2] == 0) g_ii_w0++;
-  if (g_ii_n < 96 || (g_ii_n % 240) == 0) {
-    uintptr_t lr = (uintptr_t)__builtin_return_address(0) & ~(uintptr_t)1;
-    log_printf("[gui] ImgInit #%u self=%p ext={x=%d y=%d w=%d h=%d} w0=%u from off=0x%06x",
-               g_ii_n, self, e ? (int)e[0] : -1, e ? (int)e[1] : -1,
-               e ? (int)e[2] : -1, e ? (int)e[3] : -1, g_ii_w0,
-               (unsigned)(lr - kotor_mod.text_base));
-    log_screen_globals("at ImgInit");
-  }
-  g_ii_n++;
-  ImgInit_orig(self, ext, params);
-}
-
-static void SetExtent_probe(void *self, const void *ext) {
-  const int32_t *e = (const int32_t *)ext;
-  if (e && e[2] == 0) g_se_w0++;
-  // First 64 in full (that covers main-menu construction), then thin out.
-  if (g_se_n < 64 || (g_se_n % 240) == 0) {
-    uintptr_t lr = (uintptr_t)__builtin_return_address(0) & ~(uintptr_t)1;
-    log_printf("[gui] SetExtent #%u self=%p ext={x=%d y=%d w=%d h=%d} w0=%u "
-               "from off=0x%06x",
-               g_se_n, self, e ? (int)e[0] : -1, e ? (int)e[1] : -1,
-               e ? (int)e[2] : -1, e ? (int)e[3] : -1, g_se_w0,
-               (unsigned)(lr - kotor_mod.text_base));
-  }
-  g_se_n++;
-  SetExtent_orig(self, ext);
-}
-
-// Upstream of SetExtent: CSWGuiControl::Load calls CSWGuiExtent::Load, which reads
-// four INT fields -- "LEFT","TOP","WIDTH","HEIGHT" -> extent+0,+4,+8,+12 (labels
-// resolved from its literal pool). extent+8 is the width that reads 0.
-//
-// But note 0x49f358: `cbz r0, 0x49f3b6` -- if GetStructFromStruct("EXTENT") fails,
-// ALL FOUR reads are skipped and the caller's CSWGuiExtent keeps whatever stale
-// stack bytes it had. w=0/h=480 is exactly what uninitialized stack looks like, so
-// "EXTENT struct not found" and "WIDTH field read returned the 0 default" are both
-// live and they need different fixes.
-//
-// Distinguish them without changing behaviour: stamp the 16-byte extent with a
-// sentinel, run the real Load, then see which words the callee actually wrote. Any
-// word still holding the sentinel was never written -- restore the caller's
-// original bytes there so the game sees exactly what it would have seen.
-#define EXT_SENTINEL 0x5A5A5A5A
-static unsigned g_sx_n = 0;      /* ScaleExtent calls, read by the totals line */
-static int (*ExtLoad_orig)(void *self, void *gff, void *st) = NULL;
-static unsigned g_xl_n = 0, g_xl_skipped = 0, g_xl_w0 = 0;
-
-static int ExtLoad_probe(void *self, void *gff, void *st) {
-  int32_t *e = (int32_t *)self;
-  int32_t saved[4] = {e[0], e[1], e[2], e[3]};
-  for (int i = 0; i < 4; i++) e[i] = EXT_SENTINEL;
-
-  int rc = ExtLoad_orig(self, gff, st);
-
-  unsigned unwritten = 0;
-  for (int i = 0; i < 4; i++) {
-    if (e[i] == EXT_SENTINEL) { unwritten |= (1u << i); e[i] = saved[i]; }
-  }
-  if (unwritten == 0xF) g_xl_skipped++;  // EXTENT struct not found -> nothing read
-  if (e[2] == 0) g_xl_w0++;
-
-  if (g_xl_n < 64 || (g_xl_n % 240) == 0)
-    log_printf("[gui] ExtentLoad #%u rc=%d {L=%d T=%d W=%d H=%d} unwritten=0x%x "
-               "skipped=%u w0=%u",
-               g_xl_n, rc, (int)e[0], (int)e[1], (int)e[2], (int)e[3],
-               unwritten, g_xl_skipped, g_xl_w0);
-  if ((g_xl_n % 240) == 0)
-    log_printf("[gui] extent totals: %u loaded, %u scaled  (a gap here is real, "
-               "both counters are lifetime)", g_xl_n, g_sx_n);
-  g_xl_n++;
-  return rc;
-}
-
-// --- chargen: is a model ever even requested? ------------------------------
-// log62 ruled out the missing gameinprogress/ dir (created, still faults at
-// 0x24acb8) and the resource layer (only .txi misses in the whole chargen run).
-// The creature has a valid animation base but animBase->GetModel(255) returns
-// NULL, and no model resource is ever REQUESTED. So watch the loader itself:
-// CSWCAnimBase::LoadModel(const CResRef&, unsigned char). Never called => the
-// creature is never given a model (setup bug, upstream). Called => log the
-// resref and the part id, and the failure is inside model loading.
-// Returns a value (callers do `blx LoadModel ; cbz r0`), so the probe must pass it
-// through -- declaring it void left r0 undefined on return and could have silently
-// turned a successful load into a "failed" one at the call site.
-static void *(*LoadModel_orig)(void *self, const void *resref, unsigned part) = NULL;
-static unsigned g_lm_n = 0;
-
 /* Time spent building models and reading them out of the archive, for the
  * [hitch] line: the menu-tab freezes read no card data and upload no textures,
  * and the open question is whether the equipment screen's character preview
@@ -1025,93 +756,9 @@ static unsigned g_lm_n = 0;
 static unsigned g_model_calls, g_model_read_calls, g_model_depth, g_read_depth;
 static uint64_t g_model_us, g_model_read_us;
 
-// log63 closed the chain. CSWCAnimBase::GetModel is five instructions:
-//     cmp r1,#255 ; ite eq ; ldreq r0,[r0,#0xb8] ; movne r0,#0 ; bx lr
-// so GetModel(255) is literally `return this->[0xb8]`. LoadModel IS called with
-// the right resrefs (pmbbs/pmbbm/pmbbl/pfbbl/pfbbm/pfbbs, part=255) and the model
-// DATA does load (~190KB + ~86KB new[] right after each call) -- but this+0xb8
-// stays NULL, so the chargen draw null-derefs. Sample the field either side of
-// the call: still NULL afterwards => LoadModel bails internally after reading the
-// data, and the next step is bisecting its 424 bytes.
-// log64 traced the whole chain:
-//   LoadModel(resref,255) -> this[0xb8] = NewCAurObject(name,"body",NULL,NULL)
-//   NewCAurObject: RWops args are NULL, so it takes the load-by-NAME path ->
-//     FindModel("pmbbs") / "pmbbs_x" / "pmbbs_z"; returns NULL if the base one is
-//   FindModel -> BinaryFindModel: `count = table[4]; if (count < 1) return NULL`
-// i.e. an EMPTY model registry answers every lookup with NULL. g_nModelsRead is
-// the engine's own count of models read into that registry -- if it is 0, nothing
-// ever populated it and that (not chargen) is the real bug.
-static const volatile int32_t *g_models_read = NULL;
-
-// log65 narrowed it one more hop. g_nModelsRead is NOT 0 (it climbs 4,6,8,10,12,14
-// -- 2 per LoadModel), so the registry IS being fed and the *lookup* is what fails.
-// FindModel's load-on-miss path is:
-//     IODispatcher::ReadSync(name) -> MaxTree*
-//     MaxTree::AsModel()  ==  `if ((this[0x4c] & 0x7f) != 2) return NULL;`
-//     strcasecmp(loaded->name, requested) -> mismatch writes AR_ERROR.LOG
-// No RWFromFile fires in the LoadModel window, so AR_ERROR.LOG is never opened and
-// the name-mismatch branch is NOT taken. That leaves ReadSync returning NULL, or
-// returning a tree whose type tag != 2 (read fine, parsed as the wrong node type).
-// Log the pointer and that tag byte to separate the two.
 static void *(*ReadSync_orig)(void *self, char *name) = NULL;
-static unsigned g_rs_n = 0;
-
-// ReadSync's four exits, in order:
-//   (1) AurResGet(name,".mdl",NULL,1) == NULL         -> NULL
-//   (2) AurResGetDataBytes(4, res)    == NULL         -> NULL
-//   (3) first byte != 0  -> the non-binary-MDL branch (binary MDL starts 0x00)
-//   (4) MaxTree::AsModel() tag != 2                   -> NULL
-// (1) is already excluded: no [res] MISS is logged for pmbbs, so AurResGet
-// succeeds. Probe the header fetch to separate (2) from (3)/(4). Same resource
-// family as the .txi work -- note the flag=1 (OBB blob) vs flag=0 (RWops stream)
-// split that bit us there.
-static void *(*ResDataBytes_orig)(unsigned long n, void *res) = NULL;
-static unsigned g_rdb_n = 0;
-
-// log67 pinned the divergence to WHICH BUFFER res[12] points at. AurResGet's OBB
-// path is `r5 = AurGetResource(resref,type,&size); res[12] = res[24] = r5`, and
-// AurResGetDataBytes' blob path just returns that cursor unchecked. Aligning the
-// 15 observed reads mod 8 splits them cleanly:
-//   working .mdl reads  -> ptr % 8 == 0   (plain decompressed new[](size) buffer)
-//   every failing read  -> ptr % 8 == 6   (pool block: new[](size+6), data at +6,
-//                                          the 6-byte inline header ReleaseResource
-//                                          reads back via `ldrh [r0,#-6]`)
-// The archive itself is exonerated: cgbody_light/pmbbs/pfbbl all LZMA-decompress
-// offline to a clean `00 00 00 00` binary-MDL signature, so the bytes exist and
-// the header check is right to reject what it was handed. What we do NOT know is
-// what the pool block actually CONTAINS, and that is the whole question:
-//   5d 00 00 00 01 ... -> the raw LZMA stream: decompression never ran
-//   uninitialised junk -> it ran, but into the other buffer / it failed
-//   valid MDL, shifted -> cursor/offset arithmetic is off
-// So dump the bytes, the 6-byte block header, the res fields, and the thread id
-// (a loader thread racing the pool would explain why menu models load and chargen
-// ones do not).
-static const char *g_rs_name = NULL;   // resref of the ReadSync in flight
-
-static void *ResDataBytes_probe(unsigned long n, void *res) {
-  void *p = ResDataBytes_orig(n, res);
-  if (g_rdb_n < 96) {
-    const uint32_t *o = (const uint32_t *)res;
-    char hex[48], hdr[24];
-    hex[0] = hdr[0] = 0;
-    if (p) {
-      const unsigned char *b = (const unsigned char *)p;
-      for (int i = 0; i < 12; i++) sprintf(hex + i * 3, "%02x ", b[i]);
-      for (int i = 0; i < 6; i++)  sprintf(hdr + i * 3, "%02x ", b[i - 6]);
-    }
-    log_printf("[model] RDB(%lu,%p) -> %p m8=%u \"%.16s\" res[0]=%08x [3]=%08x "
-               "[4]=%d [6]=%08x hdr:%s| %s tid=%08x",
-               n, res, p, p ? (unsigned)((uintptr_t)p & 7u) : 9u,
-               g_rs_name ? g_rs_name : "-", o[0], o[3], (int)o[4], o[6],
-               hdr, hex, (unsigned)sceKernelGetThreadId());
-  }
-  g_rdb_n++;
-  return p;
-}
 
 static void *ReadSync_probe(void *self, char *name) {
-  const char *prev = g_rs_name;
-  g_rs_name = name;                 // tag the RDB reads this ReadSync makes
   int timed = sceKernelGetThreadId() == g_game_thid;
   uint64_t t0 = (timed && !g_read_depth++) ? sceKernelGetProcessTimeWide() : 0;
   void *r = ReadSync_orig(self, name);
@@ -1119,132 +766,23 @@ static void *ReadSync_probe(void *self, char *name) {
     g_model_read_us += sceKernelGetProcessTimeWide() - t0;
     g_model_read_calls++;
   }
-  g_rs_name = prev;
-  if (g_rs_n < 48) {
-    int tag = r ? (int)(*(unsigned char *)((char *)r + 0x4c) & 0x7f) : -1;
-    log_printf("[model] ReadSync(\"%.24s\") -> %p tag=%d%s",
-               name ? name : "?", r, tag,
-               !r          ? "  <<< NULL (read failed)"
-               : tag != 2  ? "  <<< NOT A MODEL (AsModel returns NULL)"
-                           : "  ok");
-  }
-  g_rs_n++;
   return r;
 }
 
-static void *LoadModel_probe(void *self, const void *resref, unsigned part) {
-  void *before = *(void **)((char *)self + 0xb8);
-  void *rc = LoadModel_orig(self, resref, part);
-  void *after = *(void **)((char *)self + 0xb8);
-  if (g_lm_n < 64)
-    log_printf("[model] LoadModel #%u resref=\"%.16s\" part=%u this+0xb8: %p -> %p%s"
-               "  g_nModelsRead=%d",
-               g_lm_n, resref ? (const char *)resref : "?", part & 0xff,
-               before, after, after ? "" : "  <<< STILL NULL",
-               g_models_read ? (int)*g_models_read : -1);
-  g_lm_n++;
-  return rc;
-}
-
-// --- touch calibration: where ARE the widgets after scaling? ---------------
-// Touch is fluid but lands off the buttons. ExtentLoad logs the AUTHORED extent
-// (1024x768 space); what the hit-test and the renderer actually use is the
-// SCALED one (x screenHeight/768 = 0.625 here). Log both ends so the button's
-// real on-screen rect can be compared against the normalized touch coords that
-// actually activate it -- measurement, not arithmetic guesswork.
-// CSWGuiObject keeps its extent at this+0x08 (SetExtent/ScaleExtent both use it).
-static void (*ScaleExt_orig)(void *self, uint32_t fscale) = NULL;
-
-static void ScaleExt_probe(void *self, uint32_t fscale) {
-  const int32_t *e = (const int32_t *)((const char *)self + 8);
-  int32_t b[4] = {e[0], e[1], e[2], e[3]};
-  gui_ptrset_add(&g_gui_scaled, (uint32_t)(uintptr_t)self);
-  ScaleExt_orig(self, fscale);
-  /* Cadence matched to ExtentLoad's on purpose. At a flat cap of 48 this went
-   * quiet at t=145s while ExtentLoad ran on to #2400, and comparing the two
-   * logged counts then "showed" 25 extents that were never scaled -- an
-   * artifact of the cap, not a finding. Whether some extents really do skip
-   * ScaleExtentForResolution is still open, and it matters: an element left at
-   * authored size inside a frame scaled to 0.7083 is 1.41x too big for it,
-   * which is what the minimap, the fog box and the save list all look like.
-   * The save rows load as {L=471 T=358..567 W=300 H=30} in a 768-tall layout;
-   * unscaled, T=567 falls off a 544-tall screen and lands on the buttons. */
-  if (g_sx_n < 64 || (g_sx_n % 240) == 0) {
-    float sc; memcpy(&sc, &fscale, 4);
-    log_printf("[gui] ScaleExtent #%u self=0x%08x {L=%d T=%d W=%d H=%d} x%.4f -> {L=%d T=%d W=%d H=%d}",
-               g_sx_n, (unsigned)(uintptr_t)self,
-               (int)b[0], (int)b[1], (int)b[2], (int)b[3], sc,
-               (int)e[0], (int)e[1], (int)e[2], (int)e[3]);
-  }
-  g_sx_n++;
-}
-
-/* Hand a never-scaled image the resolution scale the game applies to every
- * other widget. See GUI_AUTOSCALE_UNSCALED_IMAGES in config.h for why this is
- * restricted to large, sub-screen-height images: the pillarbox wings come
- * through at exactly the screen height already in device pixels, and a blanket
- * rescale would wreck every widget that is already correct.
- *
- * Calls the original through the trampoline, so it does not re-enter the probe;
- * the widget is added to the scaled set first so it can never be scaled twice
- * however many times it is drawn. */
-static void gui_autoscale_if_needed(void *self, int w, int h) {
-#if GUI_AUTOSCALE_UNSCALED_IMAGES
-  if (!ScaleExt_orig || !g_scr_h) return;
-  int sh = (int)*g_scr_h;
-  if (sh <= 0 || h >= sh) return;            /* already device-space */
-  if (w < 200 || h < 200) return;            /* only the elements log157 flagged */
-  uint32_t sp = (uint32_t)(uintptr_t)self;
-  if (gui_ptrset_add(&g_gui_scaled, sp)) return;   /* already scaled, or seen */
-  float sc = (float)sh / 768.0f;             /* the factor the game uses itself */
-  uint32_t bits; memcpy(&bits, &sc, 4);
-  ScaleExt_orig(self, bits);
-  if (g_autoscaled < 64)
-    log_printf("[gui] autoscaled self=0x%08x %dx%d by x%.4f "
-               "(never went through ScaleExtentForResolution)", sp, w, h, sc);
-  g_autoscaled++;
-#else
-  (void)self; (void)w; (void)h;
-#endif
-}
-
-// log68 read the failing block's contents and they are UNWRITTEN: the bytes are
-// `10 40 40 81 10 40 40 81 ...` -- two identical pointers into OUR loader's .bss
-// (0x8140xxxx), i.e. the fd/bk of a newlib free-list chunk. The block is otherwise
-// perfect: its 6-byte header carries the right type tag (`d2 07` = 2002 = MDL) and
-// res[4] is the exact unpacked size from the archive (4960 for cgbody_light, 192904
-// for pmbbs). So AurGetResource located the entry, sized it, allocated and tagged a
-// block -- and never decompressed into it. Working reads hold the real MDL bytes
-// (`00 00 00 00 05 06 ...`, byte-identical to an offline LZMA decode).
-//
-// The correlation is exact and wider than the chargen crash: EVERY ptr%8==6 read is
-// garbage and every ptr%8==0 read is filled, so gui3D_room.mdx and mainmenu.mdx are
-// broken too -- ReadSync just never checks the .mdx, which is why the menu looked
-// fine. That points at the decompressor, not at chargen.
-//
-// libandroid_port implements the OBB/BZF provider and imports LzmaUncompress from
-// libLzmaLib (DT_NEEDED is present and so_resolve_link should bind it). Hook it and
-// log both sizes in/out plus the SZ_ code, which separates the three candidates:
-//   never called      -> the miniz/OBB read upstream failed
-//   rc != 0           -> decode failed (1 DATA, 2 MEM, 4 UNSUPPORTED, 6 INPUT_EOF)
-//   rc == 0, destLen  -> it "succeeded" into a buffer that is not this block
-// Signature: int LzmaUncompress(u8 *dest, size_t *destLen, const u8 *src,
-//                               size_t *srcLen, const u8 *props, size_t propsSize)
+/* LzmaUncompress is the OBB resource decompressor (libandroid_port imports it
+ * from libLzmaLib). Hooked so repeat decodes are answered from lzma_cache. */
 static int (*LzmaUncompress_orig)(unsigned char *, size_t *, const unsigned char *,
                                   size_t *, const unsigned char *, size_t) = NULL;
-static unsigned g_lz_n = 0;
 
 static int LzmaUncompress_probe(unsigned char *dest, size_t *destLen,
                                 const unsigned char *src, size_t *srcLen,
                                 const unsigned char *props, size_t propsSize) {
+#if LZMA_CACHE_KB
   size_t dl_in = destLen ? *destLen : 0;
   size_t sl_in = srcLen ? *srcLen : 0;
-#if LZMA_CACHE_KB
   uint64_t key = 0;
-  if (lzma_cache_get(&key, dest, destLen, src, srcLen, props, propsSize)) {
-    g_lz_n++;
+  if (lzma_cache_get(&key, dest, destLen, src, srcLen, props, propsSize))
     return 0;                                   /* SZ_OK, from the cache */
-  }
   uint64_t t0 = sceKernelGetProcessTimeWide();
 #endif
   int rc = LzmaUncompress_orig(dest, destLen, src, srcLen, props, propsSize);
@@ -1253,21 +791,6 @@ static int LzmaUncompress_probe(unsigned char *dest, size_t *destLen,
   if (rc == 0 && key)
     lzma_cache_put(key, dl_in, sl_in, dest, *destLen, *srcLen);
 #endif
-  if (g_lz_n < 64) {
-    char p[24];
-    p[0] = 0;
-    if (props)
-      for (unsigned i = 0; i < propsSize && i < 5; i++) sprintf(p + i * 3, "%02x ", props[i]);
-    log_printf("[lzma] #%u dest=%p m8=%u destLen=%u->%u src=%p srcLen=%u->%u "
-               "props(%u):%s rc=%d out:%02x %02x %02x %02x",
-               g_lz_n, dest, (unsigned)((uintptr_t)dest & 7u),
-               (unsigned)dl_in, (unsigned)(destLen ? *destLen : 0), src,
-               (unsigned)sl_in, (unsigned)(srcLen ? *srcLen : 0),
-               (unsigned)propsSize, p, rc,
-               dest ? dest[0] : 0, dest ? dest[1] : 0,
-               dest ? dest[2] : 0, dest ? dest[3] : 0);
-  }
-  g_lz_n++;
   return rc;
 }
 
@@ -1277,42 +800,15 @@ static void install_lzma_probe(void) {
 #endif
   uintptr_t lu = so_symbol(&lzma_mod, "LzmaUncompress");
   if (!lu) { log_printf("[lzma] LzmaUncompress symbol MISSING in libLzmaLib"); return; }
-  // Confirm the companion's import actually bound here -- a silently unresolved
-  // (ret0-stubbed) LzmaUncompress would produce exactly the unwritten block we see.
-  uintptr_t imp = so_symbol(&port_mod, "LzmaUncompress");
-  log_printf("[lzma] libLzmaLib LzmaUncompress=0x%08x  companion sees 0x%08x",
-             (unsigned)lu, (unsigned)imp);
   LzmaUncompress_orig = (int (*)(unsigned char *, size_t *, const unsigned char *,
                                  size_t *, const unsigned char *, size_t))
       build_thumb_trampoline(lu, thumb_patch_len(lu));
-  if (LzmaUncompress_orig) {
-    hook_thumb(lu, (uintptr_t)&LzmaUncompress_probe);
-    log_printf("[lzma] LzmaUncompress PROBED");
-  } else {
-    log_printf("[lzma] LzmaUncompress trampoline FAILED");
-  }
+  if (LzmaUncompress_orig) hook_thumb(lu, (uintptr_t)&LzmaUncompress_probe);
+  else log_printf("[lzma] LzmaUncompress trampoline FAILED");
 }
 
-// log71: chargen reaches the portrait screen, then DATA_ABORTs at libKOTOR+0x2bb016
-// inside CSWGuiQuickPanel::OnSelectPortraitButton. That function does, unguarded:
-//     GetModel(255) -> ldr r1,[r0]      (body -- fine now)
-//     GetModel(254) -> ldr r1,[r0]      (part 254, r0 == NULL -> fault)
-// The two GetModel bodies decide it:
-//     CSWCAnimBaseHead::GetModel(p): p==254 -> this[0x44]; p==255 -> base; else 0
-//     CSWCAnimBase::GetModel(p):     p==255 -> this[0xb8]; else 0
-// and this[0x44] is written in exactly one place --
-//     CSWCAnimBaseHead::LoadModel(resref, 254) @ 0x1c4875:
-//         CResRef::CopyToString(buf); this[0x44] = NewCAurObject(buf, <type>, 0, 0)
-// which is a DIFFERENT override from the CSWCAnimBase::LoadModel we already hook,
-// so every head load so far has been invisible to us. Model DATA is now known good
-// (pmbbs .mdl/.mdx bytes match an offline LZMA decode exactly), so this is about
-// whether the head load is attempted at all and what NewCAurObject answers.
-//
-// NewCAurObject is the single funnel for instantiating any model by name, so
-// logging it gives the whole picture in one line per attempt: which resrefs are
-// asked for, with which type tag, and which come back NULL.
+/* NewCAurObject instantiates every model by name; timed for the [hitch] line. */
 static void *(*NewCAurObject_orig)(char *name, char *type, void *rw1, void *rw2) = NULL;
-static unsigned g_nao_n = 0;
 
 static void *NewCAurObject_probe(char *name, char *type, void *rw1, void *rw2) {
   int timed = sceKernelGetThreadId() == g_game_thid;
@@ -1322,144 +818,16 @@ static void *NewCAurObject_probe(char *name, char *type, void *rw1, void *rw2) {
     g_model_us += sceKernelGetProcessTimeWide() - t0;
     g_model_calls++;
   }
-  if (g_nao_n < 96)
-    log_printf("[model] NewCAurObject(\"%.20s\", \"%.12s\", rw=%p/%p) -> %p%s",
-               name ? name : "(null)", type ? type : "(null)", rw1, rw2, r,
-               r ? "" : "  <<< NULL");
-  g_nao_n++;
   return r;
 }
 
-static void *(*HeadLoadModel_orig)(void *self, const void *resref, unsigned part) = NULL;
-static unsigned g_hlm_n = 0;
+static void hook_named(const char *sym, uintptr_t probe, void **orig, const char *tag);
 
-static void *HeadLoadModel_probe(void *self, const void *resref, unsigned part) {
-  void *before = *(void **)((char *)self + 0x44);
-  void *r = HeadLoadModel_orig(self, resref, part);
-  void *after = *(void **)((char *)self + 0x44);
-  if (g_hlm_n < 64)
-    log_printf("[model] Head::LoadModel part=%u this=%p +0x44: %p -> %p rc=%p%s",
-               part & 0xff, self, before, after, r,
-               after ? "" : "  <<< HEAD STILL NULL");
-  g_hlm_n++;
-  return r;
-}
-
-static void install_head_probe(void) {
-  uintptr_t nao = so_symbol(&kotor_mod, "_Z13NewCAurObjectPcS_P9SDL_RWopsS1_");
-  if (nao) {
-    NewCAurObject_orig = (void *(*)(char *, char *, void *, void *))
-        build_thumb_trampoline(nao, thumb_patch_len(nao));
-    if (NewCAurObject_orig) {
-      hook_thumb(nao, (uintptr_t)&NewCAurObject_probe);
-      log_printf("[model] NewCAurObject PROBED: 0x%08x", (unsigned)nao);
-    }
-  } else {
-    log_printf("[model] NewCAurObject symbol missing");
-  }
-
-  uintptr_t hlm = so_symbol(&kotor_mod, "_ZN16CSWCAnimBaseHead9LoadModelERK7CResRefh");
-  if (hlm) {
-    HeadLoadModel_orig = (void *(*)(void *, const void *, unsigned))
-        build_thumb_trampoline(hlm, thumb_patch_len(hlm));
-    if (HeadLoadModel_orig) {
-      hook_thumb(hlm, (uintptr_t)&HeadLoadModel_probe);
-      log_printf("[model] CSWCAnimBaseHead::LoadModel PROBED: 0x%08x", (unsigned)hlm);
-    }
-  } else {
-    log_printf("[model] CSWCAnimBaseHead::LoadModel symbol missing");
-  }
-
-}
-
-// log73: the module load stalls with NOBODY blocked. The game thread keeps running
-// SDL_main's frame loop (the SDL_Delay LR resolves to SDL_main+0x1ccd, the frame
-// limiter) at ~40fps forever, and the game never calls pthread_create at all -- the
-// thread registry stayed empty -- so there is no worker to be stuck. The module
-// load is therefore a state machine driven from the main loop, and it has simply
-// stopped advancing: all resource I/O ceases at a fixed point (t=333s here, 665s in
-// log72, same place both runs) and never resumes. No crash, no fault.
-//
-// So stop guessing at the state and read it. KOTOR's pipeline is
-//   CServerExoAppInternal::StartNewModule / ExecuteLoadModule
-//     -> CSWSModule::LoadModuleStart(name, flag)   @ 0x387025
-//     -> ... staged work, progress bar driven by LoadScreenUpdate(a,b,c,d)
-//     -> CSWSModule::LoadModuleFinish()            @ 0x388571
-// If Start returns but Finish never runs, the bar freezes exactly as observed
-// (~20% in the photo). LoadScreenUpdate's arguments are the stage counters, so
-// logging them ON CHANGE gives a compact trace of how far the load got and which
-// step it died on, without spamming a per-frame call.
-//
-// NOTE (learned the hard way): every probe
-// here declares a void* return and passes it through. If the real function returns
-// void the caller ignores r0 and nothing is harmed; if it returns a value we
-// preserve it. Declaring `void` is the unsafe choice, not the neutral one.
-// Shared helpers for the load/resource probes (defined here so the load probes
-// below can use them). CExoString keeps its char* at offset 0.
-static const char *exostr(const void *s) {
-  const char *p = s ? *(const char *const *)s : NULL;
-  return p ? p : "(empty)";
-}
-
-static volatile int g_in_lms = 0;
-
-static void dump_res(const char *tag, void *res) {
-  const uint32_t *w = (const uint32_t *)res;
-  const unsigned char *b = (const unsigned char *)res;
-  char txt[0x41];
-  for (int i = 0; i < 0x40; i++)
-    txt[i] = (b[i] >= 32 && b[i] < 127) ? (char)b[i] : '.';
-  txt[0x40] = 0;
-  log_printf("[res] %s CRes=%p "
-             "%08x %08x %08x %08x %08x %08x %08x %08x "
-             "%08x %08x %08x %08x %08x %08x %08x %08x  \"%s\"",
-             tag, res, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7],
-             w[8], w[9], w[10], w[11], w[12], w[13], w[14], w[15], txt);
-}
-
-static void *(*LoadModuleStart_orig)(void *self, const void *name, int flag) = NULL;
-static void *(*LoadModuleFinish_orig)(void *self) = NULL;
-static void *(*LoadScreenUpdate_orig)(int a, int b, int c, int d) = NULL;
-
-static void *LoadModuleStart_probe(void *self, const void *name, int flag) {
-  // m_sModuleName lives at CSWSModule+0x5c (LoadModuleStart compares it against
-  // the argument at +0x3870b6 and skips AddModuleResources when they match --
-  // which is what happens here, because CSWSModule's constructor already
-  // registered the resources). The CRes it then demands is at CSWSModule+8.
-  const void *cur = (const char *)self + 0x5c;
-  void *res = self ? ((void **)self)[2] : NULL;
-  log_printf("[load] LoadModuleStart ENTER flag=%d  m_sModuleName=\"%.48s\" "
-             "arg=\"%.48s\"  CRes(this+8)=%p",
-             flag, exostr(cur), exostr(name), res);
-  if (res) dump_res("before Demand", res);
-  g_in_lms = 1;
-  void *rc = LoadModuleStart_orig(self, name, flag);
-  g_in_lms = 0;
-  log_printf("[load] LoadModuleStart EXIT rc=%p", rc);
-  if (res) dump_res("after Demand", res);
-  return rc;
-}
-
-static void *LoadModuleFinish_probe(void *self) {
-  log_printf("[load] LoadModuleFinish ENTER");
-  void *rc = LoadModuleFinish_orig(self);
-  log_printf("[load] LoadModuleFinish EXIT rc=%p", rc);
-  return rc;
-}
-
-static void *LoadScreenUpdate_probe(int a, int b, int c, int d) {
-  static int la = -1, lb = -1, lc = -1, ld = -1;
-  static unsigned n = 0, since = 0;
-  if (a != la || b != lb || c != lc || d != ld) {
-    if (n < 256)
-      log_printf("[load] LoadScreenUpdate(%d, %d, %d, %d)  [%u calls since last change]",
-                 a, b, c, d, since);
-    n++; since = 0;
-    la = a; lb = b; lc = c; ld = d;
-  } else {
-    since++;
-  }
-  return LoadScreenUpdate_orig(a, b, c, d);
+static void install_model_timers(void) {
+  hook_named("_Z13NewCAurObjectPcS_P9SDL_RWopsS1_", (uintptr_t)&NewCAurObject_probe,
+             (void **)&NewCAurObject_orig, "NewCAurObject");
+  hook_named("_ZN12IODispatcher8ReadSyncEPc", (uintptr_t)&ReadSync_probe,
+             (void **)&ReadSync_orig, "IODispatcher::ReadSync");
 }
 
 static void hook_named(const char *sym, uintptr_t probe, void **orig, const char *tag) {
@@ -1468,92 +836,12 @@ static void hook_named(const char *sym, uintptr_t probe, void **orig, const char
   *orig = (void *)build_thumb_trampoline(a, thumb_patch_len(a));
   if (!*orig) { log_printf("[load] %s trampoline FAILED", tag); return; }
   hook_thumb(a, probe);
-  log_printf("[load] %s PROBED: 0x%08x", tag, (unsigned)a);
 }
 
-// The barrier in MainLoop counts outstanding async resource requests, so watch the
-// two ends of that queue directly: PreSpawnAsync issues a request, RetreiveAsync
-// collects a finished one. If issues >> retrieves, the worker never drains it; if
-// they balance, the stall is elsewhere and the counter belongs to something else.
-static void *(*PreSpawnAsync_orig)(void *self, char *name) = NULL;
-static void *(*RetreiveAsync_orig)(void *self, void *req) = NULL;
-static unsigned g_pre_n = 0, g_ret_n = 0;
-
-static void *PreSpawnAsync_probe(void *self, char *name) {
-  void *rc = PreSpawnAsync_orig(self, name);
-  if (g_pre_n < 64)
-    log_printf("[async] PreSpawnAsync(\"%.24s\") -> %p  [issued=%u retrieved=%u]",
-               name ? name : "?", rc, g_pre_n + 1, g_ret_n);
-  g_pre_n++;
-  return rc;
-}
-
-static void *RetreiveAsync_probe(void *self, void *req) {
-  void *rc = RetreiveAsync_orig(self, req);
-  if (g_ret_n < 64)
-    log_printf("[async] RetreiveAsync(%p) -> %p  [issued=%u retrieved=%u]",
-               req, rc, g_pre_n, g_ret_n + 1);
-  g_ret_n++;
-  return rc;
-}
-
-// ---- load-stall probe -------------------------------------------------------
-// Decoded from CServerExoAppInternal::MainLoop (libKOTOR +0x3eb94c). Once per
-// frame it does, in effect:
-//
-//   ls = ((void **)g_pAppManager)[5];        // appManager + 0x14, the load state
-//   if (ls[14] != 0)          -> bail; an error code is already latched
-//   mode = ls[1];             -> only 1, 2 or 3 do anything at all
-//   if      (ls[3] == 0)      -> nothing queued
-//   else if (ls[3] != ls[2])  -> CSWSModule::LoadModuleInProgress(ls[2], ls[3])
-//   else if (ls[5] != 1)      -> CSWSModule::LoadModuleFinish()
-//
-// LoadModuleInProgress (+0x3884b8) loads exactly ONE area per call via
-// CSWSArea::LoadArea and then stores ls[2]+1 back to ls[2]. So ls[2] is progress,
-// ls[3] is the target, and Finish only fires when they meet. A frozen bar means
-// ls[2] stopped climbing, which is either "MainLoop never reaches the call" or
-// "LoadArea stopped succeeding" -- opposite causes. Log the gate itself plus both
-// calls so the next run distinguishes them instead of us guessing again.
-//
-// LoadArea returning 0 is FAILURE (LoadModuleInProgress then tears the area down
-// and returns 4, which makes MainLoop call UnloadModule) -- so an all-zero return
-// here would show up as an abort, not a hang.
-static void *g_appmgr_ptr = NULL;
-
-static void *(*MainLoop_orig)(void *self) = NULL;
-static void *(*LoadInProgress_orig)(void *self, int prog, int target) = NULL;
-static void *(*LoadArea_orig)(void *self, int a) = NULL;
-
-static void load_state_dump(const char *tag) {
-  if (!g_appmgr_ptr) return;
-  void *app = *(void **)g_appmgr_ptr;
-  if (!app) { log_printf("[load] %s: g_pAppManager is NULL", tag); return; }
-  void **ls = (void **)((void **)app)[5];
-  if (!ls) { log_printf("[load] %s: appManager[+0x14] is NULL", tag); return; }
-  log_printf("[load] %s: mode=%d progress=%d target=%d f20=%d err=%d",
-             tag, (int)(intptr_t)ls[1], (int)(intptr_t)ls[2], (int)(intptr_t)ls[3],
-             (int)(intptr_t)ls[5], (int)(intptr_t)ls[14]);
-}
-
-static unsigned g_ml_n = 0, g_lip_n = 0, g_la_n = 0;
-
-// log81 verdict: 3360 frames were drawn after LoadModuleStart while MainLoop ran
-// fewer than 301 times and LoadModuleInProgress/LoadArea ran ZERO times. So the
-// server is not being pumped at all. Tracing the two things that can pump it:
-//
-//   GameUpdate()  (SDL_main +0x18d116/+0x18d1a0) -> CServerExoApp::MainLoop,
-//                 gated only on appManager[+8] != NULL
-//   UpdateScreen(float,int,int) (+0x3fe098)      -> same, but gated on b == 1
-//
-// and EVERY one of the 56 UpdateScreen call sites in the binary passes b=0, so
-// that branch is dead code: GameUpdate is the only pump. Yet UpdateScreen is the
-// only thing calling SDL_GL_SwapWindow during a load, so something is spinning it
-// in a nested loop that never returns to SDL_main. Its return address names that
-// loop, which is the one fact still missing.
-//
-// ABI: UpdateScreen's first parameter is a float and the .so is softfp, so it
-// arrives in r0, not s0. Declaring it `float` would make our hardfp build read s0
-// and shift b/c by one register.
+/* GameUpdate and UpdateScreen are timed for the [hitch] line, and GameUpdate
+ * is where the adaptive render skip is overridden (DISABLE_ADAPTIVE_RENDER_SKIP).
+ * ABI: UpdateScreen's first parameter is a float and the .so is softfp, so it
+ * arrives in r0, not s0. */
 static void *(*UpdateScreen_orig)(uint32_t a, int b, int c) = NULL;
 static void *(*GameUpdate_orig)(void) = NULL;
 static unsigned g_us_n = 0, g_gu_n = 0;
@@ -1594,14 +882,6 @@ void engine_perf_presented(void) {
 }
 
 static void *UpdateScreen_probe(uint32_t a, int b, int c) {
-  if (g_us_n < 16 || (g_us_n % 200) == 0) {
-    uintptr_t lr = (uintptr_t)__builtin_return_address(0) & ~(uintptr_t)1;
-    log_printf("[load] UpdateScreen #%u (a=0x%08x b=%d c=%d) from off=0x%06x "
-               "thid=0x%08x  [GameUpdate=%u MainLoop=%u]",
-               g_us_n, (unsigned)a, b, c,
-               (unsigned)(lr - kotor_mod.text_base),
-               (unsigned)sceKernelGetThreadId(), g_gu_n, g_ml_n);
-  }
   g_us_n++;
   uint64_t start = sceKernelGetProcessTimeWide();
   g_us_active = start;
@@ -1624,15 +904,6 @@ static void *GameUpdate_probe(void) {
   // it, instead of following it with up to ten no-present update iterations.
   if (g_render_skip && *g_render_skip > g_catchup_cap) *g_render_skip = g_catchup_cap;
 #endif
-  if ((g_gu_n % 200) == 0) {
-    void *app = g_appmgr_ptr ? *(void **)g_appmgr_ptr : NULL;
-    log_printf("[load] GameUpdate #%u appMgr=%p client=%p server=%p "
-               "[UpdateScreen=%u MainLoop=%u]",
-               g_gu_n, app,
-               app ? ((void **)app)[1] : NULL,
-               app ? ((void **)app)[2] : NULL,
-               g_us_n, g_ml_n);
-  }
   g_gu_n++;
   uint64_t start = sceKernelGetProcessTimeWide();
   g_gu_active = start;
@@ -1644,383 +915,15 @@ static void *GameUpdate_probe(void) {
   return rc;
 }
 
-static void *MainLoop_probe(void *self) {
-  // Dump every one of the first 16 -- log82 showed MainLoop runs exactly TWICE
-  // and then never again, so the every-300 throttle hid the interesting call.
-  if (g_ml_n < 16 || (g_ml_n % 300) == 0) {
-    char t[48];
-    snprintf(t, sizeof t, "MainLoop#%u thid=0x%08x", g_ml_n,
-             (unsigned)sceKernelGetThreadId());
-    load_state_dump(t);
-  }
-  g_ml_n++;
-  return MainLoop_orig(self);
-}
-
-// log82: appManager[+8] (the CServerExoApp) is NULL on every GameUpdate, forever,
-// so GameUpdate's `cbz r0` skips the server pump and the load can never advance.
-// MainLoop ran exactly twice -- around LoadModuleStart -- so the server DID exist
-// briefly and was then torn down. CAppManager::DestroyServer has five call sites:
-//   +0x1972b2 CClientExoAppInternal::MainLoop        (-> DisplayMainMenu)
-//   +0x19db80 CClientExoAppInternal::ShutDownToMainMenu
-//   +0x2beaa4 CSWGuiSaveLoad::LoadGame
-//   +0x3ec156 CServerExoAppInternal::MainLoop        (server shutdown path)
-//   +0x3fda50 GameDeinit
-// Logging the return address says which one fired instead of us reverse
-// engineering all five. CreateServer is logged too, to bracket the lifetime.
-static void *(*CreateServer_orig)(void *self, int a) = NULL;
-static void *(*DestroyServer_orig)(void *self) = NULL;
-
-// log86: modules/END_M01AA.rim, currentgame/ and _s.rim all open cleanly now (the
-// OBB fallback works -- CHITIN.key and every .bzf are served from it), yet
-// LoadModuleStart still exits rc=1. So CRes::Demand() on the module .ifo still
-// returns NULL even though the RIM is readable. The .ifo does NOT come through
-// plain file I/O -- it is registered with the resource manager by
-// CSWSModule::AddModuleResources -> CExoResMan::AddEncapsulatedResourceFile, and
-// only then demanded. Tellingly there was NO file I/O at all inside
-// LoadModuleStart's 17 ms window, so the RIM may never be opened.
-//
-// Watch that whole chain:
-//   CSWSModule::AddModuleResources(name)  - does it run, for which module
-//   CExoEncapsulatedFile::OpenFile()      - is the RIM actually opened
-//   CExoResMan::Demand(CRes*)             - log only NULL returns (the failure)
-// Hook CExoResMan::Demand, NOT CRes::Demand: the latter is a 6-instruction thunk
-// whose 2nd and 3rd instructions are `ldr r0,[pc,#12]` / `add r0,pc`, and the
-// trampoline copies bytes without relocating them, so those would read from the
-// wrong address. CExoResMan::Demand is the real implementation it tail-calls and
-// its first 8 bytes are position-independent.
-// CExoString stores its char* at offset 0 (CExoString::CStr is `ldr r0,[r0]`
-// with an empty-string fallback), so *(char**)s is the text.
-//
-// NB: CExoResMan::AddEncapsulatedResourceFile would be the more direct probe but
-// is UNHOOKABLE here -- it is an 8-byte thunk whose body is a PC-relative `b.w`
-// into a long-branch veneer. build_thumb_trampoline copies bytes verbatim without
-// relocating them, so the copied branch would go somewhere else entirely, and the
-// 10-byte patch its 2-mod-4 address demands would resume inside AddKeyTable.
-// Always check the first N bytes of a hook target for PC-relative instructions.
-static void *(*AddModRes_orig)(void *self, const void *name) = NULL;
-static void *(*OpenFile_orig)(void *self) = NULL;
-static void *(*Demand_orig)(void *self, void *res) = NULL;
-static unsigned g_openfile_n = 0, g_demand_null_n = 0;
-
-
-static void *AddModRes_probe(void *self, const void *name) {
-  log_printf("[res] AddModuleResources(\"%.64s\") ENTER", exostr(name));
-  void *rc = AddModRes_orig(self, name);
-  log_printf("[res] AddModuleResources(\"%.64s\") EXIT rc=%p  [OpenFile calls=%u]",
-             exostr(name), rc, g_openfile_n);
-  return rc;
-}
-
-static void *OpenFile_probe(void *self) {
-  void *rc = OpenFile_orig(self);
-  if (g_openfile_n < 48 || !rc)
-    log_printf("[res] CExoEncapsulatedFile::OpenFile(self=%p) -> %p  [#%u]",
-               self, rc, g_openfile_n + 1);
-  g_openfile_n++;
-  return rc;
-}
-
-// log87: Demand()->NULL is ROUTINE (every optional .txi probe misses), so a flat
-// cap of 24 was exhausted at t=105s and the one that matters -- inside
-// LoadModuleStart at t=337 -- was never logged. Scope it to the load window
-// instead: g_in_lms is armed only while LoadModuleStart runs, where NULL is the
-// actual failure. Dump 0x40 bytes so the CRes's ResRef is visible in the ASCII
-// column (it is past +0x18, which the earlier 0x20 dump could not reach).
-
-
-static void *Demand_probe(void *self, void *res) {
-  void *rc = Demand_orig(self, res);
-  if (!rc && res && (g_in_lms || g_demand_null_n < 4)) {
-    dump_res(g_in_lms ? "IN-LoadModuleStart Demand -> NULL" : "Demand -> NULL", res);
-    g_demand_null_n++;
-  }
-  return rc;
-}
-
-// log89: the copy theory is dead -- modules/END_M01AA.rim opens at 55565 bytes,
-// byte-exact with the OBB's own entry, so the RIM is intact. What the log DOES
-// show is that currentgame/END_M01AA.rim is opened `wb` and never once read: no
-// `rb` open of the copy appears anywhere in the log. The main module archive is
-// therefore never indexed.
-//
-// Why that is fatal is now settled statically. CResHelper<CResIFO,2014>::SetResRef
-// (+0x3856b0) first compares the incoming ResRef against the one it already stores
-// at this+0x0c and RETURNS IMMEDIATELY if they match -- so "module" is bound
-// exactly once, ever. On that one call it asks CExoResMan::GetResObject(ref, 2014);
-// when that misses it `new`s a 168-byte CResGFF, stamps it with the CResIFO vtable
-// (+0x59f388 -- exactly the vtable in our dump, so the object we log IS this
-// placeholder) and registers it via SetResObject. The placeholder's id (+8) stays
-// 0xFFFFFFFF, and CExoResMan::Demand (+0x4c86cc: `ldr r1,[r1,#8]; adds r0,r1,#1;
-// beq ret0`) rejects it on sight. A later archive add cannot rescue it unless it
-// walks the live CRes objects (UpdateKeyTable).
-//
-// So the question collapses to one: is the main module RIM ever handed to the
-// resource manager at all? AddEncapsulatedResourceFile is the unhookable 8-byte
-// thunk (`mov r3,r2; movs r2,#3; b.w <veneer>`) -- but it is only a shim for
-// CExoResMan::AddKeyTable(name, type=3, m), which IS a real 396-byte body at
-// +0x4c9490: 0-mod-4, prologue push/add r7/stmdb = 8 bytes, no PC-relative ops.
-// Hook that and every archive registration in the game names itself.
-static unsigned long (*AddKeyTable_orig)(void *, const void *, unsigned long,
-                                         unsigned long) = NULL;
-static unsigned g_akt_n = 0;
-
-static unsigned long AddKeyTable_probe(void *self, const void *name,
-                                       unsigned long type, unsigned long m) {
-  uintptr_t lr = (uintptr_t)__builtin_return_address(0) & ~(uintptr_t)1;
-  unsigned long rc = AddKeyTable_orig(self, name, type, m);
-  g_akt_n++;
-  log_printf("[res] AddKeyTable(\"%.64s\" type=%lu m=0x%lx) -> rc=0x%lx  "
-             "from off=0x%06x  [#%u]", exostr(name), type, m, rc,
-             (unsigned)(lr - kotor_mod.text_base), g_akt_n);
-  return rc;
-}
-
-// log91: the stat() fix was correct in itself but changed nothing -- and the log
-// shows **zero** `[FS] stat` lines, so `CExoBaseInternal::GetDirectoryList` never
-// reaches its two stat call sites (+0x4b675e / +0x4b676c) at all. It bails
-// earlier, or is never called for CURRENTGAME:. Probe the enumeration chain
-// end-to-end rather than guessing which of the 3248 bytes bails:
-//
-//   CExoKeyTable::BuildNewTable        +0x4c5eac  type 1..4 -> tail-calls one of
-//     `-> AddDirectoryContents(int)    +0x4c4adc  (type 2, our case)
-//          `-> CExoBase::GetDirectoryList        the actual enumerator
-//   CExoResMan::GetKeyEntry            +0x4ca62c  the lookup that then misses
-//
-// All four are 0-mod-4 with an 8-byte position-independent prologue
-// (push/add r7/stmdb), so all pass the 3-way trampoline check.
-//
-// CExoArrayList<CExoString> keeps its count at +4 (GetDirectoryList itself reads
-// `[r9,#4]` and compares against 1 at +0x4b678c). CResRef stores its chars at
-// offset 0 -- AsyncLoad memcpys the lowercased name straight into the struct
-// before passing it -- so a CResRef can be printed as a bounded char array.
-// log92: GetKeyEntry answered the big question -- `global`, `mainmenu` and
-// `chargen` (all in rims/) resolve as type 3002 (.rim), while `end_m01aa` (in
-// modules/) does not, at either 3002 or 3009. So one directory key table
-// populates and the other does not, even though BOTH directories are in the OBB
-// (rims/ 13 entries, modules/ 235). AddDirectoryContents("MODULES:") itself runs
-// and returns 1, so the failure is inside the enumeration.
-//
-// NB the earlier GetDirectoryList probe printed garbage: this is a NON-STATIC
-// member, so `this` occupies r0 and every argument is shifted one register right
-// (r1=out, r2=dir, r3=type). The old signature read the array-list pointer as the
-// dir string and `this` as the array list -- hence "(empty)" names and a nonsense
-// count. Corrected below.
-//
-// CExoArrayList keeps its count at +4 (GetDirectoryList reads `[r9,#4]` and
-// compares against 1 at +0x4b678c).
-static void *(*GetDirList_orig)(void *, void *, const void *, unsigned,
-                                int, int, int) = NULL;
-static void *(*AddDirContents_orig)(void *, int) = NULL;
-static void *(*GetKeyEntry_orig)(void *, const void *, unsigned, void *, void *) = NULL;
-static void *(*AddKey_orig)(void *, const void *, unsigned, unsigned, int) = NULL;
-static unsigned g_gdl_n = 0, g_adc_n = 0, g_gke_n = 0, g_addkey_n = 0;
-
-static void *GetDirList_probe(void *self, void *out, const void *dir,
-                              unsigned type, int a, int b, int c) {
-  void *rc = GetDirList_orig(self, out, dir, type, a, b, c);
-  int n = out ? ((int *)out)[1] : -1;
-  if (g_gdl_n < 64)
-    log_printf("[res] GetDirectoryList(\"%.64s\" type=%u %d,%d,%d) -> rc=%p  "
-               "count=%d  [#%u]", exostr(dir), type, a, b, c, rc, n, g_gdl_n + 1);
-  // log93 pinned the failure to CURRENTGAME: -- count=1 yet not one
-  // AddKey(tbl="CURRENTGAME:") in the entire log. Print the names for any short
-  // list so we can see WHICH name the loop rejects. Elements are CExoString,
-  // stride 8 (AddDirectoryContents walks with `adds r6,#8`), char* at offset 0;
-  // the array base is the list's first word.
-  // Cap 16, not 8, so RIMS: (12 entries, and known-good -- its keys DO land)
-  // dumps too and gives a positive control for what a name is supposed to look
-  // like next to the one currentgame entry that gets rejected.
-  if (n > 0 && n <= 16) {
-    const char *base = (const char *)((void **)out)[0];
-    if (base)
-      for (int i = 0; i < n; i++)
-        log_printf("[res]    entry[%d] = \"%.64s\"", i, exostr(base + i * 8));
-  }
-  g_gdl_n++;
-  return rc;
-}
-
-// How many keys each table actually ends up with -- the direct measure of "did
-// this directory enumerate". CResRef stores its chars at offset 0.
-static void *AddKey_probe(void *self, const void *resref, unsigned type,
-                          unsigned id, int a) {
-  void *rc = AddKey_orig(self, resref, type, id, a);
-  // CURRENTGAME: is the table under test, so never throttle it; everything else
-  // is background and gets a cap (log93 emitted 1200 AddKey lines and the run
-  // crawled).
-  const char *tbl = exostr((const char *)self + 0x20);
-  int watched = tbl && strstr(tbl, "CURRENTGAME");
-  if (watched || g_addkey_n < 24 ||
-      ((type == 3002 || type == 3009) && g_addkey_n < 300)) {
-    char n[17];
-    memcpy(n, resref, 16);
-    n[16] = 0;
-    log_printf("[res] AddKey(tbl=\"%.32s\", \"%s\" type=%u id=%u) -> %p  [#%u]",
-               exostr((const char *)self + 0x20), n, type, id, rc,
-               g_addkey_n + 1);
-  }
-  g_addkey_n++;
-  return rc;
-}
-
-static void *AddDirContents_probe(void *self, int a) {
-  void *rc = AddDirContents_orig(self, a);
-  if (g_adc_n < 64)
-    log_printf("[res] AddDirectoryContents(\"%.64s\", %d) -> rc=%p  [#%u]",
-               exostr((const char *)self + 0x20), a, rc, g_adc_n + 1);
-  g_adc_n++;
-  return rc;
-}
-
-static void *GetKeyEntry_probe(void *self, const void *resref, unsigned type,
-                               void *tbl, void *ent) {
-  uintptr_t lr = (uintptr_t)__builtin_return_address(0) & ~(uintptr_t)1;
-  void *rc = GetKeyEntry_orig(self, resref, type, tbl, ent);
-  // 3002 = .rim, 3009 = .rsv -- the two AsyncLoad gates. Rare, so log them all.
-  if ((type == 3002 || type == 3009) && g_gke_n < 128) {
-    char n[17];
-    memcpy(n, resref, 16);
-    n[16] = 0;
-    log_printf("[res] GetKeyEntry(\"%s\" type=%u) -> %p  from off=0x%06x  [#%u]",
-               n, type, rc, (unsigned)(lr - kotor_mod.text_base), g_gke_n + 1);
-    g_gke_n++;
-  }
-  return rc;
-}
-
-static void *CreateServer_probe(void *self, int a) {
-  uintptr_t lr = (uintptr_t)__builtin_return_address(0) & ~(uintptr_t)1;
-  void *rc = CreateServer_orig(self, a);
-  void *app = g_appmgr_ptr ? *(void **)g_appmgr_ptr : NULL;
-  log_printf("[load] CAppManager::CreateServer(%d) -> %p  from off=0x%06x  "
-             "server now=%p", a, rc, (unsigned)(lr - kotor_mod.text_base),
-             app ? ((void **)app)[2] : NULL);
-  return rc;
-}
-
-static void *DestroyServer_probe(void *self) {
-  uintptr_t lr = (uintptr_t)__builtin_return_address(0) & ~(uintptr_t)1;
-  void *app = g_appmgr_ptr ? *(void **)g_appmgr_ptr : NULL;
-  log_printf("[load] CAppManager::DestroyServer() from off=0x%06x  server was=%p "
-             "[GameUpdate=%u MainLoop=%u UpdateScreen=%u]",
-             (unsigned)(lr - kotor_mod.text_base),
-             app ? ((void **)app)[2] : NULL, g_gu_n, g_ml_n, g_us_n);
-  load_state_dump("at DestroyServer");
-  return DestroyServer_orig(self);
-}
-
-static void *LoadInProgress_probe(void *self, int prog, int target) {
-  void *rc = LoadInProgress_orig(self, prog, target);
-  if (g_lip_n < 64 || rc)
-    log_printf("[load] LoadModuleInProgress(progress=%d, target=%d) -> rc=%p  [#%u]",
-               prog, target, rc, g_lip_n + 1);
-  g_lip_n++;
-  return rc;
-}
-
-static void *LoadArea_probe(void *self, int a) {
-  void *rc = LoadArea_orig(self, a);
-  if (g_la_n < 64 || !rc)
-    log_printf("[load] CSWSArea::LoadArea(%d) -> rc=%p  [#%u]", a, rc, g_la_n + 1);
-  g_la_n++;
-  return rc;
-}
-
-/* --- sound: where does the chain stop? --------------------------------------
- *
- * Audio has never made a sound on hardware. Across log101/log102 the only [snd]
- * lines were "decoder ready" and "output up" -- FMOD::System::createSound was
- * never called even once, and no individual sound file was ever opened. So the
- * backend was never the problem; something upstream never asks for a sound.
- *
- * What the disassembly already settles:
- *   - FModAudioSystem::InitSystem DID run (it is what called audio_start).
- *   - FModAudioSystem::CreateSound (+0x73220, port) has NO guard on the system
- *     handle -- it walks its cache map then goes straight to createSound. So it
- *     was never called; the gate is in libKOTOR, above the companion.
- *   - Sound reaches the companion by exactly two routes:
- *       CExoSoundSourceInternal::Demand()          -> CreateSound   (SFX; bails
- *           early if this->m_pRes (+8) is NULL or CRes::Demand() returns 0)
- *       CExoStreamingSoundSourceInternal::InitializeSource() -> CreateStream
- *           (music/VO, via an SDL_RWops -- our RWFromFile chain)
- *   - CExoSound(unsigned char, unsigned char, int, int) is built at the end of
- *     CClientExoAppInternal::InitializeSoundOptions (libKOTOR +0x19bc38). Its
- *     args are NOT what an earlier pass here guessed. Reading +0x19beac:
- *         uxtb r1,r8   <- [Sound Options] "Number 2D Voices"  (default 24)
- *         uxtb r2,r6   <- [Sound Options] "Number 3D Voices"  (default 16)
- *         clz r0,r9 ; lsrs r0,r0,#5 ; str r0,[sp]   <- 4th arg = (r9 == 0)
- *     So arg1/arg2 are VOICE COUNTS with sane nonzero defaults, and the 4th arg
- *     is the real sound-enabled boolean.
- *   - r9 comes straight from [Sound Options] "Sound Init":
- *         read "Sound Init" -> r4   (ReadIniEntry fails => r4 = 0)
- *         immediately WRITE "Sound Init" = 1
- *         r4 != 0  -> r9 = 1 -> 4th arg 0 -> SOUND DISABLED
- *         r4 == 0  -> r9 = 0 -> 4th arg 1 -> sound enabled
- *         ...and at the very end of the function, WRITE "Sound Init" = 0.
- *     That is a crash-guard: the game marks "I am about to init sound", and if
- *     it finds that mark still set on the next boot it assumes sound init killed
- *     the process last time and silently runs mute forever after.
- *   - We resolve swkotor.ini to ux0:data/kotor/swkotor.ini and log103 shows it
- *     touched 15x, so the writes have a real destination. RULED OUT on hardware
- *     2026-07-31: the card's ini has "Sound Init=0", so the 4th ctor arg is 1
- *     and sound is enabled at this level. The gate is elsewhere.
- *
- * The far better candidate, found by scanning every reference in .text: the
- * global g_bDisableSound (libKOTOR .bss +0xb3e030, GOT slot 0x5a38e8). It has
- * exactly 12 referents and exactly ONE writer -- _Z8GameInitv at +0x3fd056:
- *       ReadIniEntry(swkotor.ini, [Sound Options], "Disable Sound") -> r4
- *       r4 == 0 (key absent) -> leave g_bDisableSound at its .bss 0, and write
- *                               "Disable Sound=0" back to the ini
- *       r4 != 0              -> g_bDisableSound = (value.AsINT() != 0)
- * Every other referent only reads it, and each read is a hard bail:
- *       CExoSoundInternal::Initialize  +0x4db766  ==1 -> return 0, does nothing
- *       CExoSound::CExoSound           +0x4daa66  !=0 -> never builds m_pInternal
- *       CExoSoundSource::CExoSoundSource        !=0 -> m_pInternal = NULL
- *       SDL_main main loop             +0x18d10a  !=0 -> skips UpdateSystem()
- * One flag therefore suppresses the entire subsystem with no error anywhere,
- * which is exactly the observed symptom. So log the flag itself rather than
- * inferring it: g_bDisableSound is an exported OBJECT, we can just read it.
- */
-static int *g_pDisableSound = NULL;
-static void *(*GameInit_orig)(void) = NULL;
-
-static void *GameInit_probe(void) {
-  void *rc = GameInit_orig();
-  if (g_pDisableSound)
-    log_printf("[snd?] after GameInit: g_bDisableSound = %d  %s", *g_pDisableSound,
-               *g_pDisableSound
-                   ? "<<< SOUND IS OFF: swkotor.ini [Sound Options] Disable Sound is nonzero"
-                   : "(sound not disabled by the global)");
-  return rc;
-}
-/*
- *
- * Hence probes rather than another guess: one run shows which link breaks. These
- * are pure log lines -- no threads, no mixer, nothing that could touch frame rate.
- * Every probe passes the callee's return value through: a void-declared hook on a
- * value-returning function was itself a crash once.
- */
-static void *(*ExoSound_ctor_orig)(void *, unsigned, unsigned, int, int) = NULL;
-static void *(*ExoSoundInit_orig)(void *, unsigned, unsigned, int, int) = NULL;
+/* --- sound pipeline ----------------------------------------------------------
+ * Every probe passes the callee's return value through: a void-declared hook on
+ * a value-returning function was itself a crash once. */
 static void *(*SndDemand_orig)(void *) = NULL;
 static void *(*StreamInit_orig)(void *) = NULL;
 static void *(*FmodCreateSound_orig)(void *, char *, int, void *, unsigned, int, int) = NULL;
 static void *(*FmodCreateStream_orig)(void *, char *, void *, int, int, int, int, int) = NULL;
 static void *(*FmodPlaySound_orig)(void *, int) = NULL;
 
-static void *ExoSound_ctor_probe(void *self, unsigned a, unsigned b, int c, int d) {
-  log_printf("[snd?] CExoSound(n2DVoices=%u n3DVoices=%u, %d, soundEnabled=%d)  <<< "
-             "soundEnabled==0 means \"Sound Init\" was left set in swkotor.ini",
-             a & 0xff, b & 0xff, c, d);
-  return ExoSound_ctor_orig(self, a, b, c, d);
-}
-static void *ExoSoundInit_probe(void *self, unsigned a, unsigned b, int c, int d) {
-  void *rc = ExoSoundInit_orig(self, a, b, c, d);
-  log_printf("[snd?] CExoSoundInternal::Initialize(%u, %u, %d, %d) -> %p",
-             a & 0xff, b & 0xff, c, d, rc);
-  return rc;
-}
 // Upstream of Demand: does the game ever ASK for a sound at all? If these two
 // stay silent, nothing below them can ever fire and the gate is higher than the
 // sound system. CResRef is a fixed char[16], not necessarily NUL-terminated.
@@ -2068,15 +971,7 @@ static void sound_pipeline_census(void) {
 }
 
 static void *SndSrcCtor_probe(void *self, const void *resref) {
-  static unsigned n = 0;
-  if (n < 40) {
-    char nm[17] = {0};
-    if (resref) memcpy(nm, resref, 16);
-    for (int i = 0; i < 16; i++)
-      if (nm[i] && (nm[i] < 0x20 || nm[i] > 0x7e)) nm[i] = '.';
-    log_printf("[snd?] CExoSoundSource(\"%s\") #%u", nm, n);
-  }
-  n++; g_src_ctor++;
+  g_src_ctor++;
   return SndSrcCtor_orig(self, resref);
 }
 /* Where a slow sound start spends its time. log201's ambient-sound stutters
@@ -2089,12 +984,8 @@ static char g_play_create_name[48];
 static unsigned g_play_slow_n;
 
 static void *SndSrcPlay_probe(void *self) {
-  static unsigned n = 0;
   void *internal = self ? *(void **)((char *)self + 4) : NULL;  // m_pInternal
-  if (n < 40)
-    log_printf("[snd?] CExoSoundSource::Play() #%u m_pInternal=%p%s", n, internal,
-               internal ? "" : "  <<< NULL internal, nothing can play");
-  n++; g_src_play++; if (!internal) g_src_play_noint++;
+  g_src_play++; if (!internal) g_src_play_noint++;
   g_play_demand_us = g_play_create_us = 0;
   g_play_create_name[0] = 0;
   uint64_t t0 = sceKernelGetProcessTimeWide();
@@ -2115,31 +1006,21 @@ static void *SndDemand_probe(void *self) {
   uint64_t t0 = sceKernelGetProcessTimeWide();
   void *rc = SndDemand_orig(self);
   g_play_demand_us += sceKernelGetProcessTimeWide() - t0;
-  static unsigned n = 0;
-  if (n < 40)
-    log_printf("[snd?] SoundSource::Demand #%u m_pRes=%p -> %p%s", n, res, rc,
-               res ? "" : "  <<< no CRes, cannot reach CreateSound");
-  n++; g_demand++; if (!res) g_demand_nores++; if (!rc) g_demand_fail++;
+  g_demand++; if (!res) g_demand_nores++; if (!rc) g_demand_fail++;
   return rc;
 }
 /* InitializeSource is void: r0 on return is its stack-guard scratch, always 0,
  * so there is no success flag to count (log198-200 read every call as failed). */
 static void *StreamInit_probe(void *self) {
   void *rc = StreamInit_orig(self);
-  static unsigned n = 0;
-  if (n < 40) log_printf("[snd?] StreamingSource::InitializeSource #%u", n);
-  n++; g_streaminit++;
+  g_streaminit++;
   return rc;
 }
 static unsigned g_nclose = 0, g_nrelease = 0;   /* stream/sound teardown counts */
 
 static void *FmodCreateSound_probe(void *self, char *name, int id, void *data,
                                    unsigned size, int e, int f) {
-  static unsigned n = 0;
-  if (n < 40)
-    log_printf("[snd?] FMod::CreateSound #%u \"%s\" id=%d data=%p size=%u (%d,%d)",
-               n, name ? name : "?", id, data, size, e, f);
-  n++; g_fmod_create++;
+  g_fmod_create++;
   unsigned previous_id = audio_sfx_context_push((unsigned)id);
   audio_sfx_context_name(name);
   uint64_t t0 = sceKernelGetProcessTimeWide();
@@ -2189,43 +1070,21 @@ static void createstream_churn(const char *name) {
 
 static void *FmodCreateStream_probe(void *self, char *name, void *rw, int c, int d,
                                     int e, int f, int g) {
-  static unsigned n = 0;
-  if (n < 40)
-    log_printf("[snd?] FMod::CreateStream #%u \"%s\" rw=%p (%d,%d,%d,%d,%d)  "
-               "[files open=%d, closes so far=%u]",
-               n, name ? name : "?", rw, c, d, e, f, g, io_open_count(), g_nclose);
-  n++; g_fmod_createstream++;
+  g_fmod_createstream++;
   createstream_churn(name ? name : "?");
   return FmodCreateStream_orig(self, name, rw, c, d, e, f, g);
 }
-/* Does the companion ever give a stream's OBB handle back?
- *
- * log113: open files climb 34 -> 56 as cumulative streams go 3 -> 40 and never
- * fall, then fopen fails and the app wedges. Each CreateStream holds an OBB
- * SDL_RWops. These two probes settle which fix is needed:
- *   CloseStream never fires        -> the game holds streams forever; the lever
- *                                     is stream lifetime (our placeholder length)
- *   CloseStream fires but handles stay -> the companion's OBB path leaks, and
- *                                     streams must not go through it at all
- * Log-only, and each line carries the live handle count so open/close and the
- * handle total can be read off one line. */
 static void *(*FmodCloseStream_orig)(void *, unsigned) = NULL;
 static void *(*FmodReleaseSound_orig)(void *, int) = NULL;
 
 static void *FmodCloseStream_probe(void *self, unsigned h) {
   void *rc = FmodCloseStream_orig(self, h);
   g_nclose++;
-  if (g_nclose < 60 || (g_nclose & 15) == 0)
-    log_printf("[snd?] FMod::CloseStream #%u handle=%u  [files open=%d]",
-               g_nclose, h, io_open_count());
   return rc;
 }
 static void *FmodReleaseSound_probe(void *self, int id) {
   void *rc = FmodReleaseSound_orig(self, id);
   g_nrelease++;
-  if (g_nrelease < 40 || (g_nrelease & 63) == 0)
-    log_printf("[snd?] FMod::ReleaseSound #%u id=%d  [files open=%d]",
-               g_nrelease, id, io_open_count());
   return rc;
 }
 
@@ -2258,12 +1117,10 @@ static void *FmodStopChannel_probe(void *self, unsigned key) {
 }
 
 static void *FmodPlaySound_probe(void *self, int id) {
-  static unsigned n = 0;
   slots_attach(self);
   audio_slots_ensure_free();
   void *rc = FmodPlaySound_orig(self, id);
-  if (n < 40) log_printf("[snd?] FMod::PlaySound #%u id=%d -> %p", n, id, rc);
-  n++; g_fmod_play++; if (!rc) g_fmod_play_null++;
+  g_fmod_play++; if (!rc) g_fmod_play_null++;
   return rc;
 }
 
@@ -2276,12 +1133,8 @@ static void hook_named_port(const char *sym, uintptr_t probe, void **orig,
   *orig = (void *)build_thumb_trampoline(a, thumb_patch_len(a));
   if (!*orig) { log_printf("[snd?] %s trampoline FAILED", tag); return; }
   hook_thumb(a, probe);
-  log_printf("[snd?] %s PROBED: 0x%08x", tag, (unsigned)a);
 }
 
-// Dump the persisted ini so the log records the "Sound Init" value the game is
-// about to read, independent of whatever the ctor probe reports. Read-only --
-// we are still diagnosing, not fixing.
 // Read an ini into `buf` as NUL-terminated text. Returns the byte count, or a
 // negative sceIo error. The file is a few KB of settings, so it is read whole
 // rather than streamed; a longer one is truncated at the buffer, which only
@@ -2581,44 +1434,7 @@ static void offer_mod_menu(void) {
   modset_choose(picked - 1);
 }
 
-static void dump_ini(const char *path) {
-  SceIoStat st;
-  memset(&st, 0, sizeof(st));
-  if (sceIoGetstat(path, &st) < 0) {
-    log_printf("[snd?] ini ABSENT: %s  (=> defaults, sound should be ENABLED)", path);
-    return;
-  }
-  log_printf("[snd?] ini PRESENT: %s size=%lld", path, (long long)st.st_size);
-  char buf[2049];
-  int n = slurp_ini(path, buf, sizeof(buf));
-  if (n <= 0) { log_printf("[snd?]   read failed/empty: %d", n); return; }
-  // Line-by-line so the log stays readable and CRLF does not wreck it.
-  char *p = buf;
-  while (*p) {
-    char *e = p;
-    while (*e && *e != '\n' && *e != '\r') e++;
-    char save = *e;
-    *e = '\0';
-    if (*p) log_printf("[snd?]   | %s", p);
-    *e = save;
-    while (*e == '\n' || *e == '\r') e++;
-    p = e;
-  }
-}
-
 static void install_sound_probe(void) {
-  for (int i = 0; i < INI_PATH_COUNT; i++) dump_ini(kIniPaths[i]);
-  // The one global that can suppress all of sound. GameInit is its only writer,
-  // so read it before (should be .bss 0) and again right after GameInit returns.
-  g_pDisableSound = (int *)so_symbol(&kotor_mod, "g_bDisableSound");
-  log_printf("[snd?] g_bDisableSound @ %p = %d (pre-GameInit)", g_pDisableSound,
-             g_pDisableSound ? *g_pDisableSound : -1);
-  hook_named("_Z8GameInitv", (uintptr_t)&GameInit_probe,
-             (void **)&GameInit_orig, "GameInit");
-  hook_named("_ZN9CExoSoundC1Ehhii", (uintptr_t)&ExoSound_ctor_probe,
-             (void **)&ExoSound_ctor_orig, "CExoSound::CExoSound");
-  hook_named("_ZN17CExoSoundInternal10InitializeEhhii", (uintptr_t)&ExoSoundInit_probe,
-             (void **)&ExoSoundInit_orig, "CExoSoundInternal::Initialize");
   hook_named("_ZN15CExoSoundSourceC1ERK7CResRef", (uintptr_t)&SndSrcCtor_probe,
              (void **)&SndSrcCtor_orig, "CExoSoundSource::CExoSoundSource(CResRef)");
   hook_named("_ZN15CExoSoundSource4PlayEv", (uintptr_t)&SndSrcPlay_probe,
@@ -2647,8 +1463,6 @@ static void install_sound_probe(void) {
 }
 
 static void install_load_probe(void) {
-  g_appmgr_ptr = (void *)so_symbol(&kotor_mod, "g_pAppManager");
-  log_printf("[load] g_pAppManager @ %p", g_appmgr_ptr);
   g_ai_update_time = (volatile float *)so_symbol(&kotor_mod, "g_AIUpdateTime");
   g_display_fps = (volatile float *)so_symbol(&kotor_mod, "displayFPS");
   g_movie_fps = (volatile int *)so_symbol(&kotor_mod, "g_nSetMovieFrameRate");
@@ -2660,72 +1474,14 @@ static void install_load_probe(void) {
 #if DISABLE_ADAPTIVE_RENDER_SKIP
   log_printf("[perf] adaptive render skip override: ON (selected value is logged, then cleared)");
 #endif
-  // Let the JOYBUTTON log line report what libKOTOR did with the press. All
-  // three are plain .bss globals in libKOTOR; a missing one just drops that
-  // figure from the line.
-  sdl_gamepad_probe_init(so_symbol(&kotor_mod, "pressedGamepadButtons"),
-                         so_symbol(&kotor_mod, "pressedGamepadButtonsThisFrame"),
-                         so_symbol(&kotor_mod, "gamepadButtonById"));
-  hook_named("_ZN21CServerExoAppInternal8MainLoopEv",
-             (uintptr_t)&MainLoop_probe, (void **)&MainLoop_orig,
-             "CServerExoAppInternal::MainLoop");
+  // The held-button mask the watchdog reports (a plain .bss global in libKOTOR).
+  sdl_gamepad_probe_init(so_symbol(&kotor_mod, "pressedGamepadButtons"));
   hook_named("_Z10GameUpdatev",
              (uintptr_t)&GameUpdate_probe, (void **)&GameUpdate_orig,
              "GameUpdate");
   hook_named("_Z12UpdateScreenfii",
              (uintptr_t)&UpdateScreen_probe, (void **)&UpdateScreen_orig,
              "UpdateScreen");
-  hook_named("_ZN11CAppManager12CreateServerEi",
-             (uintptr_t)&CreateServer_probe, (void **)&CreateServer_orig,
-             "CAppManager::CreateServer");
-  hook_named("_ZN11CAppManager13DestroyServerEv",
-             (uintptr_t)&DestroyServer_probe, (void **)&DestroyServer_orig,
-             "CAppManager::DestroyServer");
-  hook_named("_ZN10CSWSModule18AddModuleResourcesERK10CExoString",
-             (uintptr_t)&AddModRes_probe, (void **)&AddModRes_orig,
-             "CSWSModule::AddModuleResources");
-  hook_named("_ZN20CExoEncapsulatedFile8OpenFileEv",
-             (uintptr_t)&OpenFile_probe, (void **)&OpenFile_orig,
-             "CExoEncapsulatedFile::OpenFile");
-  hook_named("_ZN16CExoBaseInternal16GetDirectoryListEP13CExoArrayListI10CExoStringERKS1_tiii",
-             (uintptr_t)&GetDirList_probe, (void **)&GetDirList_orig,
-             "CExoBaseInternal::GetDirectoryList");
-  hook_named("_ZN12CExoKeyTable6AddKeyERK7CResReftmi",
-             (uintptr_t)&AddKey_probe, (void **)&AddKey_orig,
-             "CExoKeyTable::AddKey");
-  hook_named("_ZN12CExoKeyTable20AddDirectoryContentsEi",
-             (uintptr_t)&AddDirContents_probe, (void **)&AddDirContents_orig,
-             "CExoKeyTable::AddDirectoryContents");
-  hook_named("_ZN10CExoResMan11GetKeyEntryERK7CResReftPP12CExoKeyTablePP14CKeyTableEntry",
-             (uintptr_t)&GetKeyEntry_probe, (void **)&GetKeyEntry_orig,
-             "CExoResMan::GetKeyEntry");
-  hook_named("_ZN10CExoResMan11AddKeyTableERK10CExoStringmm",
-             (uintptr_t)&AddKeyTable_probe, (void **)&AddKeyTable_orig,
-             "CExoResMan::AddKeyTable");
-  hook_named("_ZN10CExoResMan6DemandEP4CRes",
-             (uintptr_t)&Demand_probe, (void **)&Demand_orig,
-             "CExoResMan::Demand");
-  hook_named("_ZN10CSWSModule20LoadModuleInProgressEii",
-             (uintptr_t)&LoadInProgress_probe, (void **)&LoadInProgress_orig,
-             "CSWSModule::LoadModuleInProgress");
-  hook_named("_ZN8CSWSArea8LoadAreaEi",
-             (uintptr_t)&LoadArea_probe, (void **)&LoadArea_orig,
-             "CSWSArea::LoadArea");
-  hook_named("_ZN12IODispatcher13PreSpawnAsyncEPc",
-             (uintptr_t)&PreSpawnAsync_probe, (void **)&PreSpawnAsync_orig,
-             "IODispatcher::PreSpawnAsync");
-  hook_named("_ZN12IODispatcher13RetreiveAsyncEPv",
-             (uintptr_t)&RetreiveAsync_probe, (void **)&RetreiveAsync_orig,
-             "IODispatcher::RetreiveAsync");
-  hook_named("_ZN10CSWSModule15LoadModuleStartERK10CExoStringi",
-             (uintptr_t)&LoadModuleStart_probe, (void **)&LoadModuleStart_orig,
-             "CSWSModule::LoadModuleStart");
-  hook_named("_ZN10CSWSModule16LoadModuleFinishEv",
-             (uintptr_t)&LoadModuleFinish_probe, (void **)&LoadModuleFinish_orig,
-             "CSWSModule::LoadModuleFinish");
-  hook_named("_Z16LoadScreenUpdateiiii",
-             (uintptr_t)&LoadScreenUpdate_probe, (void **)&LoadScreenUpdate_orig,
-             "LoadScreenUpdate");
 }
 
 static void install_gui_probe(void) {
@@ -2746,126 +1502,6 @@ static void install_gui_probe(void) {
                (void *)setup_slot, (void *)close_slot);
   }
 
-  uintptr_t db = so_symbol(&kotor_mod, "_Z18AurResGetDataBytesmPv");
-  if (db) {
-    ResDataBytes_orig = (void *(*)(unsigned long, void *))build_thumb_trampoline(db, thumb_patch_len(db));
-    if (ResDataBytes_orig) {
-      hook_thumb(db, (uintptr_t)&ResDataBytes_probe);
-      log_printf("[model] AurResGetDataBytes PROBED: 0x%08x", (unsigned)db);
-    }
-  } else {
-    log_printf("[model] AurResGetDataBytes symbol missing");
-  }
-
-  uintptr_t rs = so_symbol(&kotor_mod, "_ZN12IODispatcher8ReadSyncEPc");
-  if (rs) {
-    ReadSync_orig = (void *(*)(void *, char *))build_thumb_trampoline(rs, thumb_patch_len(rs));
-    if (ReadSync_orig) {
-      hook_thumb(rs, (uintptr_t)&ReadSync_probe);
-      log_printf("[model] IODispatcher::ReadSync(char*) PROBED: 0x%08x", (unsigned)rs);
-    }
-  } else {
-    log_printf("[model] IODispatcher::ReadSync(char*) symbol missing");
-  }
-
-  g_models_read = (const volatile int32_t *)so_symbol(&kotor_mod, "g_nModelsRead");
-  log_printf("[model] g_nModelsRead @ %p", (void *)g_models_read);
-
-  uintptr_t lm = so_symbol(&kotor_mod, "_ZN12CSWCAnimBase9LoadModelERK7CResRefh");
-  if (lm) {
-    LoadModel_orig = (void *(*)(void *, const void *, unsigned))
-                         build_thumb_trampoline(lm, thumb_patch_len(lm));
-    if (LoadModel_orig) {
-      hook_thumb(lm, (uintptr_t)&LoadModel_probe);
-      log_printf("[model] CSWCAnimBase::LoadModel PROBED: 0x%08x", (unsigned)lm);
-    }
-  } else {
-    log_printf("[model] CSWCAnimBase::LoadModel symbol missing");
-  }
-
-  uintptr_t sx = so_symbol(&kotor_mod, "_ZN12CSWGuiObject24ScaleExtentForResolutionEf");
-  if (sx) {
-    ScaleExt_orig = (void (*)(void *, uint32_t))
-                        build_thumb_trampoline(sx, thumb_patch_len(sx));
-    if (ScaleExt_orig) {
-      hook_thumb(sx, (uintptr_t)&ScaleExt_probe);
-      log_printf("[gui] ScaleExtentForResolution PROBED: 0x%08x", (unsigned)sx);
-    }
-  } else {
-    log_printf("[gui] ScaleExtentForResolution symbol missing");
-  }
-
-  uintptr_t xl = so_symbol(&kotor_mod, "_ZN12CSWGuiExtent4LoadEP7CResGFFR10CResStruct");
-  if (xl) {
-    ExtLoad_orig = (int (*)(void *, void *, void *))build_thumb_trampoline(xl, thumb_patch_len(xl));
-    if (ExtLoad_orig) {
-      hook_thumb(xl, (uintptr_t)&ExtLoad_probe);
-      log_printf("[gui] CSWGuiExtent::Load PROBED: 0x%08x", (unsigned)xl);
-    }
-  } else {
-    log_printf("[gui] CSWGuiExtent::Load symbol missing");
-  }
-
-  uintptr_t u = so_symbol(&kotor_mod, "_ZN12CAurGUIImage21cm_nGUIBufferSizeUsedE");
-  g_gui_buf_used = (const volatile int32_t *)u;
-  log_printf("[gui] cm_nGUIBufferSizeUsed @ 0x%08x", (unsigned)u);
-
-  g_scr_w   = (const volatile int32_t *)so_symbol(&kotor_mod, "g_nScreenWidth");
-  g_scr_h   = (const volatile int32_t *)so_symbol(&kotor_mod, "g_nScreenHeight");
-  g_scr_wp2 = (const volatile int32_t *)so_symbol(&kotor_mod, "_ZN8GLRender19cm_nScreenWidthPow2E");
-  g_scr_hp2 = (const volatile int32_t *)so_symbol(&kotor_mod, "_ZN8GLRender20cm_nScreenHeightPow2E");
-  log_printf("[gui] screen globals @ w=%p h=%p wp2=%p hp2=%p",
-             (void *)g_scr_w, (void *)g_scr_h, (void *)g_scr_wp2, (void *)g_scr_hp2);
-
-  uintptr_t ini = so_symbol(&kotor_mod, "_ZN11CSWGuiImage10InitializeERK12CSWGuiExtentRK17CSWGuiImageParams");
-  if (ini) {
-    ImgInit_orig = (void (*)(void *, const void *, const void *))
-                       build_thumb_trampoline(ini, thumb_patch_len(ini));
-    if (ImgInit_orig) {
-      hook_thumb(ini, (uintptr_t)&ImgInit_probe);
-      log_printf("[gui] CSWGuiImage::Initialize PROBED: 0x%08x", (unsigned)ini);
-    }
-  } else {
-    log_printf("[gui] CSWGuiImage::Initialize symbol missing");
-  }
-
-  uintptr_t se = so_symbol(&kotor_mod, "_ZN11CSWGuiImage9SetExtentERK12CSWGuiExtent");
-  if (se) {
-    size_t se_len = thumb_patch_len(se);
-    SetExtent_orig = (void (*)(void *, const void *))build_thumb_trampoline(se, se_len);
-    if (SetExtent_orig) {
-      hook_thumb(se, (uintptr_t)&SetExtent_probe);
-      // patchLen MUST be sampled before hook_thumb -- re-reading it afterwards
-      // walks the patched NOP+LDR and reports 10 instead of the 12 actually used
-      // (log56 showed exactly that; it was a logging artifact, not a bug).
-      log_printf("[gui] CSWGuiImage::SetExtent PROBED: 0x%08x patchLen=%u (text_base=0x%08x)",
-                 (unsigned)se, (unsigned)se_len, (unsigned)kotor_mod.text_base);
-    }
-  } else {
-    log_printf("[gui] CSWGuiImage::SetExtent symbol missing");
-  }
-
-  uintptr_t d = so_symbol(&kotor_mod, "_ZN11CSWGuiImage4DrawEf");
-  if (d) {
-    SWImgDraw_orig = (void (*)(void *, uint32_t))build_thumb_trampoline(d, thumb_patch_len(d));
-    if (SWImgDraw_orig) {
-      hook_thumb(d, (uintptr_t)&SWImgDraw_probe);
-      log_printf("[gui] CSWGuiImage::Draw(float) PROBED: 0x%08x", (unsigned)d);
-    }
-  } else {
-    log_printf("[gui] CSWGuiImage::Draw(float) symbol missing");
-  }
-
-  uintptr_t f = so_symbol(&kotor_mod, "_ZN12CAurGUIImage11FlushBufferEf");
-  if (f) {
-    FlushBuf_orig = (void (*)(void *, uint32_t))build_thumb_trampoline(f, thumb_patch_len(f));
-    if (FlushBuf_orig) {
-      hook_thumb(f, (uintptr_t)&FlushBuf_probe);
-      log_printf("[gui] CAurGUIImage::FlushBuffer(float) PROBED: 0x%08x", (unsigned)f);
-    }
-  } else {
-    log_printf("[gui] CAurGUIImage::FlushBuffer(float) symbol missing");
-  }
 }
 
 static void install_font_probe(void) {
@@ -3060,7 +1696,7 @@ int main(int argc, char *argv[]) {
   install_font_probe();
   install_gui_probe();
   install_lzma_probe();
-  install_head_probe();
+  install_model_timers();
   install_load_probe();
   gameprof_install();
   ini_write_install();

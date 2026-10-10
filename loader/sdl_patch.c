@@ -201,8 +201,6 @@ static unsigned g_evt_used = 0, g_evt_total = 0;
 /* Set by sdl_gamepad_probe_init from main, once libKOTOR is resolved. Volatile:
  * the game writes these from its own event loop and we only ever read them. */
 static const volatile uint32_t *g_pad_pressed = NULL;
-static const volatile uint32_t *g_pad_this_frame = NULL;
-static const volatile uint32_t *g_pad_map = NULL;   // __tree: begin@0 root@4 size@8
 
 /* The button mask, sampled on a schedule rather than only when a button moves.
  * A press latches a bit and the matching release clears it; if a release is ever
@@ -215,12 +213,8 @@ unsigned sdl_gamepad_mask(void) {
   return g_pad_pressed ? (unsigned)*g_pad_pressed : 0u;
 }
 
-void sdl_gamepad_probe_init(uintptr_t pressed, uintptr_t this_frame, uintptr_t map) {
-  g_pad_pressed    = (const volatile uint32_t *)pressed;
-  g_pad_this_frame = (const volatile uint32_t *)this_frame;
-  g_pad_map        = (const volatile uint32_t *)map;
-  log_printf("[input] gamepad probe: pressed=%p thisFrame=%p map=%p",
-             (void *)pressed, (void *)this_frame, (void *)map);
+void sdl_gamepad_probe_init(uintptr_t pressed) {
+  g_pad_pressed = (const volatile uint32_t *)pressed;
 }
 
 /* Per-axis JOYAXISMOTION stats for the current census window: count, big jumps
@@ -255,28 +249,8 @@ static void log_event(const char *via, const SDL_Event *e) {
   }
   if (i < EVT_SLOTS) g_evt[i].n++;
 
-  // The game's first static constructor prepopulates gamepadButtonById for
-  // Android SDL's normalized A/B/X/Y, shoulder and D-pad indices. Vita SDL uses
-  // the same event shape with a different button ordering; normalize_joy_event()
-  // translates that boundary before the game sees it.
-  // Budgeted -- this is a bring-up probe, not steady-state logging.
-  // The budget keeps going blind before the interesting part: 120 was spent on
-  // menu mashing in log145, and 400 ran out at t=2965 in log149 -- minutes before
-  // input died. At 0.27 ms a line this is noise next to the GL trace, so raise it
-  // far enough that a whole session fits.
-  static unsigned btn_n = 0, hat_n = 0;
-  if ((t == SDL_JOYBUTTONDOWN || t == SDL_JOYBUTTONUP) && btn_n < 4000) {
-    btn_n++;
-    // This is sampled before the game handles the returned event, so the mask
-    // reflects the previous event. The next line confirms that a translated
-    // DOWN set the expected bit and its matching UP cleared it.
-    log_printf("[input] JOYBUTTON%s which=%d button=%u  pressed=0x%x thisFrame=0x%x mapSize=%u  [#%u]",
-               t == SDL_JOYBUTTONDOWN ? "DOWN" : "UP",
-               (int)e->jbutton.which, (unsigned)e->jbutton.button,
-               g_pad_pressed ? (unsigned)*g_pad_pressed : 0u,
-               g_pad_this_frame ? (unsigned)*g_pad_this_frame : 0u,
-               g_pad_map ? (unsigned)g_pad_map[2] : 0u, btn_n);
-  } else if (t == SDL_JOYHATMOTION && hat_n < 40) {
+  static unsigned hat_n = 0;
+  if (t == SDL_JOYHATMOTION && hat_n < 40) {
     hat_n++;
     log_printf("[input] JOYHAT which=%d hat=%u value=0x%x  [#%u]",
                (int)e->jhat.which, (unsigned)e->jhat.hat,
