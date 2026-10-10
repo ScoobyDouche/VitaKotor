@@ -32,6 +32,7 @@
 #include "fs_patch.h"
 #include "log.h"
 #include "gameprof.h"
+#include "sdl_patch.h"
 #include "heap.h"
 #include "main.h"
 #include "config.h"
@@ -470,6 +471,7 @@ void io_obb_mount_done(void) {
 static FILE *fopen_diag_body(const char *path, const char *mode);
 static FILE *fopen_diag(const char *path, const char *mode) {
   uint64_t t0 = sceKernelGetProcessTimeWide();
+  if (mode && (mode[0] != 'r' || strchr(mode, '+'))) sdl_ini_cache_forget(path);
   FILE *f = fopen_diag_body(path, mode);
   gameprof_io_note(f ? "fopen" : "fopMISS", path, sceKernelGetProcessTimeWide() - t0);
   return f;

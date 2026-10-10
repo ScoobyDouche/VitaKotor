@@ -730,6 +730,61 @@ unsigned g_rwopen_frame_n;
 
 static SDL_RWops *SDL_RWFromFile_body(const char *fname, const char *mode, int *card_missed);
 
+/* swkotor.ini held in RAM. log240/241: one L/R onto the equip tab opens the
+ * ini 55 times in a frame, ~9 ms a card open plus the reads under it -- the
+ * whole ~1.1 s freeze. Serve read opens from one copy; any write open of it
+ * (here, fopen, unlink, rename) drops the copy so the next read sees the card. */
+static char *g_ini_buf;
+static unsigned g_ini_len, g_ini_served;
+
+static int is_game_ini(const char *fname) {
+  if (!fname) return 0;
+  const char *a = strrchr(fname, '/'), *b = strrchr(fname, '\\');
+  const char *base = a > b ? a + 1 : b ? b + 1 : fname;
+  return strcasecmp(base, "swkotor.ini") == 0;
+}
+
+void sdl_ini_cache_forget(const char *path) {
+  if (path && !is_game_ini(path)) return;
+  miss_lock();
+  free(g_ini_buf);
+  g_ini_buf = NULL;
+  g_ini_len = 0;
+  miss_unlock();
+}
+
+static SDL_RWops *ini_from_cache(void) {
+  miss_lock();
+  char *copy = g_ini_buf ? (char *)malloc(g_ini_len ? g_ini_len : 1) : NULL;
+  if (copy) memcpy(copy, g_ini_buf, g_ini_len);
+  unsigned len = g_ini_len;
+  miss_unlock();
+  if (!copy) return NULL;
+  SDL_RWops *mrw = SDL_RWFromConstMem(copy, (int)len);
+  if (!mrw) { free(copy); return NULL; }
+  mrw->size  = memtlk_size;
+  mrw->close = memtlk_close;      /* frees the copy */
+  if (++g_ini_served == 1 || (g_ini_served & 255) == 0)
+    log_printf("[SDL] swkotor.ini served from RAM (%u bytes), %u times so far", len, g_ini_served);
+  return mrw;
+}
+
+static SDL_RWops *ini_open(const char *fname, const char *mode) {
+  SDL_RWops *rw = ini_from_cache();
+  if (rw) return rw;
+  rw = SDL_RWFromFile_body(fname, mode, NULL);
+  if (!rw) return NULL;
+  unsigned int len = 0;
+  void *buf = sdl_slurp_rwops_close(rw, &len);   /* closes rw either way */
+  if (!buf) return SDL_RWFromFile_body(fname, mode, NULL);
+  miss_lock();
+  free(g_ini_buf);
+  g_ini_buf = (char *)buf;
+  g_ini_len = len;
+  miss_unlock();
+  return ini_from_cache();
+}
+
 static SDL_RWops *SDL_RWFromFile_hook(const char *fname, const char *mode) {
   uint64_t t0 = sceKernelGetProcessTimeWide();
   if (g_miss_mtx < 0) g_miss_mtx = sceKernelCreateMutex("kotor_rwmiss", 0, 0, NULL);
@@ -749,6 +804,13 @@ static SDL_RWops *SDL_RWFromFile_hook(const char *fname, const char *mode) {
     miss_unlock();
   }
   SDL_RWops *rw = NULL;
+  if (is_game_ini(fname)) {
+    if (reading) {
+      rw = ini_open(fname, mode);
+      goto done;
+    }
+    sdl_ini_cache_forget(fname);               /* falls through to a real open */
+  }
   if (reading && cacheable) {
     miss_lock();
     int nowhere = miss_has(g_all_miss, h);
