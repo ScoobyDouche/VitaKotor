@@ -67,6 +67,3 @@ void sdl_perf_snapshot(sdl_perf_t *out);
 extern uint64_t g_rwopen_frame_us;
 extern unsigned g_rwopen_frame_n;
 void sdl_miss_cache_report(void);
-/* Drop the in-RAM swkotor.ini if `path` is it (NULL: drop it regardless).
- * Call before anything that may write, remove or rename the file. */
-void sdl_ini_cache_forget(const char *path);

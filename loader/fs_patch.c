@@ -27,7 +27,6 @@
 #include "so_util.h"
 #include "log.h"
 #include "gameprof.h"
-#include "sdl_patch.h"
 #include "modset.h"
 
 #define ASSET_PATH DATA_PATH "/assets"
@@ -290,7 +289,6 @@ static int fs_closedir(DIR *d) {
   return r;
 }
 static int fs_unlink(const char *path) {
-  sdl_ini_cache_forget(path);
   char t[512];
   fs_translate(path, t, sizeof(t));
   return unlink(t);
@@ -306,8 +304,6 @@ static int fs_rmdir(const char *path) {
   return rmdir(t);
 }
 static int fs_rename(const char *a, const char *b) {
-  sdl_ini_cache_forget(a);
-  sdl_ini_cache_forget(b);
   char ta[512], tb[512];
   fs_translate(a, ta, sizeof(ta));
   fs_translate(b, tb, sizeof(tb));
