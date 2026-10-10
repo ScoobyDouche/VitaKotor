@@ -10,6 +10,7 @@
 #include "so_util.h"
 #include "log.h"
 #include "gameprof.h"
+#include "sdl_patch.h"
 
 #if GAME_PROF
 
@@ -342,6 +343,12 @@ void gameprof_hitch_blame(void) {
                   (unsigned)(g_prof_tex_frame_us / 1000u), g_prof_tex_frame_n);
     shown++;
   }
+  /* file opens through our SDL_RWFromFile hook: card, OBB search, misses */
+  if (g_rwopen_frame_us >= 2000 && o < (int)sizeof b - 32) {
+    o += snprintf(b + o, sizeof b - o, " fileOpen=%u(%u calls)",
+                  (unsigned)(g_rwopen_frame_us / 1000u), g_rwopen_frame_n);
+    shown++;
+  }
   if (shown) log_printf("%s ms", b);
   else log_printf("[hitch]   in: none of the timed functions (outside them all)");
 }
@@ -350,6 +357,8 @@ void gameprof_frame_reset(void) {
   for (unsigned i = 0; i < HOOK_N; i++) g_hook[i].frame_us = 0;
   g_prof_tex_frame_us = 0;
   g_prof_tex_frame_n = 0;
+  g_rwopen_frame_us = 0;
+  g_rwopen_frame_n = 0;
 }
 
 #else

@@ -61,3 +61,9 @@ typedef struct {
 void sdl_perf_snapshot(sdl_perf_t *out);
 
 #endif
+
+/* SDL_RWFromFile hook: time and calls this frame (hitch blame), and the miss
+ * cache's running totals (one line when they change). */
+extern uint64_t g_rwopen_frame_us;
+extern unsigned g_rwopen_frame_n;
+void sdl_miss_cache_report(void);

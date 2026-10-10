@@ -654,7 +654,127 @@ static void big_write_buffer(SDL_RWops *rw, const char *name) {
   }
 }
 
+/* Miss cache. log239: every GUI texture the game loads opens its texture pack
+ * by name, trying texturepacks/swpc_tex_gui.ezf first -- which exists nowhere,
+ * so each try paid a card open plus a case-insensitive (linear, ~16k entries)
+ * name search of both OBBs -- along with <name>.txi and override/<name>.tga
+ * on the card. Inventory icons cost ~3 ms apiece that way. The card's game
+ * data does not change while we run, so remember paths that are not on the
+ * card, and paths that are nowhere at all. What the game writes (saves,
+ * currentgame, the ini) is never remembered, and any write open forgets its
+ * path. */
+#define MISS_SLOTS 8192                    /* power of two */
+static uint64_t g_card_miss[MISS_SLOTS];  /* 0 = empty, 1 = forgotten */
+static uint64_t g_all_miss[MISS_SLOTS];
+static SceUID g_miss_mtx = -1;
+static unsigned g_miss_saved_card, g_miss_saved_all;
+
+static uint64_t path_hash(const char *p) {
+  uint64_t h = 1469598103934665603ull;
+  for (; *p; p++) {
+    unsigned char c = (unsigned char)*p;
+    if (c >= 'A' && c <= 'Z') c += 32;
+    if (c == '\\') c = '/';
+    h = (h ^ c) * 1099511628211ull;
+  }
+  return h < 2 ? h + 2 : h;
+}
+
+static int miss_cacheable(const char *t) {
+  static const char *const never[] = { "currentgame", "saves", "save", ".ini", ".sav",
+                                       ".res", ".nfo", ".txt", ".log" };
+  for (unsigned i = 0; i < sizeof never / sizeof never[0]; i++)
+    if (strcasestr(t, never[i])) return 0;
+  return 1;
+}
+
+static void miss_lock(void)   { if (g_miss_mtx >= 0) sceKernelLockMutex(g_miss_mtx, 1, NULL); }
+static void miss_unlock(void) { if (g_miss_mtx >= 0) sceKernelUnlockMutex(g_miss_mtx, 1); }
+
+static int miss_has(const uint64_t *set, uint64_t h) {
+  for (unsigned i = (unsigned)h & (MISS_SLOTS - 1), n = 0; n < MISS_SLOTS;
+       i = (i + 1) & (MISS_SLOTS - 1), n++) {
+    if (set[i] == h) return 1;
+    if (set[i] == 0) return 0;
+  }
+  return 0;
+}
+
+static void miss_add(uint64_t *set, uint64_t h) {
+  for (unsigned i = (unsigned)h & (MISS_SLOTS - 1), n = 0; n < MISS_SLOTS / 2;
+       i = (i + 1) & (MISS_SLOTS - 1), n++) {
+    if (set[i] == h) return;
+    if (set[i] < 2) { set[i] = h; return; }
+  }
+}
+
+static void miss_forget(uint64_t *set, uint64_t h) {
+  for (unsigned i = (unsigned)h & (MISS_SLOTS - 1), n = 0; n < MISS_SLOTS;
+       i = (i + 1) & (MISS_SLOTS - 1), n++) {
+    if (set[i] == h) { set[i] = 1; return; }
+    if (set[i] == 0) return;
+  }
+}
+
+void sdl_miss_cache_report(void) {
+  static unsigned last_c, last_a;
+  if (g_miss_saved_card == last_c && g_miss_saved_all == last_a) return;
+  last_c = g_miss_saved_card; last_a = g_miss_saved_all;
+  log_printf("[SDL] miss cache: %u card lookups skipped, %u opens answered "
+             "\"nowhere\" without searching", g_miss_saved_card, g_miss_saved_all);
+}
+
+uint64_t g_rwopen_frame_us;
+unsigned g_rwopen_frame_n;
+
+static SDL_RWops *SDL_RWFromFile_body(const char *fname, const char *mode, int *card_missed);
+
 static SDL_RWops *SDL_RWFromFile_hook(const char *fname, const char *mode) {
+  uint64_t t0 = sceKernelGetProcessTimeWide();
+  if (g_miss_mtx < 0) g_miss_mtx = sceKernelCreateMutex("kotor_rwmiss", 0, 0, NULL);
+  int reading = fname && mode && mode[0] == 'r' && !strchr(mode, '+');
+  char t[512];
+  uint64_t h = 0;
+  int cacheable = 0;
+  if (fname) {
+    fs_translate(fname, t, sizeof(t));
+    h = path_hash(t);
+    cacheable = miss_cacheable(t);
+  }
+  if (fname && !reading) {                     /* a write may create it */
+    miss_lock();
+    miss_forget(g_card_miss, h);
+    miss_forget(g_all_miss, h);
+    miss_unlock();
+  }
+  SDL_RWops *rw = NULL;
+  if (reading && cacheable) {
+    miss_lock();
+    int nowhere = miss_has(g_all_miss, h);
+    miss_unlock();
+    if (nowhere) {
+      g_miss_saved_all++;
+      goto done;
+    }
+  }
+  int card_missed = 0;
+  rw = SDL_RWFromFile_body(fname, mode, reading && cacheable ? &card_missed : NULL);
+  if (reading && cacheable) {
+    miss_lock();
+    if (card_missed) miss_add(g_card_miss, h);
+    if (!rw) miss_add(g_all_miss, h);
+    miss_unlock();
+  }
+done:
+  g_rwopen_frame_us += sceKernelGetProcessTimeWide() - t0;
+  g_rwopen_frame_n++;
+  return rw;
+}
+
+/* card_missed: NULL, or where to report that the card open was tried and failed.
+ * Non-NULL also means the card open may be skipped when the cache already
+ * knows the path is not there. */
+static SDL_RWops *SDL_RWFromFile_body(const char *fname, const char *mode, int *card_missed) {
   // Read-only opens for VPK-bundled assets: prefer our bundled copy.
   if (fname && mode && (mode[0] == 'r')) {
     const char *slash = strrchr(fname, '/');
@@ -694,7 +814,18 @@ static SDL_RWops *SDL_RWFromFile_hook(const char *fname, const char *mode) {
 
   char t[512];
   fs_translate(fname, t, sizeof(t));
-  SDL_RWops *rw = SDL_RWFromFile(t, mode);
+  SDL_RWops *rw = NULL;
+  int skip_card = 0;
+  if (card_missed) {
+    miss_lock();
+    skip_card = miss_has(g_card_miss, path_hash(t));
+    miss_unlock();
+    if (skip_card) g_miss_saved_card++;
+  }
+  if (!skip_card) {
+    rw = SDL_RWFromFile(t, mode);
+    if (!rw && card_missed) *card_missed = 1;
+  }
   if (rw && mode && mode[0] == 'r' && is_tlk_name(t))
     rw = tlk_into_memory(rw, t);
   // Plain "w"/"wb" only: anything that may read back ("w+", "r+", "a") stays direct.
