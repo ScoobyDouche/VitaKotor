@@ -13,15 +13,23 @@
  * and answer a write of that same value with the 1 a successful write returns,
  * without touching the card. Any other value is written and remembered, so a
  * setting changed and changed back is written both times.
+ *
+ * log248: the first equip-tab visit after boot still wrote all 54, because
+ * nothing had been remembered yet. So a setting this session has not written
+ * is checked against swkotor.ini as it stood at the first write, read once.
+ * Once a setting has been written, only the remembered value counts.
  */
 #include <vitasdk.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 #include "config.h"
 #include "main.h"
 #include "so_util.h"
 #include "log.h"
+#include "ini.h"
 #include "ini_write.h"
 
 typedef int (*write_fn)(void *self, void *a, void *b, void *c, void *d);
@@ -47,15 +55,47 @@ static const char *str_of(void *exo) {
   return s ? s : "";
 }
 
+/* swkotor.ini as it was on the card at the first write; "" if unreadable. */
+static char *g_card_ini;
+
+static void load_card_ini(void) {
+  if (g_card_ini) return;
+  static char empty[1];
+  g_card_ini = empty;
+  SceUID fd = sceIoOpen(DATA_PATH "/swkotor.ini", SCE_O_RDONLY, 0);
+  if (fd < 0) return;
+  SceOff size = sceIoLseek(fd, 0, SCE_SEEK_END);
+  sceIoLseek(fd, 0, SCE_SEEK_SET);
+  char *buf = (size > 0 && size < 256 * 1024) ? malloc((size_t)size + 1) : NULL;
+  int n = buf ? sceIoRead(fd, buf, (unsigned)size) : -1;
+  sceIoClose(fd);
+  if (n < 0) { free(buf); return; }
+  buf[n] = '\0';
+  g_card_ini = buf;
+}
+
+/* Does the card's swkotor.ini already hold exactly this value? */
+static int card_has(void *val, void *file, void *section, void *key) {
+  if (strcasecmp(str_of(file), "swkotor.ini") != 0) return 0;
+  load_card_ini();
+  char cur[128];
+  if (!ini_get(g_card_ini, str_of(section), str_of(key), cur, sizeof cur)) return 0;
+  return strcmp(cur, str_of(val)) == 0;
+}
+
 static int WriteIniEntry_hook(void *self, void *a, void *b, void *c, void *d) {
   /* t[0] value, t[1..3] file, section, key */
   uint64_t t[4] = { str_hash(a), str_hash(b), str_hash(c), str_hash(d) };
   if (g_mtx >= 0) sceKernelLockMutex(g_mtx, 1, NULL);
   g_calls++;
-  int hit = -1;
-  for (int i = 0; i < MEMO_N && hit < 0; i++)
-    if (g_memo_used[i] && !memcmp(g_memo[i], t, sizeof t)) hit = i;
-  if (hit >= 0) {
+  int hit = 0, known = 0;
+  for (int i = 0; i < MEMO_N && !hit; i++) {
+    if (!g_memo_used[i] || memcmp(&g_memo[i][1], &t[1], 3 * sizeof t[0])) continue;
+    known = 1;
+    hit = g_memo[i][0] == t[0];
+  }
+  if (!known) hit = card_has(a, b, c, d);
+  if (hit) {
     g_skipped++;
     if (g_mtx >= 0) sceKernelUnlockMutex(g_mtx, 1);
     if (g_skipped <= 8 || (g_skipped & 255) == 0)
