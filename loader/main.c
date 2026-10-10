@@ -130,6 +130,58 @@ static uint64_t g_thread_last_run[GAME_THREADS_MAX];
 /* Defined with the sound probes further down; the watchdog is its clock. */
 static void sound_pipeline_census(void);
 
+/* Hitch sampler. log239: L/R onto the equip tab freezes ~1.1 s inside
+ * CSWGuiManager::HandleInputEvent, and the one watchdog sample that landed in
+ * a freeze found the game thread WAITING (waitType 0x10), not running. The
+ * watchdog ticks every 3 s; this looks every 50 ms and, once a frame has run
+ * 250 ms, logs what the game thread is doing and the name of what it waits
+ * on, so the log says whose object holds it. */
+static void wait_object_name(unsigned type, SceUID id, char *out, size_t n) {
+  out[0] = 0;
+  if (type == 0x10) {
+    SceKernelEventFlagInfo i; memset(&i, 0, sizeof i); i.size = sizeof i;
+    if (sceKernelGetEventFlagInfo(id, &i) >= 0) snprintf(out, n, "eventflag \"%.31s\"", i.name);
+  } else if (type == 0x20) {
+    SceKernelSemaInfo i; memset(&i, 0, sizeof i); i.size = sizeof i;
+    if (sceKernelGetSemaInfo(id, &i) >= 0) snprintf(out, n, "sema \"%.31s\"", i.name);
+  } else if (type == 0x40) {
+    SceKernelMutexInfo i; memset(&i, 0, sizeof i); i.size = sizeof i;
+    if (sceKernelGetMutexInfo(id, &i) >= 0) snprintf(out, n, "mutex \"%.31s\"", i.name);
+  }
+  if (!out[0]) snprintf(out, n, "type 0x%x id 0x%x (no name)", type, (unsigned)id);
+}
+
+static void *hitch_sampler_thread(void *arg) {
+  (void)arg;
+  thread_pin_self(CPU_AUX_B, "hitch-sampler");
+  int budget = 600;                       /* lines, whole session */
+  uint64_t seen_swap = 0;
+  int n_this = 0;
+  for (;;) {
+    sceKernelDelayThread(50 * 1000);
+    SceUID thid = g_game_thid;
+    uint64_t swap = g_last_swap_end_us;
+    if (thid < 0 || !swap || budget <= 0) continue;
+    if (swap != seen_swap) { seen_swap = swap; n_this = 0; }
+    uint64_t late = sceKernelGetProcessTimeWide() - swap;
+    if (late < 250000 || n_this >= 12) continue;
+    SceKernelThreadInfo ti;
+    memset(&ti, 0, sizeof ti);
+    ti.size = sizeof ti;
+    if (sceKernelGetThreadInfo(thid, &ti) < 0) continue;
+    char what[64] = "";
+    if (ti.status != SCE_THREAD_RUNNING && ti.status != SCE_THREAD_READY)
+      wait_object_name((unsigned)ti.waitType, ti.waitId, what, sizeof what);
+    log_printf("[hitchsample] +%u ms: %s%s%s", (unsigned)(late / 1000u),
+               ti.status == SCE_THREAD_RUNNING ? "running" :
+               ti.status == SCE_THREAD_READY ? "ready (not scheduled)" : "WAITING",
+               what[0] ? " on " : "", what);
+    n_this++;
+    budget--;
+  }
+  return NULL;
+}
+
 static void *watchdog_thread(void *arg) {
   (void)arg;
   uint64_t last_run = 0;
@@ -3038,6 +3090,8 @@ int main(int argc, char *argv[]) {
   // Watchdog first, so it's sampling before/at the moment the game thread hangs.
   pthread_t wd_thread;
   pthread_create(&wd_thread, NULL, watchdog_thread, NULL);
+  pthread_t hs_thread;
+  pthread_create(&hs_thread, NULL, hitch_sampler_thread, NULL);
 
   log_printf(">>> starting game entry SDL_main on dedicated thread");
   pthread_t game_thread;
