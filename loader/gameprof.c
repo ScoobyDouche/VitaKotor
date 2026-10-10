@@ -58,6 +58,7 @@ typedef struct {
   fn6_t orig;
   unsigned depth, calls;
   uint64_t us;
+  uint64_t frame_us;     /* this frame only, for the per-hitch blame line */
 } hook_t;
 
 static hook_t g_hook[] = {
@@ -109,6 +110,34 @@ static hook_t g_hook[] = {
   { "_ZN11CSWCMessage37HandleServerToPlayerUpdate_PlayerInfoEv",           "updPlayer"},
   { "_ZN11CSWCMessage39HandleServerToPlayerUpdate_GuiInventoryEv",         "updInv"   },
   { "_ZN11CSWCMessage39HandleServerToPlayerUpdateVisualEffectsEP10CSWCObject", "updVfx" },
+  /* log237: every L/R tab switch in the in-game menu freezes ~1.1 s with no
+   * card read, no model built and no texture upload, and Cross on the equip
+   * screen ~1.5 s. These are the menu's entry points; the hitch blame line
+   * says which of them the time was in. Prologues checked against the
+   * disassembly; SetActiveControlID, Equip::SetActiveSlot, AttachModel,
+   * Options::OnPanelAdded, GuiManager::AddPanel/RemovePanel and
+   * 3DSceneView::Draw branch or read pc in the patched bytes and are left out. */
+  { "_ZN16CSWGuiInGameMenu14OnShoulderLeftEP13CSWGuiControl",  "menuL"        },
+  { "_ZN16CSWGuiInGameMenu15OnShoulderRightEP13CSWGuiControl", "menuR"        },
+  { "_ZN17CSWGuiInGameEquip12OnPanelAddedEv",                  "equipAdd"     },
+  { "_ZN17CSWGuiInGameEquip14OnPanelRemovedEv",                "equipRemove"  },
+  { "_ZN17CSWGuiInGameEquip12SetCharacterEP12CSWCCreature",    "equipSetChar" },
+  { "_ZN17CSWGuiInGameEquip15UpdateInventoryEv",               "equipInv"     },
+  { "_ZN17CSWGuiInGameEquip11OnEnterSlotEP13CSWGuiControl",    "equipEnter"   },
+  { "_ZN17CSWGuiInGameEquip14OnItemSelectedEP13CSWGuiControl", "equipItemSel" },
+  { "_ZN17CSWGuiInGameEquip9EquipItemEP8CSWSItemii",           "equipItem"    },
+  { "_ZN17CSWGuiInGameEquip11UnequipItemEmi",                  "unequipItem"  },
+  { "_ZN17CSWGuiInGameEquip6UpdateEf",                         "equipUpdate"  },
+  { "_ZN21CSWGuiInGameCharacter12OnPanelAddedEv",              "charAdd"      },
+  { "_ZN21CSWGuiInGameCharacter14OnPanelRemovedEv",            "charRemove"   },
+  { "_ZN21CSWGuiInGameCharacter8SetStatsEv",                   "charStats"    },
+  { "_ZN21CSWGuiInGameInventory12OnPanelAddedEv",              "invAdd"       },
+  { "_ZN21CSWGuiInGameInventory14OnPanelRemovedEv",            "invRemove"    },
+  { "_ZN21CSWGuiInGameInventory19PopulateItemListBoxEv",       "invPopulate"  },
+  { "_ZN21CSWGuiInGameAbilities12OnPanelAddedEv",              "abiAdd"       },
+  { "_ZN19CSWGuiInGameJournal12OnPanelAddedEv",                "jouAdd"       },
+  { "_ZN15CSWGuiInGameMap12OnPanelAddedEv",                    "mapAdd"       },
+  { "_ZN20CSWGuiInGameMessages12OnPanelAddedEv",               "msgAdd"       },
 };
 #define HOOK_N (sizeof g_hook / sizeof g_hook[0])
 
@@ -123,7 +152,9 @@ static inline uint64_t timed(hook_t *h, uint32_t a, uint32_t b, uint32_t c, uint
   }
   uint64_t t0 = sceKernelGetProcessTimeWide();
   uint64_t r = h->orig(a, b, c, d, e, f);
-  h->us += sceKernelGetProcessTimeWide() - t0;
+  uint64_t dt = sceKernelGetProcessTimeWide() - t0;
+  h->us += dt;
+  h->frame_us += dt;
   h->calls++;
   h->depth--;
   return r;
@@ -134,7 +165,8 @@ static inline uint64_t timed(hook_t *h, uint32_t a, uint32_t b, uint32_t c, uint
   { return timed(&g_hook[i], a, b, c, d, e, f); }
 P(0) P(1) P(2) P(3) P(4) P(5) P(6) P(7) P(8) P(9) P(10) P(11) P(12) P(14) P(15) P(16)
 P(17) P(18) P(19) P(20) P(21) P(22) P(23) P(24) P(25) P(26) P(27) P(28) P(29) P(30) P(31)
-P(32)
+P(32) P(33) P(34) P(35) P(36) P(37) P(38) P(39) P(40) P(41) P(42) P(43) P(44) P(45) P(46)
+P(47) P(48) P(49) P(50) P(51) P(52) P(53)
 #undef P
 
 /* log205: cMsg is 20-25 ms a frame in the cities but object updates are ~6 of
@@ -165,6 +197,9 @@ static fn6_t const g_probe[] = {
   probe_9, probe_10, probe_11, probe_12, probe_cmsg, probe_14, probe_15, probe_16,
   probe_17, probe_18, probe_19, probe_20, probe_21, probe_22, probe_23, probe_24,
   probe_25, probe_26, probe_27, probe_28, probe_29, probe_30, probe_31, probe_32,
+  probe_33, probe_34, probe_35, probe_36, probe_37, probe_38, probe_39, probe_40,
+  probe_41, probe_42, probe_43, probe_44, probe_45, probe_46, probe_47, probe_48,
+  probe_49, probe_50, probe_51, probe_52, probe_53,
 };
 _Static_assert(sizeof g_probe / sizeof g_probe[0] == HOOK_N, "one probe per hook");
 
@@ -253,8 +288,40 @@ void gameprof_window_report(void) {
   g_eng_n = 0;
 }
 
+/* Which timed functions a hitch frame spent its time in: every hook with
+ * 2 ms or more this frame, largest first. Times are inclusive, so a caller
+ * and the callee under it both appear (menuL holds equipAdd, render holds
+ * singlePass). */
+void gameprof_hitch_blame(void) {
+  char b[512];
+  int o = snprintf(b, sizeof b, "[hitch]   in:");
+  unsigned shown = 0;
+  uint8_t done[HOOK_N];
+  memset(done, 0, sizeof done);
+  for (;;) {
+    int best = -1;
+    for (unsigned i = 0; i < HOOK_N; i++)
+      if (!done[i] && g_hook[i].frame_us >= 2000 &&
+          (best < 0 || g_hook[i].frame_us > g_hook[best].frame_us))
+        best = (int)i;
+    if (best < 0 || o > (int)sizeof b - 32) break;
+    done[best] = 1;
+    o += snprintf(b + o, sizeof b - o, " %s=%u", g_hook[best].tag,
+                  (unsigned)(g_hook[best].frame_us / 1000u));
+    shown++;
+  }
+  if (shown) log_printf("%s ms", b);
+  else log_printf("[hitch]   in: none of the timed functions (outside them all)");
+}
+
+void gameprof_frame_reset(void) {
+  for (unsigned i = 0; i < HOOK_N; i++) g_hook[i].frame_us = 0;
+}
+
 #else
 uint64_t g_prof_draw_us;
+void gameprof_hitch_blame(void) {}
+void gameprof_frame_reset(void) {}
 void gameprof_install(void) {}
 void gameprof_after_update(void) {}
 void gameprof_window_report(void) {}

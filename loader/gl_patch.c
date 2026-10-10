@@ -574,6 +574,7 @@ void gl_patch_on_swap(uint64_t swap_begin_us, uint64_t swap_end_us) {
                      (unsigned)((engine.model_us - prev_engine.model_us) / 1000u),
                      engine.model_read_calls - prev_engine.model_read_calls,
                      (unsigned)((engine.model_read_us - prev_engine.model_read_us) / 1000u));
+        gameprof_hitch_blame();
         last_hitch_log = swap_end_us;
         hitch_suppressed = hitch_suppressed_max = 0;
       } else {
@@ -582,6 +583,7 @@ void gl_patch_on_swap(uint64_t swap_begin_us, uint64_t swap_end_us) {
       }
     }
 #endif
+    gameprof_frame_reset();
   }
   prev_swap_end = swap_end_us;
   prev_io = io;

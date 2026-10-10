@@ -24,3 +24,7 @@ void gameprof_install(void);
 /* Call after every GameUpdate: samples the engine's stopwatch globals. */
 void gameprof_after_update(void);
 void gameprof_window_report(void);
+/* On a logged hitch: the timed functions that frame spent its time in. */
+void gameprof_hitch_blame(void);
+/* Every swap, after any hitch line: start the next frame's tally. */
+void gameprof_frame_reset(void);
