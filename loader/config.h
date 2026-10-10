@@ -529,6 +529,12 @@
 // swkotor.ini [Vita Options] FrameLock overrides it.
 #define FRAME_LOCK_FPS 30
 
+// Draw distance cap, in metres; 0 = the area's own fog end. The engine culls
+// at the fog end, which is 500 m in Dantooine's open areas, so distance culls
+// nothing there. Only areas that have fog on are capped. swkotor.ini
+// [Vita Options] DrawDistance overrides it.
+#define DRAW_DISTANCE_M 150
+
 // Upload textures as 16-bit instead of 32-bit.
 //
 // The live-texture census (log161) is emphatic that nothing leaks: 1,014,190 KB

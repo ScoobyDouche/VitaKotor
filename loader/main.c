@@ -823,6 +823,31 @@ static void *NewCAurObject_probe(char *name, char *type, void *rw1, void *rw2) {
 
 static void hook_named(const char *sym, uintptr_t probe, void **orig, const char *tag);
 
+/* Draw distance. The iOS renderer sets the camera's far plane -- which the BSP
+ * room walk and the per-object cull (GobOutside) both test against -- to
+ * IOS_FOG_CLIPDIST, and Scene::DoFog sets that to the area's fog end whenever
+ * fog is on. Dantooine's open areas fog from 25 to 500 m, so nothing is ever
+ * culled for distance there. Pulling the fog end in before DoFog runs moves the
+ * fog and the cull together, so what is dropped has already faded out.
+ * Scene: +96 fog on, +100 fog start, +104 fog end (floats, metres). Areas with
+ * fog off are left alone: forcing fog on would change how they look. */
+static int g_draw_distance = DRAW_DISTANCE_M;   // [Vita Options] DrawDistance
+static void (*DoFog_orig)(void *scene) = NULL;
+
+static void DoFog_probe(void *scene) {
+  int on = *(volatile int *)((char *)scene + 96);
+  volatile float *start = (volatile float *)((char *)scene + 100);
+  volatile float *end = (volatile float *)((char *)scene + 104);
+  if (g_draw_distance > 0 && on && *end > (float)g_draw_distance) {
+    float cap = (float)g_draw_distance;
+    log_printf("[perf] draw distance: fog %.0f-%.0f m -> %.0f-%.0f m",
+               *start, *end, *start < cap * 0.5f ? *start : cap * 0.5f, cap);
+    if (*start > cap * 0.5f) *start = cap * 0.5f;
+    *end = cap;
+  }
+  DoFog_orig(scene);
+}
+
 static void install_model_timers(void) {
   hook_named("_Z13NewCAurObjectPcS_P9SDL_RWopsS1_", (uintptr_t)&NewCAurObject_probe,
              (void **)&NewCAurObject_orig, "NewCAurObject");
@@ -1263,10 +1288,13 @@ static void read_vita_options(void) {
     }
     if (ini_get(text, "Vita Options", "FrameLock", v, sizeof(v)) && v[0])
       g_frame_lock_fps = atoi(v);
+    if (ini_get(text, "Vita Options", "DrawDistance", v, sizeof(v)) && v[0])
+      g_draw_distance = atoi(v);
     free(text);
     break;
   }
   obb_cache_init((size_t)cache_kb);
+  log_printf("[perf] draw distance cap: %d m (0 = the area's own fog)", g_draw_distance);
 }
 
 // FRAME_LOCK_FPS -> vblanks per flip. vitaGL's display callback waits that
@@ -1698,6 +1726,7 @@ int main(int argc, char *argv[]) {
   install_gui_probe();
   install_lzma_probe();
   install_model_timers();
+  hook_named("_ZN5Scene5DoFogEv", (uintptr_t)&DoFog_probe, (void **)&DoFog_orig, "Scene::DoFog");
   install_load_probe();
   gameprof_install();
   ini_write_install();
