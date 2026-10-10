@@ -451,35 +451,6 @@
 
 #endif
 
-// Scale GUI images that never went through ScaleExtentForResolution.
-//
-// log157 asked, per widget, whether it had been scaled, and every image at or
-// above 200x200 came back NO -- while 138 other widgets in the same screen had
-// been scaled normally. Two of the three are the pillarbox wings, which arrive
-// at exactly the screen height (217x544 at x=-100 and x=843) and are already in
-// device pixels; shrinking those would be wrong, so anything at or above the
-// screen height is left alone. The third is a 238x238 image that is neither a
-// texture size nor a device-space number, and 238 x 0.7083 is 169: an element
-// left at authored size inside a frame the game scaled by 544/768 is 1.41x too
-// big for it, which is exactly how far the minimap overflows its frame.
-//
-// TESTED AND DISPROVED (log158). The rescale fired exactly once, on precisely
-// the widget it was aimed at -- "autoscaled self=0x85b42738 238x238 by x0.7083"
-// -- and the minimap was unchanged on screen. So either that widget is not the
-// minimap, or its size was never the problem. Either way the extent path is now
-// finished as an explanation for these boxes: scaling is applied correctly to
-// the 138 widgets that get it, and forcing it onto the ones that skip it fixes
-// nothing.
-//
-// Left at 0. It is a speculative mutation of widget geometry with no evidence
-// behind it any more, and shipping one of those is worse than the bug.
-//
-// Next suspect is blending, not geometry: the haze bands line up with the UI
-// slots and read like additive overlays drawn opaque, and KOTOR stores
-// per-texture blend modes in .txi files -- of which log157 shows a great many
-// missing.
-#define GUI_AUTOSCALE_UNSCALED_IMAGES 0
-
 // Spatial audio. All four FMOD 3D entry points -- set3DAttributes,
 // set3DMinMaxDistance, set3DListenerAttributes, set3DOcclusion -- were
 // fmod_stub, so no positional sound ever attenuated with distance or panned:

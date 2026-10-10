@@ -42,9 +42,8 @@ static const char *android_prefixes[] = {
   "/sdcard",
 };
 
-#define FS_REL_LOG_LIMIT 600
-static unsigned g_rel_log_n = 0;
 
+#define FS_MISS_LOG_LIMIT 200
 static const char *fs_translate_set(const char *in, char *out, int outsz,
                                     int do_log, int use_set);
 
@@ -99,16 +98,6 @@ static const char *fs_translate_set(const char *in, char *out, int outsz,
   // Relative path -- resolve against the writable root.
   if (use_set && modset_redirect(in, out, outsz)) return out;
   snprintf(out, outsz, "%s/%s", DATA_PATH, in);
-  // log97: in-game the game reopens the texture packs per texture load --
-  // swpc_tex_gui.erf alone was translated 449 times -- and each log line is an
-  // open/write/close on the memory card. Budget it; the interesting translations
-  // all happen during bring-up.
-  if (do_log && g_rel_log_n < FS_REL_LOG_LIMIT) {
-    log_printf("[FS] (rel) %s -> %s", in, out);
-    if (++g_rel_log_n == FS_REL_LOG_LIMIT)
-      log_printf("[FS] (rel) path trace silenced after %d lines (steady state)",
-                 FS_REL_LOG_LIMIT);
-  }
   return out;
 }
 
@@ -122,10 +111,10 @@ static int fs_access(const char *path, int mode) {
   // Budgeted like the other path traces: a game that probes in a loop must not
   // turn every miss into a card write.
   static unsigned miss_n = 0;
-  if (r != 0 && miss_n < FS_REL_LOG_LIMIT) {
+  if (r != 0 && miss_n < FS_MISS_LOG_LIMIT) {
     log_printf("[FS] access MISS: %s", t);
-    if (++miss_n == FS_REL_LOG_LIMIT)
-      log_printf("[FS] access MISS trace silenced after %d lines", FS_REL_LOG_LIMIT);
+    if (++miss_n == FS_MISS_LOG_LIMIT)
+      log_printf("[FS] access MISS trace silenced after %d lines", FS_MISS_LOG_LIMIT);
   }
   return r;
 }
@@ -314,7 +303,6 @@ static int fs_rename(const char *a, const char *b) {
 // Vita SDL2 has no SDL_AndroidGetExternalStoragePath; the game calls it to find
 // its writable root. Hand back ux0:data/kotor so all derived paths land there.
 static const char *SDL_AndroidGetExternalStoragePath(void) {
-  log_printf("[FS] SDL_AndroidGetExternalStoragePath -> %s", DATA_PATH);
   return DATA_PATH;
 }
 

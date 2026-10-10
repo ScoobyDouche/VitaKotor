@@ -381,15 +381,8 @@ static void glClear_t(GLbitfield mask) {
   g_clears_win++; g_clears_frame++;
   glClear(mask);
 }
-// Text-draw trace: g_gl_text_draw is raised around the game's GUI-string Draw, so
-// these lines isolate the glyph draws from the thousands of ordinary scene draws.
-// g_cur_tex mirrors the GL_TEXTURE_2D binding -- a glyph quad drawn with texture 0
-// (or with a non-atlas texture) is the difference between "text never reaches GL"
-// and "text reaches GL untextured".
-int g_gl_text_draw = 0;
+// g_cur_tex mirrors the GL_TEXTURE_2D binding.
 static unsigned g_cur_tex = 0;
-static int g_textdraw_n = 0;
-#define TEXTDRAW_LOG_MAX 80
 
 
 /* Per-draw CPU cost is the remaining stutter lever: log119 hit ~745 draw calls a
@@ -454,9 +447,6 @@ static void glDrawArrays_t(GLenum mode, GLint first, GLsizei count) {
   if (loadscreen_active()) loadscreen_end();   /* first real frame: hand over */
   if (g_draw_n < 20) log_printf("[GL] glDrawArrays(mode=0x%x, first=%d, count=%d) #%d",
                                (unsigned)mode, first, (int)count, g_draw_n);
-  if (g_gl_text_draw && g_textdraw_n < TEXTDRAW_LOG_MAX)
-    log_printf("[textdraw#%d] glDrawArrays(mode=0x%x, count=%d) tex=%u",
-               g_textdraw_n++, (unsigned)mode, (int)count, g_cur_tex);
   g_draw_n++; g_arrays_win++; g_arrays_frame++; g_arrays_tot++; draw_note_source();
 #if GEOM_PROBE
   geo_check_arrays(g_cur_prog, first, count);
@@ -470,9 +460,6 @@ static void glDrawElements_t(GLenum mode, GLsizei count, GLenum type, const void
   if (loadscreen_active()) loadscreen_end();   /* first real frame: hand over */
   if (g_draw_n < 20) log_printf("[GL] glDrawElements(mode=0x%x, count=%d, type=0x%x) #%d",
                                (unsigned)mode, (int)count, (unsigned)type, g_draw_n);
-  if (g_gl_text_draw && g_textdraw_n < TEXTDRAW_LOG_MAX)
-    log_printf("[textdraw#%d] glDrawElements(mode=0x%x, count=%d) tex=%u",
-               g_textdraw_n++, (unsigned)mode, (int)count, g_cur_tex);
   g_draw_n++; g_elements_win++; g_elements_frame++; g_elements_tot++; draw_note_source();
 #if GEOM_PROBE
   geo_check_elements(g_cur_prog, count, type, idx);
@@ -1150,13 +1137,7 @@ static void glTexImage2D_body(GLenum tg, GLint l, GLint ifmt, GLsizei w, GLsizei
   }
   if (tg != GL_TEXTURE_2D) { tex_charge(g_cur_tex, tg, l, w, h, fmt_bpp(f));
                              glTexImage2D(tg, l, ifmt, w, h, b, f, ty, px); return; }
-  // Square power-of-two base levels are the font atlases; naming the texture id
-  // here is what lets the text-draw trace say whether a glyph quad used one.
-  if (l == 0) {
-    tex_kind_set(g_cur_tex, TEXKIND_2D);
-    if (w == h && (w == 256 || w == 512 || w == 1024))
-      log_printf("[GL] atlas candidate: tex=%u %dx%d fmt=0x%x", g_cur_tex, (int)w, (int)h, (unsigned)f);
-  }
+  if (l == 0) tex_kind_set(g_cur_tex, TEXKIND_2D);
   // NPOT WIDTH SHEAR TEST (log73). Backgrounds render progressively skewed while
   // every character/GUI surface is clean, and the split falls exactly on width
   // alignment -- tallying every upload in the log:
@@ -1218,7 +1199,6 @@ static void glTexImage2D_body(GLenum tg, GLint l, GLint ifmt, GLsizei w, GLsizei
             d[k] = (unsigned char)((a[k] * (65536 - fr) + c[k] * fr) >> 16);
         }
       }
-      log_printf("[GL] NPOT resample: %dx%d -> %dx%d (bpp=%d)", (int)w, (int)h, aw, (int)h, bpp);
       tex_upload2d(tg, l, ifmt, aw, h, b, f, ty, pad);
       free(pad);
       return;
