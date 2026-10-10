@@ -850,12 +850,6 @@ static uint64_t g_us_active = 0, g_gu_active = 0;
 static volatile float *g_ai_update_time = NULL, *g_display_fps = NULL;
 static volatile int *g_movie_fps = NULL, *g_render_skip = NULL;
 static unsigned g_policy_seq = 0, g_selected_skip = 0;
-/* Most catch-up updates SDL_main may run before presenting, from swkotor.ini
- * [Vita Options] CatchUpUpdates (read_vita_options). 0 = none, the measured
- * default. Raising it gives the simulation back the steps a slow frame owes
- * it, at a frame-time cost -- the knob for players who see characters jump
- * position in combat. Only meaningful with DISABLE_ADAPTIVE_RENDER_SKIP. */
-static int g_catchup_cap = 0;
 static float g_selector_ai_ms = 0.0f, g_last_ai_ms = 0.0f;
 static int g_new_present_group = 1;
 
@@ -902,7 +896,7 @@ static void *GameUpdate_probe(void) {
   // SDL_main has already chosen the skip count and is about to run the primary
   // update. Clearing it here makes that update render and lets SDL_main present
   // it, instead of following it with up to ten no-present update iterations.
-  if (g_render_skip && *g_render_skip > g_catchup_cap) *g_render_skip = g_catchup_cap;
+  if (g_render_skip) *g_render_skip = 0;
 #endif
   g_gu_n++;
   uint64_t start = sceKernelGetProcessTimeWide();
@@ -1252,7 +1246,7 @@ static char *read_whole_ini(const char *path) {
   return text;
 }
 
-// [Vita Options] CatchUpUpdates=<0..10>: see g_catchup_cap. Also ObbCacheKB. Read whole rather
+// [Vita Options] ObbCacheKB: RAM for recent archive reads (obb_cache.h). Read whole rather
 // than through slurp_ini's 4 KB, since a section added at the end of a long
 // ini is exactly where a player would put it.
 static void read_vita_options(void) {
@@ -1261,11 +1255,6 @@ static void read_vita_options(void) {
     char *text = read_whole_ini(kIniPaths[i]);
     if (!text) continue;
     char v[16];
-    if (ini_get(text, "Vita Options", "CatchUpUpdates", v, sizeof(v)) && v[0]) {
-      int n = atoi(v);
-      g_catchup_cap = n < 0 ? 0 : (n > 10 ? 10 : n);
-    }
-    // [Vita Options] ObbCacheKB: RAM for recent archive reads (obb_cache.h).
     if (ini_get(text, "Vita Options", "ObbCacheKB", v, sizeof(v)) && v[0]) {
       int n = atoi(v);
       cache_kb = n < 0 ? 0 : (n > 32 * 1024 ? 32 * 1024 : n);
@@ -1274,9 +1263,6 @@ static void read_vita_options(void) {
     break;
   }
   obb_cache_init((size_t)cache_kb);
-  log_printf("[perf] [Vita Options] CatchUpUpdates=%d (%s)", g_catchup_cap,
-             g_catchup_cap ? "slow frames may run catch-up updates"
-                           : "every update presents");
 }
 
 // Replace the ini with `need` bytes of `out`, via a temp file: an interrupted
