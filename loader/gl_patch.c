@@ -623,6 +623,7 @@ void gl_patch_on_swap(uint64_t swap_begin_us, uint64_t swap_end_us) {
     gameprof_window_report();
     lzma_cache_report();
     obb_cache_report();
+    sdl_miss_cache_report();
 #if GEOM_PROBE
     geo_window_report();
 #endif
