@@ -1249,6 +1249,8 @@ static char *read_whole_ini(const char *path) {
 // [Vita Options] ObbCacheKB: RAM for recent archive reads (obb_cache.h). Read whole rather
 // than through slurp_ini's 4 KB, since a section added at the end of a long
 // ini is exactly where a player would put it.
+static int g_frame_lock_fps = FRAME_LOCK_FPS;
+
 static void read_vita_options(void) {
   int cache_kb = OBB_READ_CACHE_KB;
   for (int i = 0; i < INI_PATH_COUNT; i++) {
@@ -1259,10 +1261,22 @@ static void read_vita_options(void) {
       int n = atoi(v);
       cache_kb = n < 0 ? 0 : (n > 32 * 1024 ? 32 * 1024 : n);
     }
+    if (ini_get(text, "Vita Options", "FrameLock", v, sizeof(v)) && v[0])
+      g_frame_lock_fps = atoi(v);
     free(text);
     break;
   }
   obb_cache_init((size_t)cache_kb);
+}
+
+// FRAME_LOCK_FPS -> vblanks per flip. vitaGL's display callback waits that
+// many vblanks after each flip (gxm.c, sceDisplayWaitVblankStartMulti).
+static void apply_frame_lock(void) {
+  int fps = g_frame_lock_fps;
+  int vblanks = (fps >= 60 || fps <= 0) ? 1 : (fps >= 30 ? 2 : 3);
+  eglSwapInterval(NULL, vblanks);
+  log_printf("[perf] frame lock: FrameLock=%d -> flip every %d vblank(s), %d fps max",
+             fps, vblanks, 60 / vblanks);
 }
 
 // Replace the ini with `need` bytes of `out`, via a temp file: an interrupted
@@ -1552,6 +1566,7 @@ static void *game_main_thread(void *arg) {
   vglSetupGarbageCollector(0x10000100, thread_mask(CPU_AUX_B));
   vglInitExtended(0, SCREEN_W, SCREEN_H, MEMORY_VITAGL_THRESHOLD_MB * 1024 * 1024, GL_MSAA_MODE);
   gxmp_arm();
+  apply_frame_lock();
   log_printf(">>> vitaGL application shader cache: %s", vgl_shader_cache_path);
 
   // vitaGL ignores the return of sceGxmShaderPatcherCreate (gxm.c:561), so a
