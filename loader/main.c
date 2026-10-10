@@ -41,6 +41,7 @@
 #include "gameprof.h"
 #include "lzma_cache.h"
 #include "obb_cache.h"
+#include "threads.h"
 
 // SDL.h would #define main to SDL_main; this is the only SDL call made here.
 extern int SDL_setenv(const char *name, const char *value, int overwrite);
@@ -132,8 +133,15 @@ static void sound_pipeline_census(void);
 static void *watchdog_thread(void *arg) {
   (void)arg;
   uint64_t last_run = 0;
+  thread_pin_self(CPU_AUX_B, "watchdog");
   for (;;) {
     sceKernelDelayThread(3 * 1000 * 1000);
+    /* Per-thread core and load, every fourth tick (12s): which core is busy,
+     * and with what. The first call only takes the baseline. */
+    {
+      static unsigned cpu_tick = 0;
+      if (cpu_tick++ % 4 == 0) thread_census_log();
+    }
     /* Heap occupancy, sampled here because this is the one thread that already
      * ticks on a fixed schedule. One line per 3s costs ~0.3ms and is what tells
      * us whether headroom drains steadily, steps down per area, or falls off a
@@ -2850,6 +2858,8 @@ static void *game_main_thread(void *arg) {
 
   g_game_thid = sceKernelGetThreadId();   // publish for the watchdog
   log_printf(">>> game thread UID = 0x%08x", (unsigned)g_game_thid);
+  // Core 0 is this thread's alone: everything else is pinned to 1 and 2.
+  thread_pin_self(CPU_GAME, "game-main");
 
   log_printf(">>> init vitaGL on game thread");
   /* This symbol exists only when vitaGL is built with HAVE_SHADER_CACHE=1.
@@ -2862,6 +2872,9 @@ static void *game_main_thread(void *arg) {
   // vitaGL's 1 MB vertex USSE pool filled in a 20-minute session (log192);
   // gxm_patcher.c also frees idle variants, the bigger pool keeps that rare.
   vglSetupShaderPatcher(GXMP_BUFFER_MEM, GXMP_VERTEX_USSE_MEM, GXMP_FRAGMENT_USSE_MEM);
+  // The garbage collector frees the GPU memory of each retired frame. By default
+  // it may land on the game thread's core; keep it beside the other helpers.
+  vglSetupGarbageCollector(0x10000100, thread_mask(CPU_AUX_B));
   vglInitExtended(0, SCREEN_W, SCREEN_H, MEMORY_VITAGL_THRESHOLD_MB * 1024 * 1024, GL_MSAA_MODE);
   gxmp_arm();
   log_printf(">>> vitaGL application shader cache: %s", vgl_shader_cache_path);
@@ -2913,7 +2926,8 @@ int main(int argc, char *argv[]) {
   log_printf("KOTOR Vita loader starting (skeleton, link-only)");
 
   sceKernelChangeThreadPriority(0, 127);
-  sceKernelChangeThreadCpuAffinityMask(0, 0x40000);
+  sceKernelChangeThreadCpuAffinityMask(0, CPU_AUX_B);   // parks in pthread_join
+  thread_census_add(sceKernelGetThreadId(), "main");
 
   sceCtrlSetSamplingModeExt(SCE_CTRL_MODE_ANALOG_WIDE);
 

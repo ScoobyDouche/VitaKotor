@@ -9,6 +9,7 @@
 #include "font.h"
 #include "ini.h"
 #include "log.h"
+#include "threads.h"
 #include "obbzip.h"
 
 #if LANGSEL_ENABLE
@@ -185,7 +186,7 @@ void langsel_watch_begin(void) {
   s_watch_t0 = sceKernelGetProcessTimeWide();
   s_watching = 1;
   SceUID th = sceKernelCreateThread("langsel_watch", watch_thread,
-                                    0x10000100, 0x1000, 0, 0, NULL);
+                                    0x10000100, 0x1000, 0, thread_mask(CPU_AUX_A), NULL);
   if (th < 0) {
     /* Not fatal: langsel_run() still takes its own reading, which is exactly
      * the old behaviour -- fragile, but not nothing. */
