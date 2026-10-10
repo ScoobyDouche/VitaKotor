@@ -539,6 +539,11 @@
 // cannot fragment the heap; outputs over 2 MB (area-load textures) are not kept.
 #define LZMA_CACHE_KB (8 * 1024)
 
+// Skip CExoIniInternal::WriteIniEntry calls that repeat a write already made
+// this session (ini_write.c). log245: entering the equip tab rewrote the whole
+// swkotor.ini 54 times with the same values, ~1.1 s.
+#define INI_SKIP_UNCHANGED_WRITES 1
+
 // Archive read cache (obb_cache.c), in KB; 0 disables it. log_4: each hover on
 // the equipment screen re-read the same ~1.3 MB of textures from the card for
 // the character preview, ~140 ms a time. One ring allocated at boot, like the
