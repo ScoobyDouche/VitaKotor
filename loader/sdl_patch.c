@@ -30,6 +30,7 @@
 #include "so_util.h"
 #include "translation.h"
 #include "log.h"
+#include "gameprof.h"
 
 extern int ret0(void);   // from dynlib.c
 
@@ -765,9 +766,11 @@ static SDL_RWops *SDL_RWFromFile_hook(const char *fname, const char *mode) {
     if (!rw) miss_add(g_all_miss, h);
     miss_unlock();
   }
-done:
-  g_rwopen_frame_us += sceKernelGetProcessTimeWide() - t0;
+done:;
+  uint64_t dt = sceKernelGetProcessTimeWide() - t0;
+  g_rwopen_frame_us += dt;
   g_rwopen_frame_n++;
+  gameprof_io_note(rw ? "rwopen" : "rwMISS", fname ? t : "?", dt);
   return rw;
 }
 

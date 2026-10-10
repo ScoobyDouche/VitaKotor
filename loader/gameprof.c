@@ -315,6 +315,30 @@ void gameprof_window_report(void) {
   g_eng_n = 0;
 }
 
+/* The slowest file operations this frame, for the hitch blame line. log240:
+ * the equip-tab freeze spends ~400 ms in 55 opens and waits on an unnamed
+ * kernel object (card I/O) for most of the rest. Any thread may call this;
+ * a lost race only costs a line of diagnostics. */
+#define IO_SLOW_N 6
+static struct { char op[8]; char path[72]; uint32_t us; } g_io_slow[IO_SLOW_N];
+static uint64_t g_io_frame_us;
+static unsigned g_io_frame_n;
+
+void gameprof_io_note(const char *op, const char *path, uint64_t us) {
+  g_io_frame_us += us;
+  g_io_frame_n++;
+  int lo = 0;
+  for (int i = 1; i < IO_SLOW_N; i++)
+    if (g_io_slow[i].us < g_io_slow[lo].us) lo = i;
+  if (us <= g_io_slow[lo].us) return;
+  g_io_slow[lo].us = (uint32_t)us;
+  snprintf(g_io_slow[lo].op, sizeof g_io_slow[lo].op, "%s", op);
+  const char *p = path ? path : "?";
+  size_t n = strlen(p);
+  snprintf(g_io_slow[lo].path, sizeof g_io_slow[lo].path, "%s",
+           n > sizeof g_io_slow[lo].path - 1 ? p + n - (sizeof g_io_slow[lo].path - 1) : p);
+}
+
 /* Which timed functions a hitch frame spent its time in: every hook with
  * 2 ms or more this frame, largest first. Times are inclusive, so a caller
  * and the callee under it both appear (menuL holds equipAdd, render holds
@@ -351,6 +375,21 @@ void gameprof_hitch_blame(void) {
   }
   if (shown) log_printf("%s ms", b);
   else log_printf("[hitch]   in: none of the timed functions (outside them all)");
+  if (g_io_frame_us >= 5000) {
+    o = snprintf(b, sizeof b, "[hitch]   file ops %u in %u ms; slowest:",
+                 g_io_frame_n, (unsigned)(g_io_frame_us / 1000u));
+    for (;;) {
+      int best = -1;
+      for (int i = 0; i < IO_SLOW_N; i++)
+        if (g_io_slow[i].us && (best < 0 || g_io_slow[i].us > g_io_slow[best].us)) best = i;
+      if (best < 0 || o > (int)sizeof b - 96) break;
+      o += snprintf(b + o, sizeof b - o, " %s %s %u.%u ms;", g_io_slow[best].op,
+                    g_io_slow[best].path, g_io_slow[best].us / 1000u,
+                    (g_io_slow[best].us % 1000u) / 100u);
+      g_io_slow[best].us = 0;
+    }
+    log_printf("%s", b);
+  }
 }
 
 void gameprof_frame_reset(void) {
@@ -359,6 +398,9 @@ void gameprof_frame_reset(void) {
   g_prof_tex_frame_n = 0;
   g_rwopen_frame_us = 0;
   g_rwopen_frame_n = 0;
+  memset(g_io_slow, 0, sizeof g_io_slow);
+  g_io_frame_us = 0;
+  g_io_frame_n = 0;
 }
 
 #else
@@ -367,6 +409,7 @@ uint64_t g_prof_tex_frame_us;
 unsigned g_prof_tex_frame_n;
 void gameprof_hitch_blame(void) {}
 void gameprof_frame_reset(void) {}
+void gameprof_io_note(const char *op, const char *path, uint64_t us) { (void)op; (void)path; (void)us; }
 void gameprof_install(void) {}
 void gameprof_after_update(void) {}
 void gameprof_window_report(void) {}

@@ -32,3 +32,6 @@ void gameprof_window_report(void);
 void gameprof_hitch_blame(void);
 /* Every swap, after any hitch line: start the next frame's tally. */
 void gameprof_frame_reset(void);
+/* A file operation that took `us`: counted for the frame, and kept if it is
+ * among the frame's slowest. */
+void gameprof_io_note(const char *op, const char *path, uint64_t us);
