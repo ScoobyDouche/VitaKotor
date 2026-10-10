@@ -481,6 +481,8 @@ static void glDrawElements_t(GLenum mode, GLsizei count, GLenum type, const void
   glDrawElements(mode, count, type, idx);
   g_prof_draw_us += sceKernelGetProcessTimeWide() - t0;
 }
+volatile uint64_t g_last_swap_end_us;
+
 void gl_patch_on_swap(uint64_t swap_begin_us, uint64_t swap_end_us) {
   static unsigned frame = 0;
   static uint64_t prev_swap_end = 0, timing_sum = 0, timing_max = 0;
@@ -586,6 +588,7 @@ void gl_patch_on_swap(uint64_t swap_begin_us, uint64_t swap_end_us) {
     gameprof_frame_reset();
   }
   prev_swap_end = swap_end_us;
+  g_last_swap_end_us = swap_end_us;
   prev_io = io;
   prev_audio = audio;
   prev_engine = engine;
