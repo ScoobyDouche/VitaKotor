@@ -27,9 +27,9 @@ with a from-scratch FMOD audio implementation over `sceAudiodec` and
 
 **Work in progress — good enough for a real playthrough, if you save regularly.**
 
-It boots, gets through character creation, and plays through the Endar Spire and
-across Taris. Combat, dialogue, inventory, containers and saves all work, and it
-looks and sounds like the game.
+It boots, gets through character creation, and plays through the Endar Spire,
+Taris, Dantooine, Tatooine and Kashyyyk. Combat, dialogue, inventory,
+containers and saves all work, and it looks and sounds like the game.
 
 The two faults that used to wear a long session down are **fixed**: sound no
 longer thins out and goes silent, and the world geometry no longer tears into
