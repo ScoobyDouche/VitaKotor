@@ -218,54 +218,31 @@ The game checks the memory card before the OBB files. Any file you put in the
 right folder replaces the game's own file with the same name. You don't need
 to repack or edit the OBBs, and you shouldn't.
 
-```
-ux0:data/kotor/
-├── tv_dialog.tlk        <- a mod's dialog.tlk, renamed (see below)
-├── override/            <- loose files: .2da, .tga, .tpc, .utc, .dlg, .ncs ...
-├── modules/             <- .mod files
-├── lips/
-└── streamwaves/
-```
-
-The Android game is the **controller** version of KOTOR. It reads
-`tv_dialog.tlk`, not `dialog.tlk`. If a mod ships or edits `dialog.tlk`, put
-it at the top of `ux0:data/kotor/` and rename it to `tv_dialog.tlk`.
-
-Start a new game after installing a mod that changes areas or the story. That
-is the usual KOTOR advice on PC too.
-
-### Mod sets (the MODS button)
-
-The main menu's Google Play button is a **MODS** button on the Vita. It lets
-you keep several mod setups on the card and switch between them without
-moving files around.
-
-Each mod set is a folder in `ux0:data/kotor/mods/`, laid out like the top
-folder above:
+Each mod setup is a folder in `ux0:data/kotor/mods/`:
 
 ```
 ux0:data/kotor/mods/
-├── Restoration/
-│   ├── tv_dialog.tlk
-│   ├── override/
-│   ├── modules/
-│   ├── lips/
-│   └── streamwaves/
-└── Textures only/
-    └── override/
+└── Restoration/
+    ├── tv_dialog.tlk    <- a mod's dialog.tlk, renamed (see below)
+    ├── override/        <- loose files: .2da, .tga, .tpc, .utc, .dlg, .ncs ...
+    ├── modules/         <- .mod files
+    ├── lips/
+    └── streamwaves/
 ```
 
-Press **MODS** on the main menu. The game restarts into a list with
-**VANILLA** first, then every folder in `mods/`. Pick one and the game starts
-with it. To switch again, press MODS again.
+The main menu's Google Play button is a **MODS** button on the Vita. Press it
+and the game restarts into a list with **VANILLA** first, then every folder in
+`mods/`. Pick one and the game starts with it; the choice is remembered. A set
+only needs the files its mods change. Everything else comes from the OBB.
 
-- A set only needs the files its mods change. Anything it doesn't have comes
-  from the top folder, then from the OBB, as usual.
-- **VANILLA** uses the top folder alone, exactly as before mod sets existed.
-  Mods you already installed there keep working.
+- The Android game is the **controller** version of KOTOR. It reads
+  `tv_dialog.tlk`, not `dialog.tlk`, so rename a mod's `dialog.tlk`.
 - **Saves are shared** between sets. A save made with a mod may not load
-  properly without it, so switch sets with that in mind.
-- The choice is remembered in `ux0:data/kotor/mods/active.txt`.
+  properly without it.
+- Start a new game after installing a mod that changes areas or the story.
+  That is the usual KOTOR advice on PC too.
+- The same folders directly in `ux0:data/kotor/` also work, and apply to
+  every set, VANILLA included.
 
 ### What works
 
@@ -276,8 +253,6 @@ Each of these was checked on a Vita:
   and data archives.
 - **`.mod` files in `modules/`** replace the game's own version of that area.
 - **A modded talk table** (`tv_dialog.tlk`) with lines added at the end.
-  Fights no longer freeze with one installed. The table is now read into
-  memory once instead of one line at a time from the card.
 - **KOTOR 1 Restoration 1.2**, all options, played through the first areas.
 
 ### Installer mods (TSLPatcher / HoloPatcher)
@@ -287,8 +262,8 @@ just adding new ones. The installer can't run on a Vita, so you have to run
 it on a PC first:
 
 1. Run the installer on a PC copy of KOTOR (version 1.03).
-2. Copy what changed to the Vita: `Override/` into `override/`, the new
-   `.mod` files into `modules/`, and `dialog.tlk` to the top folder as
+2. Copy what changed into a mod set on the Vita: `Override/` into
+   `override/`, the new `.mod` files into `modules/`, and `dialog.tlk` as
    `tv_dialog.tlk`.
 
 Patching a PC install like this is untested. The Restoration build that was
@@ -298,7 +273,7 @@ tested was patched against the Android game's own files instead.
 
 - **Mods that patch `swkotor.exe`** (widescreen or high-resolution menus,
   4 GB patches and so on) can't work. There is no `.exe` on the Vita.
-- **Repacking the OBBs.** The game freezes. Use the card folders above.
+- **Repacking the OBBs.** The game freezes. Use the folders above.
 - **`.dds` textures** haven't been tested on a Vita.
 - **Replacement movies (`.bik`)** haven't been tested.
 - **Mods built for the PC talk table may show keyboard prompts** where the
@@ -343,28 +318,6 @@ you a save. They are listed because you may hit them. Save regularly.
   preparing several hundred objects a frame; the graphics chip is not the
   limit. Video memory is also full for most of a session, so textures loaded
   after the first minute are served from ordinary RAM.
-- **Characters can jump position in combat.** When a frame runs slow, the
-  Android game runs extra catch-up updates before drawing; the port skips
-  them because they made stutters worse. If you see your character jump away
-  when an attack starts, try letting one catch-up update through, at some cost
-  in frame rate, by adding this to `ux0:data/kotor/swkotor.ini`:
-
-  ```ini
-  [Vita Options]
-  CatchUpUpdates=1
-  ```
-
-  `0` (the default) is the old behaviour; up to `10` is accepted. The log's
-  `[perf]` line says which value is in use. Whether this cures the jumps is
-  not confirmed yet, so reports either way help.
-- **Menus can freeze for a moment.** Switching to the equipment tab used to
-  stall for about a second, because the game rewrote `swkotor.ini` on the
-  card some fifty times with the same values. Writes that change nothing are
-  now skipped; that fix has not been checked on a Vita yet. Hovering items and
-  opening the inventory are already quicker: recent game data is kept in RAM,
-  and files that don't exist are no longer looked for again and again.
-  `ObbCacheKB=8192` under `[Vita Options]` sets how much RAM that keeps
-  (default 8192, `0` turns it off).
 - **Not every movie has been checked.** The ones played so far run with
   sound and hand back to the game cleanly; 48 kHz movies and localized
   subtitles have not been specifically tested.
@@ -372,49 +325,14 @@ you a save. They are listed because you may hit them. Save regularly.
 
 ### Recently fixed
 
-- **The MODS button** *(v0.4.0)*. Google Play on the main menu now switches
-  between mod sets on the card. See [Mod sets](#mod-sets-the-mods-button).
 - **Sound could die after leaving an area** *(v0.4.0)*. A sound still loading
   in the background could be freed underneath its loader, which crashed the
-  sound thread and left the game silent. Loading now stops before the sound is
-  released.
+  sound thread and left the game silent.
 - **Leaving an area could freeze for several seconds** *(v0.4.0)*, most of
-  all with large mods. The game saves the area's state on the way out, and
-  that went to the card in about a thousand tiny writes. Files are now written
-  in large blocks, and those frames are about half as long.
-- **Sticks went dead after typing a name** *(v0.4.0)*. The on-screen
-  keyboard left the controller in digital mode, so both sticks read as
-  centred until you restarted. The port now switches analog back on.
-- **Sticks could flicker back to centre with reVita** *(v0.4.0)*. A
-  single-frame drop to centre while a stick is held is now ignored.
-
-- **Sticks stopped working with reVita installed** *(v0.3.1)*. reVita turns
-  the rear touchpad back on every time it reads the controller, and the
-  fingers holding the back of the Vita then reached the game as screen
-  drags. The port no longer reads the rear touchpad at all.
-- **A one-second hitch whenever a sound started** *(v0.3.1)*. Voice lines
-  were decoded whole before they played, ambient loops were decompressed again
-  on every play, and long music tracks were read in one go. Voice lines now
-  stream, ambient sounds are cached, and music is read in the background:
-  on Taris the hitches fell by about half.
-- **A freeze ending in a crash on an area load** *(v0.3.1)*. The heap had
-  plenty of memory free but no single piece big enough for one request, and
-  the game gave up. Requests the heap refuses are now served from the pool
-  kept for large blocks.
-- **Footsteps, doors and containers were very quiet** *(v0.3.0)*.
-  Early builds of the port misread decimal numbers in `swkotor.ini`, and the
-  engine saved its 2D/3D sound balance at its lowest setting, which plays every
-  positioned sound at a tenth of its volume. The port now resets that one value
-  to the engine default on launch, so an ini carried over from an old build is
-  repaired automatically.
-- **Sound thinning out, then going silent, over a long session** *(v0.3.0)*.
-  The game has 45 sound slots and frees one only when it sees the sound
-  end; some never got that, and after an hour or so every slot was taken. Dead
-  slots are now handed back, and an 87-minute session stayed clean.
-- **World geometry tearing into spikes** after 20–40 minutes *(v0.3.0)*.
-  The GPU's vertex-shader pool filled up and new shaders silently failed.
-  The pool is four times larger and now reclaims idle entries; an 83-minute
-  session had no failures.
+  all with large mods. Saves are now written in large blocks, and those frames
+  are about half as long.
+- **Sticks went dead after typing a name** *(v0.4.0)*.
+- **Sticks could flicker back to centre with reVita** *(v0.4.0)*.
 
 Older fixes are listed in the notes for each [release](../../releases).
 
