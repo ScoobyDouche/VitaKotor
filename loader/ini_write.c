@@ -6,12 +6,13 @@
  * per line each call) -- ~430 ms of the ~1.1 s freeze, the rest the card
  * flushing. The values are the same every time.
  *
- * Remember each (4 strings) call that wrote successfully, and answer a repeat
- * of one with the 1 a successful write returns, without touching the card.
- * The argument order is not assumed: when a call really writes, every
- * remembered call that matches it in three of the four strings is forgotten
- * first, since whichever argument is the value, that is the same setting with
- * another value. So a setting changed and changed back is written both times.
+ * The arguments are (value, file, section, key) -- log246 printed them, and
+ * the first version of this filter, which tried not to assume an order, never
+ * skipped anything: two settings of one section that share a value match in
+ * three strings. Remember the last value written for each file/section/key,
+ * and answer a write of that same value with the 1 a successful write returns,
+ * without touching the card. Any other value is written and remembered, so a
+ * setting changed and changed back is written both times.
  */
 #include <vitasdk.h>
 #include <stdint.h>
@@ -47,6 +48,7 @@ static const char *str_of(void *exo) {
 }
 
 static int WriteIniEntry_hook(void *self, void *a, void *b, void *c, void *d) {
+  /* t[0] value, t[1..3] file, section, key */
   uint64_t t[4] = { str_hash(a), str_hash(b), str_hash(c), str_hash(d) };
   if (g_mtx >= 0) sceKernelLockMutex(g_mtx, 1, NULL);
   g_calls++;
@@ -66,7 +68,7 @@ static int WriteIniEntry_hook(void *self, void *a, void *b, void *c, void *d) {
 
   int r = g_orig(self, a, b, c, d);
   g_written++;
-  if (g_written <= 120)
+  if (g_written <= 200)
     log_printf("[ini] write #%u: \"%.24s\" \"%.24s\" \"%.24s\" \"%.24s\" -> %d",
                g_written, str_of(a), str_of(b), str_of(c), str_of(d), r);
 
@@ -74,9 +76,7 @@ static int WriteIniEntry_hook(void *self, void *a, void *b, void *c, void *d) {
   int free_slot = -1;
   for (int i = 0; i < MEMO_N; i++) {
     if (!g_memo_used[i]) { if (free_slot < 0) free_slot = i; continue; }
-    int same = 0;
-    for (int k = 0; k < 4; k++) same += g_memo[i][k] == t[k];
-    if (same >= 3) {                     /* this setting, any older value */
+    if (!memcmp(&g_memo[i][1], &t[1], 3 * sizeof t[0])) {   /* this setting, older value */
       g_memo_used[i] = 0;
       if (free_slot < 0) free_slot = i;
     }
