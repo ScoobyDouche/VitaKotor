@@ -7,6 +7,7 @@
 
 #include "config.h"
 #include "log.h"
+#include "threads.h"
 
 // Originally every line did its own open/append/close so a hard crash could not
 // lose output. That is three memory-card syscalls per line; keeping one fd open
@@ -348,9 +349,12 @@ void log_init(void) {
   // Below the game and audio threads: the card can wait, they cannot.
   g_wake = sceKernelCreateSema("kotor_log_wake", 0, 0, 1, NULL);
   if (g_io_mtx >= 0 && g_wake >= 0) {
-    SceUID th = sceKernelCreateThread("kotor_log", log_writer, 0x10000120, 0x4000, 0, 0, NULL);
-    if (th >= 0 && sceKernelStartThread(th, 0, NULL) >= 0)
+    SceUID th = sceKernelCreateThread("kotor_log", log_writer, 0x10000120, 0x4000, 0,
+                                      thread_mask(CPU_AUX_B), NULL);
+    if (th >= 0 && sceKernelStartThread(th, 0, NULL) >= 0) {
       g_writer_up = 1;
+      thread_census_add(th, "log");
+    }
   }
 #endif
 

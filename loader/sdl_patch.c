@@ -21,6 +21,7 @@
 #include "config.h"
 #include "sdl_patch.h"
 #include "dynlib.h"   // g_game_threads registry (watchdog sweeps it)
+#include "threads.h"
 #include "fs_patch.h"
 #include "bink_patch.h"
 #include "gl_patch.h"
@@ -99,6 +100,9 @@ static int sdl_thread_shim(void *p) {
     g_game_threads[slot].thid = sceKernelGetThreadId();
   log_printf("[thread] SDL thread started thid=0x%08x entry=%p slot=%d",
              (unsigned)sceKernelGetThreadId(), (void *)fn, slot);
+  // ThreadHandle's workers (module loading among them) keep off the game
+  // thread's core; see threads.h.
+  thread_pin_self(thread_next_worker_mask(), "game-sdl");
   return fn(data);
 }
 
