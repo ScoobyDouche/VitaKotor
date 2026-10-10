@@ -1097,7 +1097,7 @@ static void tex_upload2d(GLenum tg, GLint l, GLint ifmt, GLsizei w, GLsizei h,
   glTexImage2D(tg, l, ifmt, w, h, b, f, ty, px);
 }
 
-static void glTexImage2D_e(GLenum tg, GLint l, GLint ifmt, GLsizei w, GLsizei h, GLint b, GLenum f, GLenum ty, const void *px) {
+static void glTexImage2D_body(GLenum tg, GLint l, GLint ifmt, GLsizei w, GLsizei h, GLint b, GLenum f, GLenum ty, const void *px) {
   GLLOG("glTexImage2D(0x%x, l=%d, %dx%d, fmt=0x%x)", (unsigned)tg, l, (int)w, (int)h, (unsigned)f);
   g_texupload_frame++;
   if (w > 0 && h > 0) g_texupload_bytes_frame += (uint64_t)w * h * fmt_bpp(f);
@@ -1235,8 +1235,8 @@ static void glTexImage2D_e(GLenum tg, GLint l, GLint ifmt, GLsizei w, GLsizei h,
 }
 /* Must convert exactly as the base upload did, or vitaGL reads byte data as
  * 16-bit and the texture turns to noise. */
-static void glTexSubImage2D_e(GLenum tg, GLint l, GLint xo, GLint yo, GLsizei w, GLsizei h,
-                              GLenum f, GLenum ty, const void *px) {
+static void glTexSubImage2D_body(GLenum tg, GLint l, GLint xo, GLint yo, GLsizei w, GLsizei h,
+                                 GLenum f, GLenum ty, const void *px) {
   GLLOG("glTexSubImage2D(0x%x, l=%d, %dx%d)", (unsigned)tg, l, (int)w, (int)h);
   g_texupload_frame++;
   if (w > 0 && h > 0) g_texupload_bytes_frame += (uint64_t)w * h * fmt_bpp(f);
@@ -1258,6 +1258,25 @@ static void glTexSubImage2D_e(GLenum tg, GLint l, GLint xo, GLint yo, GLsizei w,
   }
 #endif
   glTexSubImage2D(tg, l, xo, yo, w, h, f, ty, px);
+}
+/* log238: menu hitches re-create dozens of textures; time every upload path,
+ * ours and vitaGL's together, for the hitch blame line. */
+#define TEX_TIMED(call) do { uint64_t t0_ = sceKernelGetProcessTimeWide(); call; \
+    g_prof_tex_frame_us += sceKernelGetProcessTimeWide() - t0_; g_prof_tex_frame_n++; } while (0)
+static void glTexImage2D_e(GLenum tg, GLint l, GLint ifmt, GLsizei w, GLsizei h, GLint b,
+                           GLenum f, GLenum ty, const void *px) {
+  TEX_TIMED(glTexImage2D_body(tg, l, ifmt, w, h, b, f, ty, px));
+}
+static void glTexSubImage2D_e(GLenum tg, GLint l, GLint xo, GLint yo, GLsizei w, GLsizei h,
+                              GLenum f, GLenum ty, const void *px) {
+  TEX_TIMED(glTexSubImage2D_body(tg, l, xo, yo, w, h, f, ty, px));
+}
+static void glCompressedTexImage2D_e(GLenum tg, GLint l, GLenum ifmt, GLsizei w, GLsizei h,
+                                     GLint b, GLsizei sz, const void *px) {
+  TEX_TIMED(glCompressedTexImage2D(tg, l, ifmt, w, h, b, sz, px));
+}
+static void glGenerateMipmap_e(GLenum tg) {
+  TEX_TIMED(glGenerateMipmap(tg));
 }
 static void glTexParameteri_e(GLenum tg, GLenum p, GLint v) {
   GLLOG("glTexParameteri(0x%x,0x%x,%d)", (unsigned)tg, (unsigned)p, v);
@@ -1480,7 +1499,7 @@ static const so_default_dynlib gl_dynlib[] = {
   // GLES OES buffer-mapping ext: identical signatures to vitaGL's core maps.
   { "glMapBufferOES",                    GEO_HOOK(glMapBuffer_e, glMapBuffer) },
   { "glUnmapBufferOES",                  GEO_HOOK(glUnmapBuffer_e, glUnmapBuffer) },
-  { "glCompressedTexImage2D",            (uintptr_t)&glCompressedTexImage2D },
+  { "glCompressedTexImage2D",            (uintptr_t)&glCompressedTexImage2D_e },
   { "glCopyTexImage2D",                  (uintptr_t)&glCopyTexImage2D },
   { "glCopyTexSubImage2D",               (uintptr_t)&glCopyTexSubImage2D },
   { "glDeleteBuffers",                   GEO_HOOK(glDeleteBuffers_e, glDeleteBuffers) },
@@ -1493,7 +1512,7 @@ static const so_default_dynlib gl_dynlib[] = {
   { "glEnableVertexAttribArray",         GEO_HOOK(glEnableVertexAttribArray_e, glEnableVertexAttribArray) },
   { "glFinish",                          (uintptr_t)&glFinish },
   { "glFlush",                           (uintptr_t)&glFlush },
-  { "glGenerateMipmap",                  (uintptr_t)&glGenerateMipmap },
+  { "glGenerateMipmap",                  (uintptr_t)&glGenerateMipmap_e },
   { "glGetActiveAttrib",                 (uintptr_t)&glGetActiveAttrib },
   { "glGetActiveUniform",                (uintptr_t)&glGetActiveUniform },
   { "glGetAttachedShaders",              (uintptr_t)&glGetAttachedShaders },
