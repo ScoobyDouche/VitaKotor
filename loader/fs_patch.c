@@ -26,6 +26,7 @@
 #include "fs_patch.h"
 #include "so_util.h"
 #include "log.h"
+#include "gameprof.h"
 #include "modset.h"
 
 #define ASSET_PATH DATA_PATH "/assets"
@@ -115,7 +116,9 @@ static const char *fs_translate_set(const char *in, char *out, int outsz,
 static int fs_access(const char *path, int mode) {
   char t[512];
   fs_translate(path, t, sizeof(t));
+  uint64_t t0 = sceKernelGetProcessTimeWide();
   int r = access(t, mode);
+  gameprof_io_note(r ? "accMISS" : "access", t, sceKernelGetProcessTimeWide() - t0);
   // Budgeted like the other path traces: a game that probes in a loop must not
   // turn every miss into a card write.
   static unsigned miss_n = 0;
@@ -143,6 +146,7 @@ static DIR *fs_opendir(const char *path) {
   fs_translate(path, t, sizeof(t));
   fs_translate_set(path, root, sizeof(root), 0, 0);
 
+  uint64_t t0 = sceKernelGetProcessTimeWide();
   FsDir *fd = calloc(1, sizeof *fd);
   if (!fd) return NULL;
   if (strcmp(t, root) != 0) {
@@ -157,6 +161,7 @@ static DIR *fs_opendir(const char *path) {
   }
   if (fd->over)
     log_printf("[FS] opendir %s over %s%s", t, root, fd->base ? "" : " (absent)");
+  gameprof_io_note("opendir", root, sceKernelGetProcessTimeWide() - t0);
   return (DIR *)fd;
 }
 // log90 ROOT CAUSE: `stat` was bound straight to newlib's with NO path
@@ -180,7 +185,9 @@ static unsigned g_stat_n = 0;
 static int fs_stat(const char *path, struct stat *st) {
   char t[512];
   fs_translate_ex(path, t, sizeof(t), 0);
+  uint64_t t0 = sceKernelGetProcessTimeWide();
   int r = stat(t, st);
+  gameprof_io_note(r ? "statMISS" : "stat", t, sceKernelGetProcessTimeWide() - t0);
   // GetDirectoryList stats every candidate name, so keep this bounded: a sample
   // of the early calls, then only the paths this bug is about.
   if (g_stat_n < 48 || (path && strstr(path, "currentgame") && g_stat_n < 256))
@@ -259,7 +266,9 @@ static struct dirent *next_entry(FsDir *fd) {
 }
 
 static void *fs_readdir(DIR *d) {
+  uint64_t t0 = sceKernelGetProcessTimeWide();
   struct dirent *e = next_entry((FsDir *)d);
+  gameprof_io_note("readdir", e ? e->d_name : "(end)", sceKernelGetProcessTimeWide() - t0);
   if (!e) return NULL;
   memset(&g_bdirent, 0, sizeof g_bdirent);
   g_bdirent.d_ino    = ++g_readdir_n;          // some callers skip ino == 0

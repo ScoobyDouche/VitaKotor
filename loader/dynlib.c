@@ -31,6 +31,7 @@
 #include "threads.h"
 #include "fs_patch.h"
 #include "log.h"
+#include "gameprof.h"
 #include "heap.h"
 #include "main.h"
 #include "config.h"
@@ -466,7 +467,14 @@ void io_obb_mount_done(void) {
              g_vreads, g_vhits, g_vlive);
 }
 
+static FILE *fopen_diag_body(const char *path, const char *mode);
 static FILE *fopen_diag(const char *path, const char *mode) {
+  uint64_t t0 = sceKernelGetProcessTimeWide();
+  FILE *f = fopen_diag_body(path, mode);
+  gameprof_io_note(f ? "fopen" : "fopMISS", path, sceKernelGetProcessTimeWide() - t0);
+  return f;
+}
+static FILE *fopen_diag_body(const char *path, const char *mode) {
   if (share_this(path, mode)) {
     FILE *v = fopen_shared(path, mode);
     if (v) return v;                     /* fall through to a real open on failure */
