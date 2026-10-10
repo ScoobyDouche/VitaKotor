@@ -43,7 +43,7 @@ So: worth starting a proper playthrough on now. Save regularly all the same.
 |---|---|
 | Startup | ~2 min on first launch, then under a minute |
 | Area loads | Under a second to load; the loading screen then stays up 15–20 s while textures upload |
-| Frame rate | ~30–38 fps typical, dips into the low 20s in dense scenes, with stutters |
+| Frame rate | Locked to 30 fps; holds it in most areas with Grass, Shadows and Frame Buffer off (see [Graphics settings](#graphics-settings)); dense scenes dip to ~20 |
 | Session length | ~100 min tested with nothing fatal and nothing wearing down |
 | Audio | Effects, voice and music all work |
 | Cutscenes | Bink movies play with sound; tap or press a button to skip |
@@ -124,6 +124,29 @@ here on first run.
 Shaders and font metrics ship inside the VPK, so there is nothing else to copy.
 
 ---
+
+## Graphics settings
+
+**For a steady frame rate, leave Grass, Shadows and Frame Buffer off** in the
+game's graphics options. With all three off, Dantooine holds a near-constant
+30 fps. With them on it drops to about 18 fps, and grass also stutters as you
+walk, while the game rebuilds it around you. High quality is fine to leave on.
+
+The port reads a few settings of its own from `ux0:data/kotor/swkotor.ini`.
+Add a `[Vita Options]` section at the end of the file:
+
+```ini
+[Vita Options]
+FrameLock=30
+GrassWind=0
+```
+
+| Key | Default | What it does |
+|---|---|---|
+| `FrameLock` | `30` | Frame rate cap. At 30 every frame stays on screen for the same time, so motion is even. `20` for a lower, steadier cap; `0` unlocks it (up to 40 fps, but frames alternate between two and three screen refreshes and motion judders) |
+| `GrassWind` | `0` | `1` makes the grass sway again, at a CPU cost every frame |
+| `DrawDistance` | `0` | Caps how far you can see, in metres, in areas that have fog. It made no measurable difference on Dantooine, so it is off |
+| `ObbCacheKB` | `8192` | RAM kept for recent reads from the game's archives |
 
 ## Controls
 
@@ -298,11 +321,10 @@ you a save. They are listed because you may hit them. Save regularly.
 
 ### Rough edges
 
-- **Frame drops.** Besides the dense-scene dips below, some areas stutter
-  about once a second: one frame in thirty takes around 100 ms, while nothing on
-  screen changes. The port's log no longer writes from the game's thread
-  (v0.4.0), and the game's thread now has a CPU core to itself; the hitches
-  that remain are inside the game's own code.
+- **Frame drops.** With the 30 fps lock and the heavy graphics options off,
+  slow frames are rare (about one per 120 frames on Dantooine, down from 15).
+  The ones that remain are inside the game's own code. Grass, Shadows and Frame
+  Buffer bring them back; see [Graphics settings](#graphics-settings).
 - **Voices over the loading screen.** The game starts running as soon as the
   area data is in, while the loading screen is still up for the texture upload,
   so the new area's sounds and conversations can start before you see it. Once,
