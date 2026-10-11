@@ -350,6 +350,11 @@ you a save. They are listed because you may hit them. Save regularly.
 
 ### Recently fixed
 
+- **Griff never appeared in the Sand People Enclave** *(v0.4.2)*. Opening
+  one of their chests before asking Czerka about him used the same switch
+  the game uses to remember spawning him. A bug in the original game.
+- **A line of dialogue could repeat over and over** *(v0.4.2)* in crowded
+  fights, once every sound channel was in use.
 - **Uneven motion** *(v0.4.1)*. Frames are locked to 30 fps, so each one is
   shown for the same time.
 - **The equipment screen froze for a second** *(v0.4.1)*. Opening it rewrote
