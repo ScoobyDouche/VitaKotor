@@ -145,13 +145,13 @@ git clone https://github.com/Rinnegatamante/vitaGL
 cd vitaGL
 git checkout 38d2f9704b6b241965ed7086aeaacd69f044f2c5
 make clean
-git apply --unidiff-zero /path/to/VitaKotor/patches/vitaGL-packed-vbo-offset.patch
+git apply /path/to/VitaKotor/patches/vitagl-vbo-offset-64k.patch
 make LOG_ERRORS=1 HAVE_SHADER_CACHE=1 -j$(nproc)   # produces libvitaGL.a
 make install                   # copies libvitaGL.a → $VITASDK/arm-vita-eabi/lib/
                                #        source/vitaGL.h → $VITASDK/arm-vita-eabi/include/
 ```
 
-The packed-VBO patch is required for KOTOR. The game stores vertex attributes
+The VBO-offset patch is required for KOTOR. The game stores vertex attributes
 at offsets well above 64 KiB, while `SceGxmVertexAttribute::offset` is only
 16-bit. Its skinned layout also declares weights before position even though
 position starts earlier in memory. The patch chooses the lowest active memory

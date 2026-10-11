@@ -34,9 +34,6 @@ set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -g -D_GNU_SOURCE -Wl,-q -Wl,-z,max-page-size
 set(CMAKE_CXX_FLAGS "${CMAKE_C_FLAGS} -std=c++11 -Wno-write-strings")
 
 option(KOTOR_NO_LOG "Quiet build: no log.txt except a crash dump (shipped next to the logged VPK)" OFF)
-option(KOTOR_BINK_SHADER_TEST "Initialize the embedded Bink shaders while continuing to skip movies" OFF)
-option(KOTOR_BINK_LEGAL_VIDEO_TEST "Play silent legal.bik once while skipping all audio-bearing movies" OFF)
-option(KOTOR_BINK_OPENSL_TEST "Play short 01c.bik once through the existing Vita mixer" OFF)
 
 add_executable(KOTOR
   loader/main.c
@@ -66,7 +63,6 @@ add_executable(KOTOR
   loader/input_patch.c
   loader/ime_patch.c
   loader/gl_patch.c
-  loader/geo_probe.c
   loader/gxm_patcher.c
   loader/glsl_prep.c
   loader/crash.c
@@ -81,27 +77,12 @@ add_executable(KOTOR
   loader/script_fix.c
 )
 
-target_compile_definitions(KOTOR PRIVATE KOTOR_USE_BINK_OPENSL=1)
-
 # Bytes of read-only padding to shift the RX segment's end (see loader/sce_pad.c).
 set(KOTOR_SCE_PAD 0 CACHE STRING "Read-only padding so vita-elf-create has room for its SCE data")
 set_source_files_properties(loader/sce_pad.c PROPERTIES
   COMPILE_DEFINITIONS "KOTOR_SCE_PAD=${KOTOR_SCE_PAD}")
 if(KOTOR_NO_LOG)
   target_compile_definitions(KOTOR PRIVATE LOG_OFF=1)
-endif()
-
-if((KOTOR_BINK_SHADER_TEST AND KOTOR_BINK_LEGAL_VIDEO_TEST) OR
-   (KOTOR_BINK_SHADER_TEST AND KOTOR_BINK_OPENSL_TEST) OR
-   (KOTOR_BINK_LEGAL_VIDEO_TEST AND KOTOR_BINK_OPENSL_TEST))
-  message(FATAL_ERROR "Select only one Bink test mode")
-endif()
-if(KOTOR_BINK_SHADER_TEST)
-  target_compile_definitions(KOTOR PRIVATE BINK_MODE=1)
-elseif(KOTOR_BINK_LEGAL_VIDEO_TEST)
-  target_compile_definitions(KOTOR PRIVATE BINK_MODE=2)
-elseif(KOTOR_BINK_OPENSL_TEST)
-  target_compile_definitions(KOTOR PRIVATE BINK_MODE=3)
 endif()
 
 target_link_libraries(KOTOR

@@ -3,22 +3,17 @@
  * A fake JNIEnv/JavaVM whose function-table slots point at logging shims. This
  * build has NO JNI_OnLoad and does NOT use RegisterNatives -- its native
  * surface is the set of statically-exported Java_com_aspyr_kotor_KOTOR_* methods
- * plus SDL_main (see RECON-JNI.md). The game reaches Java through its own
+ * plus SDL_main. The game reaches Java through its own
  * out-of-line _JNIEnv:: wrappers, which funnel into the *MethodV slots of this
  * table; those are the slots we populate with typed shims. Everything else
  * falls through to a traced safe-default so an unexpected call logs instead of
  * dereferencing a null slot.
  *
- * Instrumentation goal (Phase 1, step 1): every JNI call the lib makes is
+ * Every JNI call the lib makes is
  * logged by name -- FindClass, Get(Static)MethodID (name+signature),
  * RegisterNatives (each method name+sig), GetStringUTFChars, and every
  * Call*Method variant -- so the first Java-side call before any hang/crash is
  * always visible. No real Java behaviour is emulated.
- *
- * NOTE: CallStaticFloatMethodV returns a float across the .so boundary. Under
- * the hardfp loader vs softfp Android ABI its result lands in the wrong
- * register; that is the global ABI issue tracked for the toolchain phase, not
- * something to patch here.
  */
 
 #include <vitasdk.h>

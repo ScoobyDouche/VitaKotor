@@ -265,14 +265,6 @@
 #define LANGSEL_MORE_UP_Y         124
 #define LANGSEL_FOOTER_Y          486
 
-// How many times to dump the game's GL state after it takes over. The art can
-// only draw while the loader owns GL outright; once the game starts issuing GL
-// the loadscreen stops for good (see loadscreen.h). These probes record what
-// was bound at that point, so a future attempt to keep drawing for the whole
-// boot starts from measurements rather than guesses.
-#define LOADSCREEN_PROBE_MAX      24
-#define LOADSCREEN_PROBE_MS       2000
-
 // Per-call GL trace budget. Every traced call is one sceIoWrite to the memory
 // card, and log125/126 measured what that costs: gaps after a log line sit at a
 // flat ~8-11ms floor regardless of WHICH line it was, and the two slowest gaps
@@ -285,18 +277,6 @@
 // "silenced" line); raise it to 4000 to get the bring-up trace back.
 #define GL_TRACE_LIMIT 0
 
-// Log write buffering. Every log line used to be its own sceIoWrite to the
-// memory card, measured at 8-11ms, which put the logger on the critical path of
-// both startup and frames (logs 127/128: ~3370 gameplay lines per session, ~34s
-// of ~175s of frame time, 18-19%). Batch lines into one buffer instead and write
-// when it fills or when LOG_FLUSH_MS has elapsed, so a burst costs one card
-// write rather than hundreds while a quiet period still reaches disk promptly.
-//
-// The time-based flush is what bounds the risk: on a hard hang (not a CPU fault,
-// which has its own path) at most LOG_FLUSH_MS of log is unwritten. This project
-// has chased several stalls, so that ceiling matters more than the last few
-// syscalls. Set LOG_BUFFER_KB to 0 for the old unbuffered line-at-a-time
-// behaviour.
 // Diagnostic probe logging. The probes are how every bug in this port has been
 // found, and they are also what fills the card: in log162, twelve periodic tags
 // accounted for about 85% of 17,599 lines across 28 minutes, and that write
@@ -325,33 +305,26 @@
 #define LOG_OFF 0
 #endif
 
+// Log write buffering. Every log line used to be its own sceIoWrite to the
+// memory card, measured at 8-11ms, which put the logger on the critical path of
+// both startup and frames (logs 127/128: ~3370 gameplay lines per session, ~34s
+// of ~175s of frame time, 18-19%). Batch lines into one buffer instead and write
+// when it fills or when LOG_FLUSH_MS has elapsed, so a burst costs one card
+// write rather than hundreds while a quiet period still reaches disk promptly.
+//
+// The time-based flush is what bounds the risk: on a hard hang (not a CPU fault,
+// which has its own path) at most LOG_FLUSH_MS of log is unwritten.
+//
 // Two buffers of this size: one fills while the writer thread empties the
 // other (see log.c). A busy second is ~10-20 KB, so 64 KB leaves headroom.
 #define LOG_BUFFER_KB  64
 #define LOG_FLUSH_MS   1000
-
-// Heap tracing. gl_patch.c arms it at the last GL cap query (entering engine
-// setup) to catch an UNBOUNDED alloc loop during bring-up, and never disarms it,
-// so it runs for the whole session. MEM_TRACE is already throttled to every
-// 1024th allocation -- but KOTOR allocates ~2.3M times in a 700s session, so the
-// heartbeat alone emitted 2249 lines in log119, the single largest log source in
-// gameplay (26% of all lines, ~54s of frame time). Off for release; set to 1 to
-// hunt an allocation loop again.
-#define MEM_TRACE_ENABLE 0
 
 // glGet* value trace. The diagnostic value is all in init (~18 cap queries);
 // steady-state values are noise, and log119 still spent 231 lines on them. The
 // UNWRITTEN case stays unconditional either way -- it always signals a real
 // vitaGL gap. Raise to 256 to restore the bring-up trace.
 #define GLGET_TRACE_LIMIT 0
-
-// Geometry-spike probe (geo_probe.c). Samples a few draws a frame for vertex
-// values no KOTOR model can have, indices past the end of their buffer, and
-// attribute layouts vitaGL's 16-bit offset cannot express, and hashes every
-// vertex buffer at upload to catch bytes that change with no GL write. Costs
-// roughly 2 MB/s of buffer reads. 0 compiles all of it out. Off: log191/192
-// found the vertex data clean every time; the spikes were the shader patcher.
-#define GEOM_PROBE 0
 
 // Event-driven frame hitch trace. Timing is sampled once at swap with no
 // per-draw clock calls; only frames slower than this threshold emit a line.
@@ -366,23 +339,6 @@
 // [prof] lines per 120-frame window. log197 put ~60 of an 80 ms Undercity
 // frame in CClientAIMaster::UpdateState; this says which part of it.
 #define GAME_PROF (!LOG_OFF)
-
-// Bink integration modes. Production uses the embedded player and routes decoded
-// PCM through the existing Vita mixer. The other modes retain isolated regression
-// gates for shader, silent-video, and single audio/video playback.
-#define BINK_MODE_SKIP        0
-#define BINK_MODE_SHADER_TEST 1
-#define BINK_MODE_LEGAL_VIDEO 2
-#define BINK_MODE_OPENSL_TEST 3
-#define BINK_MODE_PLAY        4
-#ifndef BINK_MODE
-#define BINK_MODE BINK_MODE_PLAY
-#endif
-#if BINK_MODE != BINK_MODE_SKIP && BINK_MODE != BINK_MODE_SHADER_TEST && \
-    BINK_MODE != BINK_MODE_LEGAL_VIDEO && BINK_MODE != BINK_MODE_OPENSL_TEST && \
-    BINK_MODE != BINK_MODE_PLAY
-#error Unsupported BINK_MODE
-#endif
 
 // KOTOR's Android loop turns an AI update over 33/67/100/133 ms into
 // 2/4/7/11 complete GameUpdate calls before the next presentation. On Vita the
@@ -430,26 +386,6 @@
 // are NOT the upload pad, so do not come back here for them. The real fix for
 // the shear this exists to mask is strided texture init in vitaGL.
 #define GL_NPOT_WIDTH_PAD 1
-
-// Skinning bisect: force the ubershader's `#define USE_SKIN 1` to 0 in
-// glShaderSource, bypassing kotor.vert's dynamic uniform-array read
-// (u_boneMatrices[indices.x]) while leaving everything else identical.
-// Diagnostic for the exploding-character bug -- characters render in BIND POSE
-// (static but correctly shaped) while enabled. See gl_patch.c for the full
-// rationale. Set to 0 to restore real skinning.
-#define SKIN_BISECT_DISABLE 0
-
-// Skinning bone-index rounding: rewrite kotor.vert's
-//   ivec4 indices = ivec4(clamp(3.0 * a_matrixIndices, 0.0, 50.0));
-// to round-to-nearest instead of truncating. DISPROVED (log79): the rewrite was
-// confirmed applied to every skinned vertex shader ("SKIN FIX sh=N: 1 site") and
-// the characters exploded exactly as before, so fp16 demotion of a_matrixIndices
-// was never the problem. Left in place, off, because it costs nothing to re-arm.
-// The real cause was vitaGL truncating >64 KB VBO attribute offsets into GXM's
-// 16-bit SceGxmVertexAttribute::offset -- fixed in vitaGL, see
-#define SKIN_INDEX_ROUND_FIX 0
-
-#endif
 
 // Spatial audio. All four FMOD 3D entry points -- set3DAttributes,
 // set3DMinMaxDistance, set3DListenerAttributes, set3DOcclusion -- were
@@ -563,3 +499,5 @@
 // Set to 0 to go back to full-precision uploads. swkotor.ini [Vita Options]
 // TextureBits=32 overrides it (anything else means 16).
 #define GL_TEX16_CONVERT 1
+
+#endif

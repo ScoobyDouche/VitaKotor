@@ -1,10 +1,9 @@
-/* main.c -- KOTOR PS Vita so-loader (skeleton)
+/* main.c -- KOTOR PS Vita so-loader
  *
- * Bring-up scaffold adapted from TheOfficialFloW/gtasa_vita. Goal at this stage:
- * link cleanly into a VPK. It loads libKOTOR.so + libandroid_port.so, relocates
- * and resolves them against the stub/wiring tables, stubs Bink + audio, and
- * initialises vitaGL -- but deliberately stops before invoking the game
- * (JNI_OnLoad / init). See RECON.md for the porting phases.
+ * Adapted from TheOfficialFloW/gtasa_vita. Loads libLzmaLib, libminiz,
+ * libandroid_port and libKOTOR, relocates and resolves them against the
+ * stub/wiring tables, installs the engine hooks, then runs the game's SDL_main
+ * on its own thread with vitaGL initialised there.
  */
 
 #include <vitasdk.h>
@@ -207,14 +206,6 @@ static void *watchdog_thread(void *arg) {
       static unsigned tick = 0;
       if (tick++ % 10 == 0) heap_log_full(NULL); else heap_log(NULL);
     }
-    /* vitaGL's own heaps, which we have never measured. They are fixed at
-     * vglInitExtended and hold every texture and vertex buffer the game
-     * uploads, so they are a second place to run out -- and vitaGL does not
-     * check its allocations, so exhaustion there is silent: the GPU reads
-     * whatever is at the pointer and the geometry smears, while the GUI (small,
-     * per-frame) keeps drawing correctly. log146 ended exactly like that after
-     * 44 minutes in one area with the newlib heap still healthy, which is what
-     * this line is here to confirm or rule out. */
     /* Held-button mask, reported only when it moves. A bit that stays set with
      * nothing held is a missed release, and the game will act as though that
      * button is held forever -- so the interesting event is a transition that
@@ -247,6 +238,9 @@ static void *watchdog_thread(void *arg) {
       if (stick % 8 == 0) audio_log_stats();
       stick++;
     }
+    /* vitaGL's own heaps. They are fixed at vglInitExtended and hold every
+     * texture and vertex buffer the game uploads, so they are a second place
+     * to run out -- and vitaGL degrades silently rather than failing. */
     log_printf("[vgl] free: vram %u/%u KB, ram %u/%u KB, phycont %u/%u KB",
                (unsigned)(vglMemFree(VGL_MEM_VRAM) / 1024u),
                (unsigned)(vglMemTotal(VGL_MEM_VRAM) / 1024u),
@@ -315,7 +309,7 @@ static void *watchdog_thread(void *arg) {
 // on g_obbMounted && g_patchObbMounted. Calling the game's own mountObb/
 // mountPatchObb builds the ObbFile (miniz) objects into g_mainObb/g_patchObb
 // AND sets the flags, so later OBB reads work (just forcing the flags would
-// leave g_mainObb null -> crash). See RECON / obb-mount memory.
+// leave g_mainObb null -> crash).
 // Verify an OBB is actually a readable zip before we rely on it: true 64-bit
 // size (sceIo) + first 4 bytes (a zip starts "PK\3\4"). mountObb sets its flag
 // unconditionally even if ObbFile/miniz init fails, so a missing/bad file only
@@ -414,7 +408,7 @@ static void mount_obbs(void) {
 
   // Now that the archives are mounted, let ordinary file opens reach them too.
   // Without this, only resource-manager reads saw the OBB and anything opened as
- // a plain file (modules/*.rim among them) failed.
+  // a plain file (modules/*.rim among them) failed.
   sdl_obb_fallback_init(so_symbol(&port_mod, "_ZN7ObbFile10RWFromFileEPKc"),
                         (uintptr_t)g_main, (uintptr_t)g_patch);
 }
@@ -431,11 +425,9 @@ static void mount_obbs(void) {
 // and SKIP only when it's null, otherwise chain to the real function via a
 // trampoline. Reproducing the lookup is safe: it's exactly what the game does, and
 // GetFontInfo returns null cleanly (it doesn't fault) when there's no font.
+// Text itself comes from the .txi injection below; these guards cover the window
+// before the font loads, and stay as the safety net if the injection fails.
 //
-// NOTE (still open): even at the menu fontInfo stays null -- the TXI->CAurFontInfo
-// metrics parse (CAurFontInfo::ParseField) never runs, so GUI text does not yet
-// render. These guards keep the app ALIVE (no crash) through the whole boot;
-// getting actual text is a separate fix (populate CAurFontInfo / +0x38).
 // Shared: reproduce CAurGUIStringInternal's fontInfo lookup. Returns the CAurFontInfo
 // pointer (may be null == font not loaded) without ever faulting.
 static void *gui_string_fontinfo(void *self) {
@@ -530,41 +522,15 @@ static int   txi_injected_n = 0;
 static uintptr_t txi_dummy_rwops[8];
 static int txi_dummy_close(void *ctx) { (void)ctx; return 0; }
 
-// Chargen crashes because animBase->GetModel(255) (vtable slot 3 -- proven via
-// CSWCObject::GetModel, which is `r0=this[0x68]; r2=vptr[12]; bx r2`) returns
-// NULL: the class-selection creatures have no model. No .mdl/.mdx ever reaches
-// the FS layer because models live inside the OBB's data/*.bzf archives, so the
-// only place to see the failure is the resource gateway itself. Log the misses.
-// (An SDL_RWFromFile MISS is NOT a failure -- ios_mm_new_en.tga misses too and
+// Resources inside the OBB's data/*.bzf archives never reach the FS layer, so
+// this gateway is the only place a missing one shows. Log the misses. (An
+// SDL_RWFromFile MISS is NOT a failure -- ios_mm_new_en.tga misses too and
 // still draws; the game falls back to the OBB. A NULL from AurResGet is real.)
 static unsigned g_res_miss_n = 0;
 #define RES_MISS_LOG_MAX 300
 
-// Model resources go through here too. Log the object AurResGet just built so the
-// provider's answer (res[12]/res[16], set from AurGetResource + its out-size) can
-// be compared against the archive's real entry sizes, which we know exactly:
-// pmbbs.mdl is 192904 unpacked / 86608 packed in player.bzf, gui3D_room.mdl 1553 /
-// 530 in models.bzf. A short or zero res[16] means the provider failed and the
-// header check is reading a buffer nobody filled.
-static int is_model_type(const char *t) {
-  return t && (!strcmp(t, ".mdl") || !strcmp(t, ".mdx") ||
-               !strcmp(t, "mdl")  || !strcmp(t, "mdx"));
-}
-static unsigned g_resget_mdl_n = 0;
-
 static void *AurResGet_hook(char *resref, char *type, int *size, int flag) {
   void *r = AurResGet_orig(resref, type, size, flag);
-
-  if (is_model_type(type) && g_resget_mdl_n < 48) {
-    const uint32_t *o = (const uint32_t *)r;
-    log_printf("[model] AurResGet(\"%.16s\",\"%.4s\",flag=%d) -> %p%s",
-               resref ? resref : "?", type, flag, r,
-               !r ? "  <<< NULL" : "");
-    if (r)
-      log_printf("[model]   res[0]=%08x [3]=%08x m8=%u [4]=%d [5]=%d [6]=%08x",
-                 o[0], o[3], (unsigned)(o[3] & 7u), (int)o[4], (int)o[5], o[6]);
-    g_resget_mdl_n++;
-  }
 
   if (!r) {
     if (g_res_miss_n < RES_MISS_LOG_MAX)
@@ -673,7 +639,7 @@ static void install_aurresget_hook(void) {
 }
 #endif  // FONT_TXI_MEMORY_INJECT
 
-// ---- GUI IMAGE PIPELINE probe ----------------------------------------------
+// ---- GUI viewport clipping -------------------------------------------------
 /* KOTOR uses AurGUISetupViewport/AurGUICloseViewport as a nested GUI clipping
  * stack, but glViewport is only a coordinate transform. Mirror this semantic
  * GUI boundary to scissor while preserving any caller-owned scissor state. */
@@ -775,7 +741,7 @@ static void *ReadSync_probe(void *self, char *name) {
 static int (*LzmaUncompress_orig)(unsigned char *, size_t *, const unsigned char *,
                                   size_t *, const unsigned char *, size_t) = NULL;
 
-static int LzmaUncompress_probe(unsigned char *dest, size_t *destLen,
+static int LzmaUncompress_hook(unsigned char *dest, size_t *destLen,
                                 const unsigned char *src, size_t *srcLen,
                                 const unsigned char *props, size_t propsSize) {
 #if LZMA_CACHE_KB
@@ -795,7 +761,7 @@ static int LzmaUncompress_probe(unsigned char *dest, size_t *destLen,
   return rc;
 }
 
-static void install_lzma_probe(void) {
+static void install_lzma_cache(void) {
 #if LZMA_CACHE_KB
   lzma_cache_init((size_t)LZMA_CACHE_KB * 1024u);
 #endif
@@ -804,7 +770,7 @@ static void install_lzma_probe(void) {
   LzmaUncompress_orig = (int (*)(unsigned char *, size_t *, const unsigned char *,
                                  size_t *, const unsigned char *, size_t))
       build_thumb_trampoline(lu, thumb_patch_len(lu));
-  if (LzmaUncompress_orig) hook_thumb(lu, (uintptr_t)&LzmaUncompress_probe);
+  if (LzmaUncompress_orig) hook_thumb(lu, (uintptr_t)&LzmaUncompress_hook);
   else log_printf("[lzma] LzmaUncompress trampoline FAILED");
 }
 
@@ -822,7 +788,7 @@ static void *NewCAurObject_probe(char *name, char *type, void *rw1, void *rw2) {
   return r;
 }
 
-static void hook_named(const char *sym, uintptr_t probe, void **orig, const char *tag);
+static void hook_named(const char *sym, uintptr_t hook, void **orig, const char *tag);
 
 /* Draw distance. The iOS renderer sets the camera's far plane -- which the BSP
  * room walk and the per-object cull (GobOutside) both test against -- to
@@ -836,7 +802,7 @@ static int g_draw_distance = DRAW_DISTANCE_M;   // [Vita Options] DrawDistance
 static int g_grass_wind = GRASS_WIND;           // [Vita Options] GrassWind
 static void (*DoFog_orig)(void *scene) = NULL;
 
-static void DoFog_probe(void *scene) {
+static void DoFog_hook(void *scene) {
   int on = *(volatile int *)((char *)scene + 96);
   volatile float *start = (volatile float *)((char *)scene + 100);
   volatile float *end = (volatile float *)((char *)scene + 104);
@@ -857,12 +823,12 @@ static void install_model_timers(void) {
              (void **)&ReadSync_orig, "IODispatcher::ReadSync");
 }
 
-static void hook_named(const char *sym, uintptr_t probe, void **orig, const char *tag) {
+static void hook_named(const char *sym, uintptr_t hook, void **orig, const char *tag) {
   uintptr_t a = so_symbol(&kotor_mod, sym);
   if (!a) { log_printf("[load] %s symbol missing", tag); return; }
   *orig = (void *)build_thumb_trampoline(a, thumb_patch_len(a));
   if (!*orig) { log_printf("[load] %s trampoline FAILED", tag); return; }
-  hook_thumb(a, probe);
+  hook_thumb(a, hook);
 }
 
 /* GameUpdate and UpdateScreen are timed for the [hitch] line, and GameUpdate
@@ -1124,12 +1090,12 @@ static void slots_attach(void *self) {
 static void *(*FmodPlayStream_orig)(void *, unsigned, int) = NULL;
 static void *(*FmodStopChannel_orig)(void *, unsigned) = NULL;
 
-static void *FmodPlayStream_probe(void *self, unsigned h, int paused) {
+static void *FmodPlayStream_hook(void *self, unsigned h, int paused) {
   slots_attach(self);
   audio_slots_ensure_free();
   return FmodPlayStream_orig(self, h, paused);
 }
-static void *FmodStopChannel_probe(void *self, unsigned key) {
+static void *FmodStopChannel_hook(void *self, unsigned key) {
   slots_attach(self);
   audio_slot_stop_begin(key);
   void *rc = FmodStopChannel_orig(self, key);
@@ -1147,14 +1113,14 @@ static void *FmodStopChannel_probe(void *self, unsigned key) {
  * not fill; the reclaim stays as a last resort. */
 #define FMOD_SLOT_COUNT 96
 static int (*FmodInitSystem_orig)(void *, int) = NULL;
-static int FmodInitSystem_probe(void *self, int n) {
+static int FmodInitSystem_hook(void *self, int n) {
   int want = FMOD_SLOT_COUNT - 5;
   log_printf("[snd] FModAudioSystem::InitSystem(%d) -> %d (%d slots)", n,
              n < want ? want : n, (n < want ? want : n) + 5);
   return FmodInitSystem_orig(self, n < want ? want : n);
 }
 
-static void *FmodPlaySound_probe(void *self, int id) {
+static void *FmodPlaySound_hook(void *self, int id) {
   slots_attach(self);
   audio_slots_ensure_free();
   void *rc = FmodPlaySound_orig(self, id);
@@ -1164,13 +1130,13 @@ static void *FmodPlaySound_probe(void *self, int id) {
 
 // hook_named() resolves against libKOTOR; the FModAudioSystem methods live in the
 // companion, so the same dance against port_mod.
-static void hook_named_port(const char *sym, uintptr_t probe, void **orig,
+static void hook_named_port(const char *sym, uintptr_t hook, void **orig,
                             const char *tag) {
   uintptr_t a = so_symbol(&port_mod, sym);
   if (!a) { log_printf("[snd?] %s symbol missing", tag); return; }
   *orig = (void *)build_thumb_trampoline(a, thumb_patch_len(a));
   if (!*orig) { log_printf("[snd?] %s trampoline FAILED", tag); return; }
-  hook_thumb(a, probe);
+  hook_thumb(a, hook);
 }
 
 // Read an ini into `buf` as NUL-terminated text. Returns the byte count, or a
@@ -1525,7 +1491,7 @@ static void offer_mod_menu(void) {
   offer_texture_menu();
 }
 
-static void install_sound_probe(void) {
+static void install_sound_hooks(void) {
   hook_named("_ZN15CExoSoundSourceC1ERK7CResRef", (uintptr_t)&SndSrcCtor_probe,
              (void **)&SndSrcCtor_orig, "CExoSoundSource::CExoSoundSource(CResRef)");
   hook_named("_ZN15CExoSoundSource4PlayEv", (uintptr_t)&SndSrcPlay_probe,
@@ -1535,7 +1501,7 @@ static void install_sound_probe(void) {
   hook_named("_ZN32CExoStreamingSoundSourceInternal16InitializeSourceEv",
              (uintptr_t)&StreamInit_probe, (void **)&StreamInit_orig,
              "CExoStreamingSoundSourceInternal::InitializeSource");
-  hook_named_port("_ZN15FModAudioSystem10InitSystemEi", (uintptr_t)&FmodInitSystem_probe,
+  hook_named_port("_ZN15FModAudioSystem10InitSystemEi", (uintptr_t)&FmodInitSystem_hook,
                   (void **)&FmodInitSystem_orig, "FModAudioSystem::InitSystem");
   hook_named_port("_ZN15FModAudioSystem11CreateSoundEPciPvmii",
                   (uintptr_t)&FmodCreateSound_probe,
@@ -1543,11 +1509,11 @@ static void install_sound_probe(void) {
   hook_named_port("_ZN15FModAudioSystem12CreateStreamEPcP9SDL_RWopsiiiii",
                   (uintptr_t)&FmodCreateStream_probe,
                   (void **)&FmodCreateStream_orig, "FModAudioSystem::CreateStream");
-  hook_named_port("_ZN15FModAudioSystem9PlaySoundEi", (uintptr_t)&FmodPlaySound_probe,
+  hook_named_port("_ZN15FModAudioSystem9PlaySoundEi", (uintptr_t)&FmodPlaySound_hook,
                   (void **)&FmodPlaySound_orig, "FModAudioSystem::PlaySound");
-  hook_named_port("_ZN15FModAudioSystem10PlayStreamEmi", (uintptr_t)&FmodPlayStream_probe,
+  hook_named_port("_ZN15FModAudioSystem10PlayStreamEmi", (uintptr_t)&FmodPlayStream_hook,
                   (void **)&FmodPlayStream_orig, "FModAudioSystem::PlayStream");
-  hook_named_port("_ZN15FModAudioSystem11StopChannelEm", (uintptr_t)&FmodStopChannel_probe,
+  hook_named_port("_ZN15FModAudioSystem11StopChannelEm", (uintptr_t)&FmodStopChannel_hook,
                   (void **)&FmodStopChannel_orig, "FModAudioSystem::StopChannel");
   hook_named_port("_ZN15FModAudioSystem11CloseStreamEm", (uintptr_t)&FmodCloseStream_probe,
                   (void **)&FmodCloseStream_orig, "FModAudioSystem::CloseStream");
@@ -1555,7 +1521,7 @@ static void install_sound_probe(void) {
                   (void **)&FmodReleaseSound_orig, "FModAudioSystem::ReleaseSound");
 }
 
-static void install_load_probe(void) {
+static void install_frame_hooks(void) {
   g_ai_update_time = (volatile float *)so_symbol(&kotor_mod, "g_AIUpdateTime");
   g_display_fps = (volatile float *)so_symbol(&kotor_mod, "displayFPS");
   g_movie_fps = (volatile int *)so_symbol(&kotor_mod, "g_nSetMovieFrameRate");
@@ -1577,7 +1543,7 @@ static void install_load_probe(void) {
              "UpdateScreen");
 }
 
-static void install_gui_probe(void) {
+static void install_gui_scissor(void) {
   uintptr_t *setup_slot = find_jump_slot(&kotor_mod,
       "_Z19AurGUISetupViewportiiiiRK6Vectorbf");
   uintptr_t *close_slot = find_jump_slot(&kotor_mod,
@@ -1597,7 +1563,7 @@ static void install_gui_probe(void) {
 
 }
 
-static void install_font_probe(void) {
+static void install_font_guards(void) {
   uintptr_t ws = so_symbol(&kotor_mod, "_ZN21CAurGUIStringInternal11WrapStringsEi");
   if (ws) {
     WrapStrings_orig = (int (*)(void *, int))build_thumb_trampoline(ws, thumb_patch_len(ws));
@@ -1706,7 +1672,7 @@ static void *game_main_thread(void *arg) {
 
 int main(int argc, char *argv[]) {
   log_init();
-  log_printf("KOTOR Vita loader starting (skeleton, link-only)");
+  log_printf("KOTOR Vita loader starting");
 
   sceKernelChangeThreadPriority(0, 127);
   sceKernelChangeThreadCpuAffinityMask(0, CPU_AUX_B);   // parks in pthread_join
@@ -1772,7 +1738,7 @@ int main(int argc, char *argv[]) {
   // the pool rather than carving up newlib's arena (log145).
   bigalloc_init();
 
-  // Stub Bink (companion-provided) so cutscenes are skipped for now.
+  // Bink movies play through the companion's own player (see bink_patch.h).
   bink_patch(&port_mod);
 
   so_initialize(&lzma_mod);
@@ -1787,16 +1753,16 @@ int main(int argc, char *argv[]) {
 #if FONT_TXI_MEMORY_INJECT
   install_aurresget_hook();
 #endif
-  install_font_probe();
-  install_gui_probe();
-  install_lzma_probe();
+  install_font_guards();
+  install_gui_scissor();
+  install_lzma_cache();
   install_model_timers();
-  hook_named("_ZN5Scene5DoFogEv", (uintptr_t)&DoFog_probe, (void **)&DoFog_orig, "Scene::DoFog");
-  install_load_probe();
+  hook_named("_ZN5Scene5DoFogEv", (uintptr_t)&DoFog_hook, (void **)&DoFog_orig, "Scene::DoFog");
+  install_frame_hooks();
   gameprof_install();
   ini_write_install();
   script_fix_install();
-  install_sound_probe();
+  install_sound_hooks();
   modset_install_button();
 
   // NOTE: vitaGL is initialised on the game thread (see game_main_thread), not
@@ -1809,10 +1775,10 @@ int main(int argc, char *argv[]) {
   repair_sound_bias();
   modset_scan();          // before the game opens anything on the card
 
-  // Build the fake JNI tables (this build has no JNI_OnLoad; see RECON-JNI.md).
+  // Build the fake JNI tables (this build has no JNI_OnLoad).
   jni_setup();
 
-  // Phase 1, step 3: hand off to the game's real entry point. SDL renames the
+  // Hand off to the game's real entry point. SDL renames the
   // game's main() to SDL_main; run it on a dedicated large-stack thread (the
   // Vita main thread's stack is too small for the game). main() then parks in
   // the join so the process stays alive and vitaGL isn't torn down.

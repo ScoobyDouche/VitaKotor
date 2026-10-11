@@ -1,10 +1,8 @@
 /* gl_patch.c -- wire the companion's real GLES2 imports to vitaGL.
  *
  * libandroid_port.so exposes android_port_gl* wrappers to the game, but the
- * wrappers themselves import the *real* gl* entry points (141 of them). Those
- * were deliberately left unresolved during skeleton bring-up; the first GL call
- * (OpenGLES20Implementation::init -> glGetIntegerv) therefore jumped through an
- * unresolved PLT slot and prefetch-aborted. This table resolves them to vitaGL.
+ * wrappers themselves import the *real* gl* entry points (141 of them). This
+ * table resolves them to vitaGL.
  *
  * Three groups:
  *   (1) direct     -- integer/pointer signatures map straight to vitaGL.
@@ -35,7 +33,6 @@
 #include "sdl_patch.h"
 #include "log.h"
 #include "loadscreen.h"
-#include "geo_probe.h"
 #include "gxm_patcher.h"
 #include "gameprof.h"
 #include "lzma_cache.h"
@@ -170,75 +167,6 @@ static void glShaderSource_t(GLuint sh, GLsizei count, const GLchar *const *str,
     }
     joined[off] = '\0';
 
-    // SKINNING BISECT (log77). Characters explode into spikes, and every input to
-    // the skinned shader has now been proven correct in turn:
-    //   - .mdl/.mdx bytes match an offline LZMA decode exactly
-    //   - attributes are contiguous GL_FLOAT at stride 64, nothing normalised
-    //   - glUniform4fv delivers count=51 of clean near-identity bone rows
-    //   - the LINKED program reports u_boneMatrices size=51 type=GL_FLOAT_VEC4,
-    //     so ShaccCg did not collapse the array
-    // Three theories disproved by measurement, so stop theorising about the one
-    // remaining suspect (GXM's execution of `u_boneMatrices[indices.x]`, a
-    // dynamic uniform-array read driven by a vertex attribute) and test it.
-    // Forcing the ubershader's own USE_SKIN switch to 0 takes the `pos = a_position`
-    // branch instead, bypassing the indexed read entirely while changing nothing
-    // else. The rewrite is length-preserving ('1' -> '0'), so every offset in the
-    // buffer -- and the varying pre-pass that runs next -- is unaffected.
-    // Spikes gone  => the dynamic indexed read is the culprit, and the fix belongs
-    //                 in vitaGL's GLSL->Cg translation.
-    // Spikes stay  => skinning is exonerated and the fault is elsewhere entirely
-    //                 (geometry/index buffers), which redirects the whole hunt.
-    // Cost while enabled: characters render in BIND POSE -- static, but correctly
-    // shaped, which is strictly better to look at than the current explosion.
-    // This is a diagnostic, not the fix; revert once the cause is known.
-    int skin_off = 0;
-    if (SKIN_BISECT_DISABLE) {
-      char *d = joined;
-      while ((d = strstr(d, "#define USE_SKIN 1")) != NULL) {
-        d[sizeof("#define USE_SKIN ") - 1] = '0';
-        skin_off++;
-        d += sizeof("#define USE_SKIN ") - 1;
-      }
-      if (skin_off)
-        log_printf("[GL] SKIN BISECT sh=%u: forced USE_SKIN 1 -> 0 (%d site%s)",
-                   (unsigned)sh, skin_off, skin_off == 1 ? "" : "s");
-    }
-
-    // Skinning bone-index rounding fix. The bisect above proved the dynamic
-    // uniform-array read is what wrecks characters, and everything feeding it is
-    // provably correct (attributes, bone data, and the linked program's
-    // u_boneMatrices[51] all verified). What is left is the index arithmetic:
-    //     ivec4 indices = ivec4(clamp(3.0 * a_matrixIndices, 0.0, 50.0));
-    // ivec4() TRUNCATES. Each bone occupies 3 consecutive vec4 rows, so the true
-    // values are exact multiples of 3 -- but only if a_matrixIndices survives as
-    // an exact integer. If ShaccCg demotes the attribute to fp16, a stored 3.0
-    // can arrive as 2.9999, and 3.0*2.9999 = 8.9997 truncates to 8 instead of 9:
-    // that vertex then reads rows 8/9/10 rather than 9/10/11 and is transformed
-    // by an entirely different bone. Only indices that land just under an integer
-    // are affected, which is exactly why the models are mostly right with some
-    // vertices flung away, rather than uniformly wrong.
-    // Adding 0.5 before truncation turns floor() into round-to-nearest, making
-    // the index robust to +/-0.5 of error while changing nothing when the value
-    // is already exact. The replacement is written to the same 46 characters as
-    // the original so every offset in the buffer -- and the varying pre-pass that
-    // runs next -- is untouched. `clamp` deliberately stays in the float domain:
-    // GLSL ES 1.00 has no integer overload of clamp().
-    int skin_fix = 0;
-    if (SKIN_INDEX_ROUND_FIX) {
-      static const char kOld[] = "ivec4(clamp(3.0 * a_matrixIndices, 0.0, 50.0))";
-      static const char kNew[] = "ivec4(clamp(3.*a_matrixIndices+.5,0.,50.))    ";
-      char *d = joined;
-      while ((d = strstr(d, kOld)) != NULL) {
-        memcpy(d, kNew, sizeof(kNew) - 1);   // same length: offsets preserved
-        skin_fix++;
-        d += sizeof(kNew) - 1;
-      }
-      if (skin_fix)
-        log_printf("[GL] SKIN FIX sh=%u: bone index round-to-nearest (%d site%s)",
-                   (unsigned)sh, skin_fix, skin_fix == 1 ? "" : "s");
-    }
-    skin_off += skin_fix;   // either rewrite means we must pass OUR buffer on
-
     int raw = 0, live = 0;
     if (glsl_prep_strip_dead_varyings(joined, &raw, &live)) {
       log_printf("[GL] glShaderSource(sh=%u): varyings %d seen by vitaGL -> %d live",
@@ -246,17 +174,6 @@ static void glShaderSource_t(GLuint sh, GLsizei count, const GLchar *const *str,
       if (live > 10)
         log_printf("[GL] WARNING sh=%u: %d live varyings still exceeds the 10-slot "
                    "TEXCOORD budget -- link will overflow", (unsigned)sh, live);
-      const GLchar *one = joined;
-      glShaderSource(sh, 1, &one, NULL);
-      free(joined);
-      return;
-    }
-    // If the varying pre-pass declined we would normally hand back the game's
-    // original strings -- but that would silently discard a USE_SKIN rewrite, so
-    // pass our edited copy in that case.
-    if (skin_off) {
-      log_printf("[GL] glShaderSource(sh=%u): varying pre-pass declined, but "
-                 "passing the SKIN-BISECT copy", (unsigned)sh);
       const GLchar *one = joined;
       glShaderSource(sh, 1, &one, NULL);
       free(joined);
@@ -313,9 +230,6 @@ static void glLinkProgram_t(GLuint p) {
   g_link_us_frame += sceKernelGetProcessTimeWide() - link_start;
   g_links_frame++;
   g_cur_prog = 0;             /* relinking can change what this id draws with */
-#if GEOM_PROBE
-  geo_note_link(p);
-#endif
   GLint ok = 0;
   glGetProgramiv(p, GL_LINK_STATUS, &ok);
   if (!ok) {
@@ -324,37 +238,6 @@ static void glLinkProgram_t(GLuint p) {
     log_printf("[GL] !!! program %u LINK FAILED: %s", (unsigned)p, info);
   } else {
     log_printf("[GL] program %u linked OK", (unsigned)p);
-    // Skinned characters explode into spikes even though the vertex layout and
-    // the bone data we hand GL are both provably correct (attributes are
-    // contiguous GL_FLOAT at stride 64; glUniform4fv gets count=51 of clean
-    // near-identity rows). kotor.vert indexes `uniform vec4 u_boneMatrices[51]`
-    // DYNAMICALLY from a vertex attribute, so the remaining suspect is what the
-    // COMPILED GXM program made of that array. vitaGL reports it faithfully:
-    // glGetActiveUniform's size comes straight from
-    // sceGxmProgramParameterGetArraySize. If u_boneMatrices comes back with
-    // size=1 (or anything < 51), ShaccCg collapsed the array and every dynamic
-    // index reads the same row -- which is exactly what flings vertices onto
-    // wrong bones. Dump it once per program, alongside the attributes so the
-    // active set can be matched against the a_* locations we already log.
-    GLint nu = 0, na = 0;
-    glGetProgramiv(p, GL_ACTIVE_UNIFORMS, &nu);
-    glGetProgramiv(p, GL_ACTIVE_ATTRIBUTES, &na);
-    log_printf("[vtx] prog %u: %d active uniforms, %d active attributes",
-               (unsigned)p, (int)nu, (int)na);
-    for (GLint i = 0; i < nu && i < 48; i++) {
-      char nm[96]; GLint sz = -1; GLenum ty = 0; GLsizei len = 0;
-      nm[0] = '\0';
-      glGetActiveUniform(p, (GLuint)i, sizeof(nm), &len, &sz, &ty, nm);
-      log_printf("[vtx]   uniform[%d] \"%.48s\" size=%d type=0x%x", (int)i, nm,
-                 (int)sz, (unsigned)ty);
-    }
-    for (GLint i = 0; i < na && i < 24; i++) {
-      char nm[96]; GLint sz = -1; GLenum ty = 0; GLsizei len = 0;
-      nm[0] = '\0';
-      glGetActiveAttrib(p, (GLuint)i, sizeof(nm), &len, &sz, &ty, nm);
-      log_printf("[vtx]   attrib[%d] \"%.48s\" size=%d type=0x%x", (int)i, nm,
-                 (int)sz, (unsigned)ty);
-    }
   }
 }
 static void glViewport_t(GLint x, GLint y, GLsizei w, GLsizei h) {
@@ -448,9 +331,6 @@ static void glDrawArrays_t(GLenum mode, GLint first, GLsizei count) {
   if (g_draw_n < 20) log_printf("[GL] glDrawArrays(mode=0x%x, first=%d, count=%d) #%d",
                                (unsigned)mode, first, (int)count, g_draw_n);
   g_draw_n++; g_arrays_win++; g_arrays_frame++; g_arrays_tot++; draw_note_source();
-#if GEOM_PROBE
-  geo_check_arrays(g_cur_prog, first, count);
-#endif
   uint64_t t0 = sceKernelGetProcessTimeWide();
   glDrawArrays(mode, first, count);
   g_prof_draw_us += sceKernelGetProcessTimeWide() - t0;
@@ -461,9 +341,6 @@ static void glDrawElements_t(GLenum mode, GLsizei count, GLenum type, const void
   if (g_draw_n < 20) log_printf("[GL] glDrawElements(mode=0x%x, count=%d, type=0x%x) #%d",
                                (unsigned)mode, (int)count, (unsigned)type, g_draw_n);
   g_draw_n++; g_elements_win++; g_elements_frame++; g_elements_tot++; draw_note_source();
-#if GEOM_PROBE
-  geo_check_elements(g_cur_prog, count, type, idx);
-#endif
   uint64_t t0 = sceKernelGetProcessTimeWide();
   glDrawElements(mode, count, type, idx);
   g_prof_draw_us += sceKernelGetProcessTimeWide() - t0;
@@ -492,9 +369,6 @@ void gl_patch_on_swap(uint64_t swap_begin_us, uint64_t swap_end_us) {
   sdl_perf_snapshot(&sdl);
   frame++;
   gxmp_on_swap();
-#if GEOM_PROBE
-  geo_on_swap();
-#endif
 
   if (engine.policy_seq != policy_seen) {
     unsigned bucket = engine.selected_skip == 0 ? 0 : engine.selected_skip == 1 ? 1 :
@@ -611,9 +485,6 @@ void gl_patch_on_swap(uint64_t swap_begin_us, uint64_t swap_end_us) {
     lzma_cache_report();
     obb_cache_report();
     sdl_miss_cache_report();
-#if GEOM_PROBE
-    geo_window_report();
-#endif
     log_printf("[GL]   policy groups skip 0/1/3/6/10/other=%u/%u/%u/%u/%u/%u "
                "latest ai=%.1f->%u next=%.1f displayFPS=%.1f movieFPS=%d; "
                "SDL_Delay lifetime=%u requested=%u ms actual=%u ms lifetimeMax=%u ms",
@@ -670,12 +541,6 @@ static void glGetIntegerv_t(GLenum pname, GLint *params) {
     log_printf("[GL] glGetIntegerv(0x%x) -> UNWRITTEN (vitaGL ignored enum)", (unsigned)pname);
   else
     GLGETLOG("[GL] glGetIntegerv(0x%x) -> %d", (unsigned)pname, params ? *params : 0);
-  // 0xd57 is init()'s LAST cap query; the hang is just past here. Arm heap
-  // tracing now so OpenGLESState::init's allocations become visible.
-  if (MEM_TRACE_ENABLE && pname == 0xd57 && !g_mem_trace) {
-    log_printf("[GL] --- arming heap trace (entering GL engine setup) ---");
-    g_mem_trace = 1;
-  }
 }
 static void glGetBooleanv_t(GLenum pname, GLboolean *params) {
   const GLboolean SENT = 0x5A;
@@ -925,89 +790,24 @@ static void glBindTexture_e(GLenum tg, GLuint t) {
   if (tg == GL_TEXTURE_2D) g_cur_tex = t;  // mirrored for the text-draw trace
   glBindTexture(tg, t);
 }
-// --- skinning diagnostics --------------------------------------------------
-// Character models render as exploding spikes even though their .mdl/.mdx bytes
-// are byte-identical to an offline LZMA decode -- so the DATA is right and the
-// way it reaches the GPU is not. kotor.vert's skinned path is:
-//     uniform vec4 u_boneMatrices[51];        // 17 bones x 3 vec4 rows
-//     attribute vec4 a_matrixWeights, a_matrixIndices;
-//     ivec4 indices = ivec4(clamp(3.0 * a_matrixIndices, 0.0, 50.0));
-//     pos = weights.x * vec3(dot(u_boneMatrices[indices.x], a_position), ...);
-// i.e. DYNAMIC indexing of a uniform array from a vertex attribute. Two things
-// can break it independently, and spikes look the same either way:
-//   - a_matrixIndices arriving in the wrong format (e.g. UNSIGNED_BYTE flagged
-//     normalized -> 0..255 collapses to 0..1 -> 3.0*x picks bone 0-3 for every
-//     vertex), so the wrong bone transforms the vertex;
-//   - the 51-element uniform array not being uploaded/addressed contiguously by
-//     vitaGL, so indices.x+1 / +2 read someone else's rows.
-// These get their OWN log budget: the general GLLOG trace is spent during init
-// (4000 calls) long before a character is ever drawn, which is why the model
-// path has been invisible. Log each DISTINCT attribute configuration once, and
-// the first few large glUniform4fv uploads (the bone array).
-#define VAP_SLOTS 24
-static struct { GLuint idx; GLint size; GLenum type; GLboolean norm; GLsizei stride; uintptr_t off; } g_vap[VAP_SLOTS];
-static unsigned g_vap_used = 0;
-
+/* Attribute-offset witness (see g_vap_max_off). Only meaningful when a VBO is
+ * bound: with no buffer, `pointer` is a real client address and comparing it
+ * to 0xFFFF is nonsense. log151 reported maxAttrOff=0x985daa2c -- an address
+ * inside libKOTOR -- and counted 2.35M "over 64 KB", which measured nothing. */
 static void glVertexAttribPointer_e(GLuint index, GLint size, GLenum type, GLboolean normalized,
                                     GLsizei stride, const void *pointer) {
-  unsigned i;
-  for (i = 0; i < g_vap_used; i++)
-    if (g_vap[i].idx == index && g_vap[i].size == size && g_vap[i].type == type &&
-        g_vap[i].norm == normalized && g_vap[i].stride == stride &&
-        g_vap[i].off == (uintptr_t)pointer)
-      break;
-  if (i == g_vap_used && g_vap_used < VAP_SLOTS) {
-    g_vap[g_vap_used].idx = index; g_vap[g_vap_used].size = size;
-    g_vap[g_vap_used].type = type; g_vap[g_vap_used].norm = normalized;
-    g_vap[g_vap_used].stride = stride; g_vap[g_vap_used].off = (uintptr_t)pointer;
-    g_vap_used++;
-    log_printf("[vtx] attrib idx=%u size=%d type=0x%x norm=%d stride=%d off=0x%x",
-               (unsigned)index, (int)size, (unsigned)type, (int)normalized,
-               (int)stride, (unsigned)(uintptr_t)pointer);
-  }
-  /* Only meaningful when a VBO is bound: with no buffer, `pointer` is a real
-   * client address and comparing it to 0xFFFF is nonsense. log151 reported
-   * maxAttrOff=0x985daa2c -- an address inside libKOTOR -- and counted 2.35M
-   * "over 64 KB", which measured nothing at all. */
   if (g_cur_arraybuf) {
     if ((uintptr_t)pointer > g_vap_max_off) g_vap_max_off = (uintptr_t)pointer;
     if ((uintptr_t)pointer > 0xFFFFu) g_vap_over64k++;
   }
-#if GEOM_PROBE
-  geo_note_attrib(index, size, type, stride, pointer, g_cur_arraybuf);
-#endif
   glVertexAttribPointer(index, size, type, normalized, stride, pointer);
 }
 
-static unsigned g_u4fv_n = 0;
-static void glUniform4fv_e(GLint location, GLsizei count, const GLfloat *v) {
-  // The bone array is the only uniform uploaded in bulk; log its first rows so a
-  // garbage/identity matrix set is obvious.
-  if (count > 8 && g_u4fv_n < 12) {
-    log_printf("[vtx] glUniform4fv(loc=%d, count=%d) rows0-2: "
-               "[%.3f %.3f %.3f %.3f] [%.3f %.3f %.3f %.3f] [%.3f %.3f %.3f %.3f]",
-               (int)location, (int)count,
-               v ? v[0] : 0.f, v ? v[1] : 0.f, v ? v[2] : 0.f, v ? v[3] : 0.f,
-               v ? v[4] : 0.f, v ? v[5] : 0.f, v ? v[6] : 0.f, v ? v[7] : 0.f,
-               v ? v[8] : 0.f, v ? v[9] : 0.f, v ? v[10] : 0.f, v ? v[11] : 0.f);
-    g_u4fv_n++;
-  }
-  glUniform4fv(location, count, v);
-}
-
-// Name->location for the skinning inputs, so the attrib indices above can be tied
-// to a_matrixIndices/a_matrixWeights and the uniform loc to u_boneMatrices.
-static GLint glGetAttribLocation_e(GLuint prog, const GLchar *name) {
-  GLint l = glGetAttribLocation(prog, name);
-  if (name && (strstr(name, "matrix") || strstr(name, "position") || strstr(name, "normal")))
-    log_printf("[vtx] attribLoc prog=%u \"%s\" -> %d", (unsigned)prog, name, (int)l);
-  return l;
-}
+/* Sampler name->location, so the texture unit glUniform1i_e logs can be tied
+ * to a name; u_texture2Sampler is the cube map. */
 static GLint glGetUniformLocation_e(GLuint prog, const GLchar *name) {
   GLint l = glGetUniformLocation(prog, name);
-  /* Samplers as well as bones: the unit logged by glUniform1i_e is only useful
-   * if the location can be named, and u_texture2Sampler is the cube. */
-  if (name && (strstr(name, "bone") || strstr(name, "Sampler")))
+  if (name && strstr(name, "Sampler"))
     log_printf("[vtx] uniformLoc prog=%u \"%s\" -> %d", (unsigned)prog, name, (int)l);
   return l;
 }
@@ -1307,9 +1107,6 @@ static void glGenBuffers_e(GLsizei n, GLuint *b) { GLLOG("glGenBuffers(%d)", (in
 static void glBindBuffer_e(GLenum tg, GLuint b) {
   GLLOG("glBindBuffer(0x%x,%u)", (unsigned)tg, (unsigned)b);
   if (tg == GL_ARRAY_BUFFER) g_cur_arraybuf = b;
-#if GEOM_PROBE
-  geo_note_bind(tg, b);
-#endif
   glBindBuffer(tg, b);
 }
 static void glBufferData_e(GLenum tg, GLsizeiptr sz, const void *d, GLenum u) {
@@ -1317,34 +1114,7 @@ static void glBufferData_e(GLenum tg, GLsizeiptr sz, const void *d, GLenum u) {
   g_bufdata_win++; g_bufdata_frame++;
   if (sz > 0) g_bufdata_bytes_frame += (uint64_t)sz;
   glBufferData(tg, sz, d, u);
-#if GEOM_PROBE
-  geo_note_bufdata(tg, sz, d, u);
-#endif
 }
-#if GEOM_PROBE
-static void glBufferSubData_e(GLenum tg, GLintptr off, GLsizeiptr sz, const void *d) {
-  glBufferSubData(tg, off, sz, d);
-  geo_note_subdata(tg);
-}
-static void *glMapBuffer_e(GLenum tg, GLenum access) {
-  geo_note_map(tg);
-  return glMapBuffer(tg, access);
-}
-static GLboolean glUnmapBuffer_e(GLenum tg) {
-  GLboolean r = glUnmapBuffer(tg);
-  geo_note_unmap(tg);
-  return r;
-}
-static void glDeleteBuffers_e(GLsizei n, const GLuint *b) {
-  geo_note_delete(n, b);
-  glDeleteBuffers(n, b);
-}
-static void glEnableVertexAttribArray_e(GLuint i) { geo_note_enable(i, 1); glEnableVertexAttribArray(i); }
-static void glDisableVertexAttribArray_e(GLuint i) { geo_note_enable(i, 0); glDisableVertexAttribArray(i); }
-#define GEO_HOOK(probe, plain) (uintptr_t)&probe
-#else
-#define GEO_HOOK(probe, plain) (uintptr_t)&plain
-#endif
 static GLuint glCreateProgram_e(void) { GLLOG("glCreateProgram()"); GLuint p = glCreateProgram(); log_printf("[GL]  -> program %u", (unsigned)p); return p; }
 /* Redundant program-switch filter.
  *
@@ -1382,9 +1152,6 @@ static void glUseProgram_e(GLuint p) {
 }
 static void glDeleteProgram_e(GLuint p) {
   g_cur_prog = 0;
-#if GEOM_PROBE
-  geo_note_link(p);   /* a reused id must not inherit the old attribute mask */
-#endif
   glDeleteProgram(p);
 }
 static void glScissor_e(GLint x, GLint y, GLsizei w, GLsizei h) { GLLOG("glScissor(%d,%d,%d,%d)", x, y, (int)w, (int)h); glScissor(x, y, w, h); }
@@ -1480,28 +1247,28 @@ static const so_default_dynlib gl_dynlib[] = {
   { "glBlendEquation",                   (uintptr_t)&glBlendEquation },
   { "glBlendEquationSeparate",           (uintptr_t)&glBlendEquationSeparate },
   { "glBlendFuncSeparate",               (uintptr_t)&glBlendFuncSeparate },
-  { "glBufferSubData",                   GEO_HOOK(glBufferSubData_e, glBufferSubData) },
+  { "glBufferSubData",                   (uintptr_t)&glBufferSubData },
   // GLES OES buffer-mapping ext: identical signatures to vitaGL's core maps.
-  { "glMapBufferOES",                    GEO_HOOK(glMapBuffer_e, glMapBuffer) },
-  { "glUnmapBufferOES",                  GEO_HOOK(glUnmapBuffer_e, glUnmapBuffer) },
+  { "glMapBufferOES",                    (uintptr_t)&glMapBuffer },
+  { "glUnmapBufferOES",                  (uintptr_t)&glUnmapBuffer },
   { "glCompressedTexImage2D",            (uintptr_t)&glCompressedTexImage2D_e },
   { "glCopyTexImage2D",                  (uintptr_t)&glCopyTexImage2D },
   { "glCopyTexSubImage2D",               (uintptr_t)&glCopyTexSubImage2D },
-  { "glDeleteBuffers",                   GEO_HOOK(glDeleteBuffers_e, glDeleteBuffers) },
+  { "glDeleteBuffers",                   (uintptr_t)&glDeleteBuffers },
   { "glDeleteFramebuffers",              (uintptr_t)&glDeleteFramebuffers },
   { "glDeleteProgram",                   (uintptr_t)&glDeleteProgram_e },
   { "glDeleteRenderbuffers",             (uintptr_t)&glDeleteRenderbuffers },
   { "glDeleteShader",                    (uintptr_t)&glDeleteShader },
   { "glDeleteTextures",                  (uintptr_t)&glDeleteTextures_e },
-  { "glDisableVertexAttribArray",        GEO_HOOK(glDisableVertexAttribArray_e, glDisableVertexAttribArray) },
-  { "glEnableVertexAttribArray",         GEO_HOOK(glEnableVertexAttribArray_e, glEnableVertexAttribArray) },
+  { "glDisableVertexAttribArray",        (uintptr_t)&glDisableVertexAttribArray },
+  { "glEnableVertexAttribArray",         (uintptr_t)&glEnableVertexAttribArray },
   { "glFinish",                          (uintptr_t)&glFinish },
   { "glFlush",                           (uintptr_t)&glFlush },
   { "glGenerateMipmap",                  (uintptr_t)&glGenerateMipmap_e },
   { "glGetActiveAttrib",                 (uintptr_t)&glGetActiveAttrib },
   { "glGetActiveUniform",                (uintptr_t)&glGetActiveUniform },
   { "glGetAttachedShaders",              (uintptr_t)&glGetAttachedShaders },
-  { "glGetAttribLocation",               (uintptr_t)&glGetAttribLocation_e },
+  { "glGetAttribLocation",               (uintptr_t)&glGetAttribLocation },
   { "glGetBufferParameteriv",            (uintptr_t)&glGetBufferParameteriv },
   { "glGetFramebufferAttachmentParameteriv",   (uintptr_t)&glGetFramebufferAttachmentParameteriv },
   { "glGetProgramInfoLog",               (uintptr_t)&glGetProgramInfoLog },
@@ -1538,7 +1305,7 @@ static const so_default_dynlib gl_dynlib[] = {
   { "glUniform3fv",                      (uintptr_t)&glUniform3fv },
   { "glUniform3i",                       (uintptr_t)&glUniform3i },
   { "glUniform3iv",                      (uintptr_t)&glUniform3iv },
-  { "glUniform4fv",                      (uintptr_t)&glUniform4fv_e },
+  { "glUniform4fv",                      (uintptr_t)&glUniform4fv },
   { "glUniform4i",                       (uintptr_t)&glUniform4i },
   { "glUniform4iv",                      (uintptr_t)&glUniform4iv },
   { "glUniformMatrix2fv",                (uintptr_t)&glUniformMatrix2fv },

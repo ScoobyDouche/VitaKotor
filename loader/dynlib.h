@@ -10,10 +10,6 @@
 extern so_default_dynlib default_dynlib[];
 extern const int default_dynlib_size;   // in bytes, for so_resolve()
 
-// Diagnostic: when nonzero, malloc/calloc/realloc/operator-new log each request.
-// Armed by gl_patch.c at init()'s final GL cap-query to trace the hang window.
-extern volatile int g_mem_trace;
-
 // Diagnostic: when nonzero, fopen/fseek/ftell/fread log. Armed around OBB mount.
 extern volatile int g_io_trace;
 

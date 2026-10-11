@@ -2,8 +2,7 @@
  *
  * The Bink decode/draw entry points (MacPlayBinkGL, MacCreateBinkShaders) are
  * implemented *inside* libandroid_port.so. Production enables both and routes
- * the player's OpenSL PCM queue through the existing Vita mixer. Diagnostic
- * modes retain the earlier isolated playback gates.
+ * the player's OpenSL PCM queue through the existing Vita mixer.
  *
  * MacDecompress is NOT one of them despite the shared `Mac` prefix -- it is the
  * OBB's LZMA resource decompressor and must be left alone. See bink_patch.c.
@@ -16,7 +15,7 @@
 
 #include "so_util.h"
 
-// Apply the BINK_MODE policy to the companion module's Bink exports.
+// Hook the companion module's Bink exports.
 void bink_patch(so_module *port_mod);
 
 // Low-overhead counters driven by the existing GL and swap wrappers while the

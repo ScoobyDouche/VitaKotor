@@ -1,8 +1,7 @@
 # VitaKotor — development notes
 
 PS Vita port of the Android build of **Star Wars: KOTOR** (Aspyr) via the
-so-loader technique. See [`RECON.md`](./RECON.md) for the binary analysis and
-[`SETUP.md`](./SETUP.md) for the toolchain install.
+so-loader technique. See [`SETUP.md`](./SETUP.md) for the toolchain install.
 
 ## Golden rule
 
@@ -11,8 +10,7 @@ so-loader technique. See [`RECON.md`](./RECON.md) for the binary analysis and
 > These are the user's copyrighted, legally-owned game binaries and assets.
 > They are inputs for local analysis only. `.gitignore` enforces this — do not
 > remove those entries, do not `git add -f` them, and do not paste their raw
-> bytes/large hex dumps into commits, issues, or PRs. Extracted **symbol lists**
-> in `recon/` are fine to commit; **game binaries and assets are not.**
+> bytes/large hex dumps into commits, issues, or PRs.
 
 ## Environment
 
@@ -69,7 +67,7 @@ cp build-nolog/KOTOR.vpk KOTOR-nolog.vpk                                   # upl
 
 It is not snapshotted to `backups/`.
 
-Inspecting the Android binaries (recon):
+Inspecting the Android binaries:
 
 ```bash
 arm-vita-eabi-readelf -d       apk/lib/armeabi-v7a/libKOTOR.so   # dynamic/NEEDED
@@ -80,52 +78,37 @@ arm-vita-eabi-readelf --dyn-syms -W apk/lib/armeabi-v7a/libKOTOR.so
 
 - **Target ABI is `armeabi-v7a`** (ARM32). Ignore `arm64-v8a`.
 - **Graphics:** vitaGL (backs both GLES1 fixed-function and GLES2). No EGL layer
-  — SDL2 owns context creation. Rebuild/reinstall vitaGL with
-  `cd ~/vitadev/vitaGL && make -j && make install` when bumping it.
+  — the loader initialises vitaGL on the game thread. vitaGL is linked
+  statically and carries a patch; rebuild it exactly as SETUP.md section 4 says.
 - **so-load, don't rewrite:** load `libKOTOR.so` **and** `libandroid_port.so`
-  together — the companion resolves 266 of KOTOR's imports (GL wrappers, Win32
-  shims, `FModAudioSystem`, Bink). Only implement `libandroid_port.so`'s own
-  imports (see `recon/TOTAL_to_implement.txt`).
-- **Symbol resolution:** seed `default_dynlib[]` from
-  `recon/A_covered_by_template.txt`; adapt asset-manager/JNI impls from the
-  reference loaders rather than writing new ones.
-- **Audio is the hard part** (FMOD → OpenSLES over `sceAudio`). Keep a
-  `NOSOUND` fallback so bring-up isn't blocked on it.
+  together — the companion resolves most of KOTOR's imports (GL wrappers, Win32
+  shims, `FModAudioSystem`, Bink). The loader only implements what is left.
 - **Saves / writable data:** redirect to `ux0:data/kotor/`. Game data (OBB) is
   read-only input.
-- Keep `recon/` in sync if you re-run the readelf analysis (regen instructions
-  at the bottom of `RECON.md`).
-- Before claiming a phase works, **build the `.vpk` and verify** — don't assert
-  success from a clean compile alone.
+- Before claiming something works, **build the `.vpk` and verify on hardware** —
+  don't assert success from a clean compile alone.
 
-## Status (graphics bring-up — runs on hardware)
+## How it runs
 
-The loader builds cleanly to `build/KOTOR.vpk` (0 warnings) and **runs the game's
-`SDL_main` on hardware**. It so-loads `libKOTOR.so` + `libandroid_port.so`,
-implements the FMOD and Bink OpenSL paths over one Vita mixer, wires libc/libm/
-C++/pthread, inits vitaGL, builds the fake JNI tables (no `JNI_OnLoad`; entry is
-`SDL_main`), redirects the filesystem, and hands off to the game.
+The loader so-loads `libLzmaLib.so`, `libminiz.so`, `libandroid_port.so` and
+`libKOTOR.so`, implements FMOD and the Bink OpenSL path over one Vita mixer,
+wires libc/libm/C++/pthread, builds the fake JNI tables (there is no
+`JNI_OnLoad`; the entry point is `SDL_main`), mounts the OBBs, redirects the
+filesystem, and runs `SDL_main` on its own thread with vitaGL initialised there.
 
-- **Runtime prerequisites:** copy `libKOTOR.so`, `libandroid_port.so`,
-  `libminiz.so`, and `libLzmaLib.so` from `apk/lib/armeabi-v7a/` to
-  `ux0:data/kotor/`; **copy all of `apk/assets/*` (GLSL shaders + `iosdialog.otf`
-  font) to `ux0:data/kotor/`** — the game opens these by filename via
-  `SDL_RWFromFile`, and without them shaders load empty and `glLinkProgram`
-  crashes; copy the OBB archives to `ux0:data/kotor/main.obb`
-  (`main.53….obb`, ~2.1 GB) and `ux0:data/kotor/patch.obb` (`patch.53….obb`,
-  ~453 MB); `libshacccg.suprx` in `ur0:/data/`; `kubridge.skprx` installed. All
-  JNI calls, GL wiring, OBB mount, and CPU faults log to
-  `ux0:data/kotor/log.txt`.
-- **OpenGL — WIRED** (`loader/gl_patch.c`): the companion's 141 real `gl*`
-  imports resolve to vitaGL. 113 direct, 14 gap-stubs (symbols vitaGL lacks —
-  see `recon/gl_gaps_not_in_vitaGL.txt`), and 14 **float-by-value shims** (next).
+- **Runtime prerequisites:** the four `.so` files from `apk/lib/armeabi-v7a/`
+  and the OBBs (`main.obb`, `patch.obb`) in `ux0:data/kotor/`;
+  `libshacccg.suprx` in `ur0:/data/`; `kubridge.skprx` installed. The GLSL
+  shaders and fonts from `apk/assets/` ship inside the VPK (`app0:shaders/`,
+  `app0:fonts/`), so a build made without `apk/assets/` present is broken.
+  Everything logs to `ux0:data/kotor/log.txt`.
+- **OpenGL** (`loader/gl_patch.c`): the companion's `gl*` imports resolve to
+  vitaGL, with stubs for the few vitaGL lacks and float-by-value shims (next).
 - **⚠ Float ABI:** this SDK is **hardfp** ("VFP registers"); Android armeabi-v7a
-  is **softfp** (floats in core regs). Handled *per-function* for GL by shims in
-  `gl_patch.c` (declare params `uint32_t`, bit-reinterpret to `float`, call
-  hardfp vitaGL). Pointer variants (`*fv`, `Matrix*fv`) need no shim. The same
-  mismatch still affects **non-GL** float args across the boundary (e.g.
-  `CallStaticFloatMethod`); a full softfp rebuild of vitaGL + deps remains the
-  eventual clean fix. Watch for it wherever a float is passed by value.
+  is **softfp** (floats in core regs). Every float passed by value across the
+  boundary needs a shim: declare the params `uint32_t`, bit-reinterpret to
+  `float`, call the hardfp function. GL has them in `gl_patch.c`, libm in
+  `dynlib.c`. Pointer variants (`*fv`, `Matrix*fv`) need none.
 
 ## Debugging crashes
 
@@ -155,8 +138,8 @@ rewrite of the MODULE_INFO/THREAD_REG_INFO note parsing is enough.)
 
 **Memory gotcha (already bitten once):** the app needs `ATTRIBUTE2=12` in the SFO
 (extended-memory partition) or a large `_newlib_heap_size_user` fails at CRT init
-and crashes in `_sbrk_r` before `main`. Keep the heap (192 MB) ≤ the granted
-partition.
+and crashes in `_sbrk_r` before `main`. Keep `MEMORY_NEWLIB_MB` in config.h
+within the granted partition.
 
 ## Input mapping
 
@@ -200,9 +183,11 @@ forward.
 ```
 apk/                  extracted APK  (GIT-IGNORED — never commit)
 com.aspyr.swkotor/    OBB game data  (GIT-IGNORED — never commit)
-recon/                readelf-derived symbol lists (safe to commit)
 loader/               so-loader source (main.c, so_util, dynlib, jni/audio/bink, log)
+tools/                build helpers and host-side unit tests (test_*.c)
+patches/              the vitaGL patch the shipped binary depends on
+docs/releases/        release notes, one file per version
 build/                CMake build output (GIT-IGNORED) -> build/KOTOR.vpk
 sce_sys/              VPK icon + LiveArea assets
-RECON.md  SETUP.md  DEVELOPMENT.md
+SETUP.md  DEVELOPMENT.md
 ```

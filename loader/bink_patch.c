@@ -30,9 +30,7 @@ typedef struct {
 
 static bink_perf_t g_bink_perf;
 
-#if BINK_MODE == BINK_MODE_OPENSL_TEST || BINK_MODE == BINK_MODE_PLAY
 static void bink_snd_pump_on_swap(void);
-#endif
 
 void bink_patch_note_texture_upload(unsigned width, unsigned height) {
   if (!g_bink_perf.active) return;
@@ -50,12 +48,9 @@ void bink_patch_on_swap(uint64_t swap_end_us) {
   }
   g_bink_perf.last_swap_us = swap_end_us;
   g_bink_perf.swaps++;
-#if BINK_MODE == BINK_MODE_OPENSL_TEST || BINK_MODE == BINK_MODE_PLAY
   bink_snd_pump_on_swap();
-#endif
 }
 
-#if BINK_MODE == BINK_MODE_OPENSL_TEST || BINK_MODE == BINK_MODE_PLAY
 /* The companion's async audio worker services this pump once before the first
  * decoded-frame sequence is published, then never services it again on Vita.
  * Capture the handle at that first call; bink_snd_pump_on_swap drives the same
@@ -119,76 +114,37 @@ static void install_bink_snd_pump(so_module *port_mod) {
   log_printf("[BINK:PUMP] hooked @0x%08x len=%u tramp=%p", (unsigned)fn,
              (unsigned)len, (void *)BinkSndPump_orig);
 }
-#endif
 
 void bink_patch_stop_audio_pump(void) {
-#if BINK_MODE == BINK_MODE_OPENSL_TEST || BINK_MODE == BINK_MODE_PLAY
   __atomic_store_n(&g_snd_bink, BINK_SND_STOPPED, __ATOMIC_RELEASE);
-#endif
 }
-
-#if BINK_MODE == BINK_MODE_LEGAL_VIDEO || BINK_MODE == BINK_MODE_OPENSL_TEST || \
-    BINK_MODE == BINK_MODE_PLAY
-#if BINK_MODE == BINK_MODE_OPENSL_TEST
-#define BINK_TEST_MOVIE ".\\movies\\01c.bik"
-#define BINK_TEST_NAME  "OpenSL"
-#elif BINK_MODE == BINK_MODE_LEGAL_VIDEO
-#define BINK_TEST_MOVIE ".\\movies\\legal.bik"
-#define BINK_TEST_NAME  "legal"
-#endif
 
 static void (*MacPlayBinkGL_orig)(const char *path, int can_skip,
                                   unsigned char *finished, int arg) = NULL;
-#if BINK_MODE != BINK_MODE_PLAY
-static int g_bink_test_played = 0;
-#endif
 
 static void MacPlayBinkGL_real(const char *path, int can_skip,
                                unsigned char *finished, int arg) {
-#if BINK_MODE != BINK_MODE_PLAY
-  if (g_bink_test_played || !MacPlayBinkGL_orig) {
-    MacPlayBinkGL_stub(path, can_skip, finished, arg);
-    return;
-  }
-  g_bink_test_played = 1;
-  const char *play_path = BINK_TEST_MOVIE;
-#else
   if (!MacPlayBinkGL_orig) {
     MacPlayBinkGL_stub(path, can_skip, finished, arg);
     return;
   }
   const char *play_path = path;
-#endif
 
   memset(&g_bink_perf, 0, sizeof g_bink_perf);
   g_bink_perf.active = 1;
   g_bink_perf.start_us = sceKernelGetProcessTimeWide();
   int open_before = io_open_count();
-#if BINK_MODE == BINK_MODE_PLAY
   log_printf("[BINK] playback begin: path=\"%s\" canSkip=%d arg=%d finished=%d",
              play_path ? play_path : "(null)", can_skip, arg,
              finished ? *finished : -1);
-#else
-  log_printf("[BINK] %s test begin: requested=\"%s\" substitute=\"%s\" "
-             "canSkip=%d arg=%d finished=%d",
-             BINK_TEST_NAME, path ? path : "(null)", play_path, can_skip, arg,
-             finished ? *finished : -1);
-#endif
-#if BINK_MODE == BINK_MODE_OPENSL_TEST || BINK_MODE == BINK_MODE_PLAY
   __atomic_store_n(&g_snd_bink, NULL, __ATOMIC_RELEASE);
   g_snd_pump_calls = 0;
   g_snd_forced_pumps = 0;
   g_snd_gate_max = 0;
   g_snd_last_gate = 0;
-#endif
   MacPlayBinkGL_orig(play_path, can_skip, finished, arg);
-#if BINK_MODE == BINK_MODE_OPENSL_TEST || BINK_MODE == BINK_MODE_PLAY
   bink_patch_stop_audio_pump();
-#endif
   g_bink_perf.active = 0;
-#if BINK_MODE != BINK_MODE_PLAY
-  if (finished) *finished = 1;
-#endif
   log_printf("[BINK] playback end: path=\"%s\" elapsed=%u ms swaps=%u "
              "frame avg/max=%u/%u ms lumaUploads=%u/%u KB files=%d->%d finished=%d",
              play_path ? play_path : "(null)",
@@ -200,13 +156,10 @@ static void MacPlayBinkGL_real(const char *path, int can_skip,
              g_bink_perf.texture_uploads,
              (unsigned)(g_bink_perf.texture_bytes / 1024u),
              open_before, io_open_count(), finished ? *finished : -1);
-#if BINK_MODE == BINK_MODE_OPENSL_TEST || BINK_MODE == BINK_MODE_PLAY
   bink_opensl_log_stats();
   bink_pump_log();
-#endif
   log_flush();
 }
-#endif
 
 void bink_patch(so_module *port_mod) {
   if (!port_mod)
@@ -214,12 +167,7 @@ void bink_patch(so_module *port_mod) {
 
   uintptr_t play = so_symbol(port_mod, "_Z13MacPlayBinkGLPKcbRbi");
   uintptr_t shaders = so_symbol(port_mod, "_Z20MacCreateBinkShadersv");
-  const char *mode = BINK_MODE == BINK_MODE_PLAY ? "PLAY" :
-                     BINK_MODE == BINK_MODE_OPENSL_TEST ? "OPENSL_TEST" :
-                     BINK_MODE == BINK_MODE_LEGAL_VIDEO ? "LEGAL_VIDEO" :
-                     BINK_MODE == BINK_MODE_SHADER_TEST ? "SHADER_TEST" : "SKIP";
-  log_printf("[BINK] mode=%s play=0x%08x shaders=0x%08x",
-             mode, (unsigned)play, (unsigned)shaders);
+  log_printf("[BINK] play=0x%08x shaders=0x%08x", (unsigned)play, (unsigned)shaders);
 
   if (!play || !shaders) {
     log_printf("[BINK] missing companion export -- forcing available hooks to skip");
@@ -228,17 +176,6 @@ void bink_patch(so_module *port_mod) {
     return;
   }
 
-  // Shader-test mode leaves the real shader initializer enabled while every
-  // movie is skipped. The isolated video modes permit exactly one substituted
-  // call; production forwards every requested path to the real player.
-#if BINK_MODE == BINK_MODE_SKIP
-  hook_addr(play, (uintptr_t)&MacPlayBinkGL_stub);
-  hook_addr(shaders, (uintptr_t)&bink_stub);
-#elif BINK_MODE == BINK_MODE_SHADER_TEST
-  hook_addr(play, (uintptr_t)&MacPlayBinkGL_stub);
-  log_printf("[BINK] real shader initialization enabled; movie playback still skipped");
-#elif BINK_MODE == BINK_MODE_LEGAL_VIDEO || BINK_MODE == BINK_MODE_OPENSL_TEST || \
-      BINK_MODE == BINK_MODE_PLAY
   size_t patch_len = thumb_patch_len(play);
   MacPlayBinkGL_orig = (void *)build_thumb_trampoline(play, patch_len);
   if (!MacPlayBinkGL_orig) {
@@ -247,18 +184,9 @@ void bink_patch(so_module *port_mod) {
     return;
   }
   hook_addr(play, (uintptr_t)&MacPlayBinkGL_real);
-#if BINK_MODE == BINK_MODE_PLAY
   log_printf("[BINK] normal movie playback enabled: trampoline=%p patchLen=%u",
              (void *)MacPlayBinkGL_orig, (unsigned)patch_len);
-#else
-  log_printf("[BINK] one-movie test enabled: trampoline=%p patchLen=%u; "
-             "first request becomes %s, later requests skipped",
-             (void *)MacPlayBinkGL_orig, (unsigned)patch_len, BINK_TEST_MOVIE);
-#endif
-#if BINK_MODE == BINK_MODE_OPENSL_TEST || BINK_MODE == BINK_MODE_PLAY
   install_bink_snd_pump(port_mod);
-#endif
-#endif
 
   // DO NOT stub MacDecompress. The `Mac` prefix makes it look like a sibling of
   // MacPlayBinkGL/MacCreateBinkShaders, and bring-up stubbed it on that basis --
@@ -275,5 +203,5 @@ void bink_patch(so_module *port_mod) {
   // chargen's models were NULL: IODispatcher::ReadSync rejects the .mdl because
   // byte 0 of that garbage is not the required 0x00. Only assets served from
   // uncompressed RIM/module containers (gui3D_room, mainmenu) survived, which is
- // why the main menu looked fine.
+  // why the main menu looked fine.
 }

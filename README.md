@@ -398,8 +398,8 @@ assuming it hung.
 Needs [VitaSDK](https://vitasdk.org/) with vitaGL, vitashark, SceShaccCgExt,
 mathneon, FreeType and SDL2 installed. `SETUP.md` covers the toolchain.
 
-vitaGL must be built with the packed-VBO patch and `HAVE_SHADER_CACHE=1`, both
-in `SETUP.md`. Without the patch, vertex offsets above 64 KB are truncated and
+vitaGL must be built with the patch in `patches/` and `HAVE_SHADER_CACHE=1`,
+both in `SETUP.md`. Without the patch, vertex offsets above 64 KB are truncated and
 models stretch into spikes; without the cache, effects stall for seconds the
 first time they appear.
 
@@ -423,9 +423,8 @@ are not in the repo. The generated PNGs are checked in, so you only need the
 script, and those images, if you want to change how they look.
 
 Tunables live in `loader/config.h` — MSAA mode, the redundant texture-bind
-filter, memory layout. `RECON.md` documents the binary analysis the port is
-built on, and `DEVELOPMENT.md` covers the architecture and the debugging
-workflow.
+filter, memory layout. `DEVELOPMENT.md` covers the architecture and the
+debugging workflow.
 
 ---
 

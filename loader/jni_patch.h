@@ -9,7 +9,7 @@
 void *Android_JNI_GetEnv(void);
 
 // Build the fake VM/env. Every slot the game touches traces to log.txt.
-// This build has NO JNI_OnLoad (see RECON-JNI.md); the env is exercised when
+// This build has NO JNI_OnLoad; the env is exercised when
 // the real entry (SDL_main) runs.
 void jni_setup(void);
 

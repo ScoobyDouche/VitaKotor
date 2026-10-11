@@ -1004,9 +1004,7 @@ static void mix_grain(void) {
     }
   }
 
-#ifdef KOTOR_USE_BINK_OPENSL
   bink_opensl_mix(g_acc, OUT_GRAIN, OUT_RATE);
-#endif
 
   /* Peak limiter.
    *
@@ -2473,30 +2471,13 @@ void audio_log_stats(void) {
   }
 }
 
-/* OpenSLES interface IDs are data objects the engine dereferences by address;
- * a stable dummy address per IID is enough to satisfy relocation. */
-#ifndef KOTOR_USE_BINK_OPENSL
-static const uint32_t sl_iid_engine      = 0;
-static const uint32_t sl_iid_play        = 0;
-static const uint32_t sl_iid_volume      = 0;
-static const uint32_t sl_iid_bufferqueue = 0;
-#endif
-
 static const so_default_dynlib audio_dynlib[] = {
   // ---- OpenSLES (libandroid_port.so imports these directly) ----
-#ifdef KOTOR_USE_BINK_OPENSL
   { "slCreateEngine",     (uintptr_t)&bink_slCreateEngine },
   { "SL_IID_ENGINE",      (uintptr_t)&bink_sl_iid_engine },
   { "SL_IID_PLAY",        (uintptr_t)&bink_sl_iid_play },
   { "SL_IID_VOLUME",      (uintptr_t)&bink_sl_iid_volume },
   { "SL_IID_BUFFERQUEUE", (uintptr_t)&bink_sl_iid_bufferqueue },
-#else
-  { "slCreateEngine",     (uintptr_t)&fmod_stub },
-  { "SL_IID_ENGINE",      (uintptr_t)&sl_iid_engine },
-  { "SL_IID_PLAY",        (uintptr_t)&sl_iid_play },
-  { "SL_IID_VOLUME",      (uintptr_t)&sl_iid_volume },
-  { "SL_IID_BUFFERQUEUE", (uintptr_t)&sl_iid_bufferqueue },
-#endif
 
   // ---- FMOD C API ----
   { "FMOD_System_Create",       (uintptr_t)&Sys_Create },

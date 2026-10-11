@@ -33,8 +33,6 @@ static uint64_t g_last   = 0;
 static uint64_t g_expect = 0;    /* us this boot is predicted to take */
 static int      g_game_gl = 0;   /* the game has started issuing GL of its own */
 static int      g_art     = 0;   /* the art loaded, so the freeze applies */
-static unsigned g_probes  = 0;
-static uint64_t g_probe_t = 0;
 #if LOADSCREEN_ART
 static GLuint   g_tex    = 0;    /* background art, 0 when we never got any */
 static GLuint   g_logo   = 0;
@@ -394,25 +392,6 @@ void loadscreen_begin(int warm) {
 
 int loadscreen_active(void) { return g_active; }
 
-/* Record what the game has bound. Every call here is a pure query, and we are
- * in the loader's own wrapper before the real GL call runs, so vitaGL is not
- * re-entered. The values start at -1 so an enum vitaGL declines to answer reads
- * as unknown rather than as a plausible zero. */
-static void probe_gl_state(const char *when) {
-  GLint fbo = -1, prog = -1, vbo = -1, ibo = -1, tex = -1;
-  GLint vp[4] = { -1, -1, -1, -1 };
-  glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fbo);
-  glGetIntegerv(GL_CURRENT_PROGRAM, &prog);
-  glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &vbo);
-  glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &ibo);
-  glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex);
-  glGetIntegerv(GL_VIEWPORT, vp);
-  log_printf("[loadscreen:probe %u/%u] %s: fbo=%d prog=%d vbo=%d ibo=%d tex=%d "
-             "viewport=%d,%d %dx%d", g_probes + 1, (unsigned)LOADSCREEN_PROBE_MAX,
-             when, fbo, prog, vbo, ibo, tex, vp[0], vp[1], vp[2], vp[3]);
-  g_probes++;
-}
-
 void loadscreen_note_gl(void) {
 #if LOADSCREEN_ENABLE
   if (!g_active) return;
@@ -436,8 +415,6 @@ void loadscreen_note_gl(void) {
     else
       log_printf("[loadscreen] game began issuing GL at %u.%03us (plain bar, "
                  "keeps drawing)", ms / 1000, ms % 1000);
-    g_probe_t = now;
-    probe_gl_state("at the game's first GL call");
 #if LOADSCREEN_ART
     /* Nothing will ever draw it again. vitaGL defers the actual free until the
      * texture is no longer referenced, so this cannot pull memory out from
@@ -450,12 +427,6 @@ void loadscreen_note_gl(void) {
     hints_free();
     g_nhint = 0;
 #endif
-  } else if (g_probes < LOADSCREEN_PROBE_MAX) {
-    uint64_t now = sceKernelGetProcessTimeWide();
-    if (now - g_probe_t >= (uint64_t)LOADSCREEN_PROBE_MS * 1000) {
-      g_probe_t = now;
-      probe_gl_state("while frozen");
-    }
   }
 
   /* GLLOG used to call this directly. The plain bar still wants it; the art

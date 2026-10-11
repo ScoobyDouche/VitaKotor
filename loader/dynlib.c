@@ -1,11 +1,10 @@
 /* dynlib.c -- default_dynlib[] resolution table
  *
- * Categorisation follows RECON.md:
- *   (a) covered / wired to real VitaSDK libc/libm/libstdc++/pthread
- *   (b) stubbed (no-op / trivial return) -- process control, log, GL gaps
- * Audio (FMOD/OpenSLES) and Bink are stubbed in audio_patch.c / bink_patch.c.
- * OpenGL proper (the 127 gl / android_port_gl calls) is wired to vitaGL in a
- * later phase and is intentionally absent here.
+ *   (a) wired to real VitaSDK libc/libm/libstdc++/pthread, with shims where
+ *       bionic's struct layouts or the softfp float ABI differ
+ *   (b) stubbed (no-op / trivial return) -- process control, log
+ * Audio (FMOD/OpenSLES) lives in audio_patch.c, OpenGL in gl_patch.c, the
+ * filesystem in fs_patch.c, SDL in sdl_patch.c; each has its own table.
  */
 
 #include <vitasdk.h>
@@ -192,32 +191,10 @@ extern void *_ZTVN10__cxxabiv121__vmi_class_type_infoE;
 extern void *_ZNSt8bad_castD1Ev, *_ZNSt9exceptionD2Ev;
 extern void *_ZTIi, *_ZTISt8bad_cast, *_ZTISt9exception;
 
-// ---- allocation tracing (diagnostic) --------------------------------------
-// Armed (by gl_patch.c) only once init()'s final GL cap-query runs, so we don't
-// drown in the thousands of CRT/SDL/vitaGL allocations that precede it. Each
-// heap request in the hang window is logged with size BEFORE the call, so a
-// garbage size that makes the allocator spin still leaves a breadcrumb. The
-// companion's OpenGLESState::init is allocation-heavy; the last logged size
-// localises a hang there.
-volatile int g_mem_trace = 0;
-static volatile int g_mem_seq = 0;
 static void *(*real_Znwj)(size_t) = (void *(*)(size_t)) & _Znwj;
 static void *(*real_Znaj)(size_t) = (void *(*)(size_t)) & _Znaj;
 static void (*real_ZdlPv)(void *) = (void (*)(void *)) & _ZdlPv;
 static void (*real_ZdaPv)(void *) = (void (*)(void *)) & _ZdaPv;
-
-// Logging every allocation is ~20ms each and turns instant init into a crawl.
-// Throttle to a heartbeat (every 1024th) plus any unusually large request, so
-// the game runs near full speed: a FINITE init reaches the next phase quickly
-// (glCreateShader or a real hang) with a low mem# total, while an UNBOUNDED
-// alloc loop shows mem# climbing without limit.
-#define MEM_TRACE(tag, size) do {                                        \
-    if (g_mem_trace) {                                                   \
-      int s = g_mem_seq++;                                               \
-      if ((s & 1023) == 0 || (size_t)(size) > (1u << 20))                    \
-        log_printf("[mem#%d] " tag "(%u)", s, (unsigned)(size));         \
-    }                                                                    \
-  } while (0)
 
 // log72 stalls with the game thread HEALTHY: it keeps rendering the module
 // loading screen at ~40fps (frame 15480, draw counts climbing) while all resource
@@ -689,21 +666,21 @@ static char *fgets_diag(char *buf, int n, FILE *f) {
  * bigalloc.c. The delete operators have to be wrapped for the same reason:
  * libstdc++'s own _ZdlPv calls free(), which would hand a pool pointer to
  * newlib. */
-static void *malloc_diag(size_t n) { MEM_TRACE("malloc", n); heap_note_alloc(n); return big_malloc(n); }
+static void *malloc_diag(size_t n) { heap_note_alloc(n); return big_malloc(n); }
 static void *calloc_diag(size_t a, size_t b) {
-  MEM_TRACE("calloc", a * b); heap_note_alloc(a * b);
+  heap_note_alloc(a * b);
   size_t n = a * b;
   if (a && n / a != b) return NULL;                 /* overflow */
   void *p = big_malloc(n);
   if (p) memset(p, 0, n);
   return p;
 }
-static void *realloc_diag(void *p, size_t n) { MEM_TRACE("realloc", n); heap_note_alloc(n); return big_realloc(p, n); }
+static void *realloc_diag(void *p, size_t n) { heap_note_alloc(n); return big_realloc(p, n); }
 static void free_diag(void *p) { big_free(p); }
 /* Record the size so the new-handler can report what the failing request was;
  * a single huge allocation and a heap that is simply full need different fixes. */
 static void *Znwj_diag(size_t n) {
-  MEM_TRACE("new", n); g_heap_last_new = n; heap_note_alloc(n);
+  g_heap_last_new = n; heap_note_alloc(n);
   void *p = bigalloc(n);
   /* newlib next, then the pool at any size. Only if both refuse does the real
    * operator new run, with its new-handler and its bad_alloc. */
@@ -712,7 +689,7 @@ static void *Znwj_diag(size_t n) {
   return p ? p : real_Znwj(n);
 }
 static void *Znaj_diag(size_t n) {
-  MEM_TRACE("new[]", n); g_heap_last_new = n; heap_note_alloc(n);
+  g_heap_last_new = n; heap_note_alloc(n);
   void *p = bigalloc(n);
   if (!p) p = malloc(n);
   if (!p) p = bigalloc_rescue(n);
