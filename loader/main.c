@@ -1310,11 +1310,14 @@ static void read_vita_options(void) {
       g_draw_distance = atoi(v);
     if (ini_get(text, "Vita Options", "GrassWind", v, sizeof(v)) && v[0])
       g_grass_wind = atoi(v) != 0;
+    if (ini_get(text, "Vita Options", "TextureBits", v, sizeof(v)) && v[0])
+      g_gl_tex16 = atoi(v) != 32;
     free(text);
     break;
   }
   obb_cache_init((size_t)cache_kb);
   log_printf("[perf] draw distance cap: %d m (0 = the area's own fog)", g_draw_distance);
+  log_printf("[perf] texture bits: %d (TextureBits)", g_gl_tex16 ? 16 : 32);
 
   // Read by UpdateGrassForWind on every call, so setting it before the game
   // starts is enough.

@@ -1062,10 +1062,12 @@ static void tex16_pack(uint16_t *dst, const unsigned char *src, int w, int h, in
 
 /* The one 2D upload path: convert when we can, charge what was really spent,
  * hand it to vitaGL. Always uploads exactly once. */
+int g_gl_tex16 = GL_TEX16_CONVERT;   /* swkotor.ini [Vita Options] TextureBits */
+
 static void tex_upload2d(GLenum tg, GLint l, GLint ifmt, GLsizei w, GLsizei h,
                          GLint b, GLenum f, GLenum ty, const void *px) {
-#if GL_TEX16_CONVERT
-  int kind = (f == GL_RGBA) ? TEX16_4444 : (f == GL_RGB) ? TEX16_565 : TEX16_NONE;
+  int kind = !g_gl_tex16  ? TEX16_NONE
+           : (f == GL_RGBA) ? TEX16_4444 : (f == GL_RGB) ? TEX16_565 : TEX16_NONE;
   if (px && kind != TEX16_NONE && ty == GL_UNSIGNED_BYTE && w > 0 && h > 0) {
     uint16_t *cv = (uint16_t *)malloc((size_t)w * h * 2);
     if (cv) {
@@ -1083,7 +1085,6 @@ static void tex_upload2d(GLenum tg, GLint l, GLint ifmt, GLsizei w, GLsizei h,
       return;
     }
   }
-#endif
   tex_charge(g_cur_tex, tg, l, w, h, fmt_bpp(f));
   glTexImage2D(tg, l, ifmt, w, h, b, f, ty, px);
 }

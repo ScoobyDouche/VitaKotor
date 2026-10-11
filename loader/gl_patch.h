@@ -15,6 +15,10 @@ void gl_patch_on_swap(uint64_t swap_begin_us, uint64_t swap_end_us);
 /* When the last frame was presented; the hitch sampler measures from it. */
 extern volatile uint64_t g_last_swap_end_us;
 
+/* 1 = upload RGBA8/RGB8 textures as 4444/565 (GL_TEX16_CONVERT). Set before
+ * the first texture upload; ids converted under one setting keep it. */
+extern int g_gl_tex16;
+
 /* Scope for KOTOR's nested AurGUI viewport stack. */
 extern int g_gl_gui_viewport_scope;
 

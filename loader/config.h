@@ -560,5 +560,6 @@
 // not ours to change, and the environment map is 64x64x6 and not worth the
 // risk. Textures we convert are remembered per id so glTexSubImage2D can
 // match, since a byte-typed sub-upload into a 4444 texture would corrupt it.
-// Set to 0 to go back to full-precision uploads.
+// Set to 0 to go back to full-precision uploads. swkotor.ini [Vita Options]
+// TextureBits=32 overrides it (anything else means 16).
 #define GL_TEX16_CONVERT 1
