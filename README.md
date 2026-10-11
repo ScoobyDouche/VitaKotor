@@ -34,8 +34,8 @@ containers and saves all work, and it looks and sounds like the game.
 The two faults that used to wear a long session down are **fixed**: sound no
 longer thins out and goes silent, and the world geometry no longer tears into
 spikes. Sessions of close to 100 minutes now end as healthy as they started.
-What remains is frame rate and a few rough edges. Nothing crashes and no save
-has been lost. See [Known issues](#known-issues).
+What remains is frame rate and a few rough edges. One rare crash has been seen
+and no save has been lost. See [Known issues](#known-issues).
 
 So: worth starting a proper playthrough on now. Save regularly all the same.
 
@@ -321,6 +321,11 @@ you a save. They are listed because you may hit them. Save regularly.
   the camera stick and touch input stopped doing anything while the game kept
   running. It has not been seen since, but touch and buttons together have not
   had a long session yet. Relaunching clears it.
+- **Rare crash right after an area-change auto-save.** Once, leaving the
+  Leviathan, the game crashed while unloading the old area. The auto-save had
+  already finished, so nothing was lost. It looks like a freeze because the
+  crash handler parks the app. Relaunch and load; the same exit worked on the
+  next try. If it happens to you, please send `log.txt`.
 
 ### Rough edges
 
