@@ -79,10 +79,11 @@
 #define OUT_GRAIN    1024                 /* frames per sceAudioOutOutput call */
 /* FModAudioSystem::InitSystem asks for (arg + 5) channels and InitChannels then
  * walks getChannel(0 .. count-1), aborting all of sound if ANY call is not
- * FMOD_OK. With 2D+3D voices at 24+16 that is 45; keep comfortable headroom and
- * log what is actually requested. Mixing cost is per PLAYING channel, so a large
- * pool is nearly free. */
-#define MAX_CHANNELS 96
+ * FMOD_OK. The game passes 24+16 voices, 45 channels, and main.c raises that to
+ * 96 (FMOD_SLOT_COUNT) so the companion's slot table stops filling; that has to
+ * fit in MAX_PLAY_CHANNELS. Mixing cost is per PLAYING channel, so a large pool
+ * is nearly free. */
+#define MAX_CHANNELS 128
 /* The tail of g_chan is not playable: it is where a voice about to be stolen
  * parks its undelivered END so System::update can still hand it to the game.
  * See chan_retire. Reserving it inside g_chan (rather than a separate array)
@@ -1728,6 +1729,10 @@ static int Sys_createSound(void *self, const char *name, unsigned mode,
             ss->ent  = NULL;
             ss->st   = st;
             ss->pcm  = fmt;                /* fmt.pcm is NULL */
+            /* The voice trace skips untagged sounds, and every stream returns
+             * here before the tag below is set -- log253 traced nothing. */
+            strncpy(ss->tag, what, sizeof ss->tag - 1);
+            ss->tag[sizeof ss->tag - 1] = '\0';
             *out = ss;
             log_printf("[snd] createSound STREAMING \"%.64s\" -> %u ms %uHz %uch "
                        "(es %u KB, ring %u KB; whole decode would have been %u KB)",
@@ -2248,7 +2253,8 @@ unsigned audio_play_count(void) { return g_play_calls; }
  * Offsets, from the companion's own code (+0x7355c PlaySound, +0x751a0 Reset,
  * +0x746a4 GetIsChannelPlaying):
  *   info+0   slot key (what PlaySound returns and StopChannel takes)
- *   info+16  in use          info+20  stolen, awaiting reboot
+ *   info+16  in use          info+20  looping (SetChannelLoopCount; HandleChannelEnd
+ *                                      replays the sound while it is set)
  *   info+24  paused by game  info+28  ended (HandleChannelEnd set it)
  *   info+68  FMOD::Channel*  -- one of ours
  * libc++ map: map+4 is the root; a node is {left, right, parent, colour, key,
@@ -2256,7 +2262,7 @@ unsigned audio_play_count(void) { return g_play_calls; }
  * walking it from the watchdog thread is safe; only the slot words change. */
 #define SLOT_KEY(i)     (*(unsigned *)((char *)(i) + 0))
 #define SLOT_INUSE(i)   (*(int *)((char *)(i) + 16))
-#define SLOT_STOLEN(i)  (*(int *)((char *)(i) + 20))
+#define SLOT_LOOPING(i) (*(int *)((char *)(i) + 20))
 #define SLOT_GPAUSED(i) (*(int *)((char *)(i) + 24))
 #define SLOT_ENDED(i)   (*(int *)((char *)(i) + 28))
 #define SLOT_CHAN(i)    (*(void **)((char *)(i) + 68))
@@ -2304,9 +2310,12 @@ void audio_slots_attach(void *fmod_sys, void (*reset)(void *info)) {
 /* Called before the companion scans for a free slot. With one free, nothing is
  * touched: this only ever acts on a table that is already refusing everything.
  * Then it frees the deadest slot, oldest voice first within a rank, and never a
- * voice that is still audible. The game may still hold the old key and stop it
- * later; if the slot has been reused by then it cuts a new sound short, which is
- * the whole cost, against all sound going quiet for good. */
+ * voice that is still audible. The game may still hold the old key, and whatever
+ * it does with it lands on the slot's next sound: a stop cuts that sound short,
+ * and a streaming source's Resume() sets the loop flag from its own looping
+ * setting -- log253 replayed a dead Dark Jedi's line 12 times that way. main.c
+ * sizes the table so this should not run at all; it is the last resort against
+ * all sound going quiet for good. */
 void audio_slots_ensure_free(void) {
   void *info[SLOT_MAX];
   int n = slot_collect(info);
@@ -2336,12 +2345,12 @@ void audio_slots_ensure_free(void) {
   }
   g_slot_reclaimed[best_rank]++;
   unsigned total = g_slot_reclaimed[0] + g_slot_reclaimed[1] + g_slot_reclaimed[2];
-  int key = (int)SLOT_KEY(best), st = SLOT_STOLEN(best), gp = SLOT_GPAUSED(best),
+  int key = (int)SLOT_KEY(best), st = SLOT_LOOPING(best), gp = SLOT_GPAUSED(best),
       en = SLOT_ENDED(best);
   unlock();
   g_slot_reset(best);
   if (total <= 40 || (total & 63) == 0)
-    log_printf("[snd] slot table FULL: reclaimed slot %d (rank %d: %s; stolen=%d "
+    log_printf("[snd] slot table FULL: reclaimed slot %d (rank %d: %s; looping=%d "
                "gamePaused=%d ended=%d) -- reclaim #%u",
                key, best_rank,
                best_rank == 0 ? "voice no longer its own" :
@@ -2364,22 +2373,22 @@ void audio_log_slots(void) {
   void *info[SLOT_MAX];
   int n = slot_collect(info);
   if (!n) return;
-  int inuse = 0, ended = 0, gpaused = 0, stolen = 0, rank[4] = {0, 0, 0, 0};
+  int inuse = 0, ended = 0, gpaused = 0, looping = 0, rank[4] = {0, 0, 0, 0};
   lock();
   for (int i = 0; i < n; i++) {
     if (!SLOT_INUSE(info[i])) continue;
     inuse++;
     if (SLOT_ENDED(info[i]))   ended++;
     if (SLOT_GPAUSED(info[i])) gpaused++;
-    if (SLOT_STOLEN(info[i]))  stolen++;
+    if (SLOT_LOOPING(info[i]))  looping++;
     rank[slot_rank(info[i])]++;
   }
   unlock();
-  log_printf("[snd] slots: %d/%d in use (ended %d, game-paused %d, stolen %d | "
+  log_printf("[snd] slots: %d/%d in use (ended %d, game-paused %d, looping %d | "
              "orphaned %d, over %d, parked %d, live %d) | table full %u times, "
              "reclaimed %u orphaned / %u over / %u parked, %u unfreeable, "
              "%u foreign stops refused",
-             inuse, n, ended, gpaused, stolen, rank[0], rank[1], rank[2], rank[3],
+             inuse, n, ended, gpaused, looping, rank[0], rank[1], rank[2], rank[3],
              g_slot_full, g_slot_reclaimed[0], g_slot_reclaimed[1],
              g_slot_reclaimed[2], g_slot_unfreeable, g_stop_foreign);
 }

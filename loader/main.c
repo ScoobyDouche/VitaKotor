@@ -1136,6 +1136,23 @@ static void *FmodStopChannel_probe(void *self, unsigned key) {
   return rc;
 }
 
+/* InitSystem(n) builds n + 5 ChannelInfo slots and the game passes 40 (24 2D +
+ * 16 3D voices). A voice keeps its slot after its sound ends until the voice is
+ * reused, and every looping area sound and music track holds one more, so a busy
+ * area overflows 45: log253's Sith base filled it 791 times. Each overflow made
+ * audio_slots_ensure_free hand a slot to a new sound while its old owner still
+ * held the key -- and that owner's later Resume() set the loop flag on the new
+ * sound: a dead Dark Jedi's line replayed 12 times. Size the table so it does
+ * not fill; the reclaim stays as a last resort. */
+#define FMOD_SLOT_COUNT 96
+static int (*FmodInitSystem_orig)(void *, int) = NULL;
+static int FmodInitSystem_probe(void *self, int n) {
+  int want = FMOD_SLOT_COUNT - 5;
+  log_printf("[snd] FModAudioSystem::InitSystem(%d) -> %d (%d slots)", n,
+             n < want ? want : n, (n < want ? want : n) + 5);
+  return FmodInitSystem_orig(self, n < want ? want : n);
+}
+
 static void *FmodPlaySound_probe(void *self, int id) {
   slots_attach(self);
   audio_slots_ensure_free();
@@ -1482,6 +1499,8 @@ static void install_sound_probe(void) {
   hook_named("_ZN32CExoStreamingSoundSourceInternal16InitializeSourceEv",
              (uintptr_t)&StreamInit_probe, (void **)&StreamInit_orig,
              "CExoStreamingSoundSourceInternal::InitializeSource");
+  hook_named_port("_ZN15FModAudioSystem10InitSystemEi", (uintptr_t)&FmodInitSystem_probe,
+                  (void **)&FmodInitSystem_orig, "FModAudioSystem::InitSystem");
   hook_named_port("_ZN15FModAudioSystem11CreateSoundEPciPvmii",
                   (uintptr_t)&FmodCreateSound_probe,
                   (void **)&FmodCreateSound_orig, "FModAudioSystem::CreateSound");
