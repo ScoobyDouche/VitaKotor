@@ -78,6 +78,7 @@ add_executable(KOTOR
   loader/sce_pad.c
   loader/threads.c
   loader/ini_write.c
+  loader/script_fix.c
 )
 
 target_compile_definitions(KOTOR PRIVATE KOTOR_USE_BINK_OPENSL=1)

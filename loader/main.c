@@ -43,6 +43,7 @@
 #include "obb_cache.h"
 #include "threads.h"
 #include "ini_write.h"
+#include "script_fix.h"
 
 // SDL.h would #define main to SDL_main; this is the only SDL call made here.
 extern int SDL_setenv(const char *name, const char *value, int overwrite);
@@ -1762,6 +1763,7 @@ int main(int argc, char *argv[]) {
   install_load_probe();
   gameprof_install();
   ini_write_install();
+  script_fix_install();
   install_sound_probe();
   modset_install_button();
 
