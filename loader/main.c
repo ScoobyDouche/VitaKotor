@@ -1473,6 +1473,37 @@ static void offer_language_picker(void) {
   write_language(picked, folder);
 }
 
+// Save a [Vita Options] key. Same file and same caution as write_language.
+static void write_vita_option(const char *key, const char *value) {
+  const char *path = g_ini_path ? g_ini_path : kIniPaths[0];
+  char *text = read_whole_ini(path);
+  const char *base = text ? text : "";
+  size_t need = ini_set(base, "Vita Options", key, value, NULL, 0);
+  char *out = malloc(need + 1);
+  if (out) ini_set(base, "Vita Options", key, value, out, need + 1);
+  free(text);
+  if (!out) return;
+  if (ini_replace_file(path, out, need))
+    log_printf("[ini] saved [Vita Options] %s=%s to %s", key, value, path);
+  free(out);
+}
+
+// Texture quality, offered right after the mod set on the same button.
+// Textures are first uploaded after this point, so the choice applies now, not
+// on the next boot. 32-bit looked the same speed on Tatooine (log255) but left
+// under 1 MB of the 96 MB of VRAM free where 16-bit left ~29 MB; past that,
+// vitaGL silently puts textures in slower RAM.
+static void offer_texture_menu(void) {
+  static const char *const rows[] = {"16-BIT, FASTER", "32-BIT, SHARPER"};
+  int picked = g_gl_tex16 ? 0 : 1;
+  if (!langsel_list("TEXTURE QUALITY", "32-BIT CAN RUN OUT OF VIDEO MEMORY IN BIG AREAS",
+                    rows, 2, picked, &picked))
+    return;
+  g_gl_tex16 = picked == 0;
+  write_vita_option("TextureBits", g_gl_tex16 ? "16" : "32");
+  log_printf("[perf] texture bits: %d (picked in the mod menu)", g_gl_tex16 ? 16 : 32);
+}
+
 // The mod menu, when the Google Play button asked for it on the last run (see
 // modset.h). Same window and same screen as the language picker, and for the
 // same reasons; row 0 is the card root as it was before mod sets existed.
@@ -1491,6 +1522,7 @@ static void offer_mod_menu(void) {
                     rows, count, picked, &picked))
     return;
   modset_choose(picked - 1);
+  offer_texture_menu();
 }
 
 static void install_sound_probe(void) {

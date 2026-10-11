@@ -147,6 +147,7 @@ GrassWind=0
 | `GrassWind` | `0` | `1` makes the grass sway again, at a CPU cost every frame |
 | `DrawDistance` | `0` | Caps how far you can see, in metres, in areas that have fog. It made no measurable difference on Dantooine, so it is off |
 | `ObbCacheKB` | `8192` | RAM kept for recent reads from the game's archives |
+| `TextureBits` | `16` | `32` loads textures at full colour depth: sharper, about the same speed, but it can use up the Vita's video memory in big areas. Also selectable from the **MODS** button |
 
 ## Controls
 
@@ -257,6 +258,8 @@ The main menu's Google Play button is a **MODS** button on the Vita. Press it
 and the game restarts into a list with **VANILLA** first, then every folder in
 `mods/`. Pick one and the game starts with it; the choice is remembered. A set
 only needs the files its mods change. Everything else comes from the OBB.
+A second list then asks for texture quality: 16-bit (faster) or 32-bit
+(sharper). That choice is saved too.
 
 - The Android game is the **controller** version of KOTOR. It reads
   `tv_dialog.tlk`, not `dialog.tlk`, so rename a mod's `dialog.tlk`.
