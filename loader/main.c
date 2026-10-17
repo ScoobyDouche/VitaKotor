@@ -1483,7 +1483,7 @@ static void offer_mod_menu(void) {
 
   int picked = modset_active() + 1;
   if (!langsel_list("CHOOSE A MOD SET",
-                    count > 1 ? "CHANGE THIS AGAIN WITH THE GOOGLE PLAY BUTTON"
+                    count > 1 ? "CHANGE THIS AGAIN WITH THE MODS BUTTON"
                               : "ADD MOD SETS AS FOLDERS IN UX0:DATA/KOTOR/MODS/",
                     rows, count, picked, &picked))
     return;
