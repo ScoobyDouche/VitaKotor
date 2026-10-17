@@ -73,6 +73,21 @@ below says which fixes have not been released yet.
 The Android release: the `.apk` and both `.obb` expansion files. An `.apk` is
 just a zip — open it with any archive tool to get at the libraries inside.
 
+**Which APK versions work?**
+
+| APK | Status |
+|---|---|
+| **1.0.10** | Works — the version this port was built on |
+| **1.0.9 build 54** | Works — its libraries are identical to 1.0.10's |
+| **1.0.7 / 1.0.71** | Works — tested on hardware: menus, saves, movies, sound, MODS |
+| **1.0.9 Amazon Underground** | **Does not work** — an older build with a different audio engine |
+
+To tell them apart, look inside `lib/armeabi-v7a/` in the APK: if it has
+`libfmod.so` it works; if it has `libfmodex.so` and `libgnustl_shared.so`
+instead, it is the Amazon Underground build. With the repository checked out,
+`python3 tools/check_apk.py yourfile.apk` reports whether the loader has
+everything a given APK needs.
+
 ---
 
 ## Installation
