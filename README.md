@@ -370,6 +370,9 @@ you a save. They are listed because you may hit them. Save regularly.
 
 ### Recently fixed
 
+- **The 1.0.7 / 1.0.71 APK would not run** *(v0.4.3)*. It is an older build
+  than 1.0.10 and needed five more functions and a movie hook that does not
+  rely on a fixed address.
 - **Griff never appeared in the Sand People Enclave** *(v0.4.2)*. Opening
   one of their chests before asking Czerka about him used the same switch
   the game uses to remember spawning him. A bug in the original game.
