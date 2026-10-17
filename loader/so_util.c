@@ -67,11 +67,85 @@ size_t thumb_patch_len(uintptr_t addr) {
   return len;
 }
 
+/* The trampoline runs the first `len` bytes of orig_fn from somewhere else, so
+ * anything in them that reads PC would read the wrong place. A literal load
+ * (LDR Rt,[PC,#imm], 16- or 32-bit) is rewritten to an LDR.W from the
+ * trampoline's own pool holding the same word. Anything else PC-relative --
+ * branches, ADR, ADD/MOV from PC, other literal loads -- or an IT block that
+ * runs past `len` (it would make the jump back conditional) fails the build,
+ * and every caller then skips its hook rather than crashing inside it.
+ * 1.0.10 never needs the rewrite; 1.0.71 has literal loads in the first 8
+ * bytes of two of gameprof's targets. Returns the halfword count, 0 to refuse. */
+static size_t thumb_relocate(uintptr_t orig_fn, size_t len, uint16_t *out,
+                             uint32_t *lit, size_t *nlit, size_t *lit_at) {
+  size_t n = 0, it_left = 0;
+  *nlit = 0;
+  for (size_t off = 0; off < len; ) {
+    uintptr_t pc = orig_fn + off;
+    uint16_t hw = *(const uint16_t *)pc;
+    uintptr_t base = (pc + 4) & ~(uintptr_t)3;
+    int rt = -1;
+    uintptr_t src = 0;
+    if (it_left) it_left--;
+    if (hw >= 0xE800) {
+      uint16_t hw2 = *(const uint16_t *)(pc + 2);
+      if ((hw & 0xFF7F) == 0xF85F) {                        // LDR.W Rt, [PC, #+/-imm12]
+        rt = hw2 >> 12;
+        src = (hw & 0x80) ? base + (hw2 & 0xFFF) : base - (hw2 & 0xFFF);
+      } else if (((hw & 0xF800) == 0xF000 && (hw2 & 0x8000)) ||  // B/BL/BLX/Bcc.W
+                 ((hw & 0xFE00) == 0xF800 && (hw & 0xF) == 0xF) ||  // other loads from PC
+                 (hw & 0xFE5F) == 0xE85F ||                      // LDRD literal
+                 (hw & 0xFFF0) == 0xE8D0 ||                      // TBB/TBH
+                 (hw & 0xFBFF) == 0xF20F || (hw & 0xFBFF) == 0xF2AF) {  // ADR.W
+        return 0;
+      } else {
+        out[n++] = hw;
+        out[n++] = hw2;
+      }
+      off += 4;
+    } else {
+      if ((hw & 0xF800) == 0x4800) {                        // LDR Rt, [PC, #imm8*4]
+        rt = (hw >> 8) & 7;
+        src = base + ((hw & 0xFF) << 2);
+      } else if ((hw & 0xFF78) == 0x4478 || (hw & 0xFF78) == 0x4678 ||  // ADD/MOV Rd, PC
+                 (hw & 0xF800) == 0xA000 ||                 // ADR
+                 ((hw & 0xF000) == 0xD000 && (hw & 0x0E00) != 0x0E00) ||  // Bcc
+                 (hw & 0xF800) == 0xE000 ||                 // B
+                 (hw & 0xF500) == 0xB100) {                 // CBZ/CBNZ
+        return 0;
+      } else {
+        if ((hw & 0xFF00) == 0xBF00 && (hw & 0xF))          // IT: 4 - ctz(mask) insns
+          it_left = 4 - __builtin_ctz(hw & 0xF);
+        out[n++] = hw;
+      }
+      off += 2;
+    }
+    if (rt >= 0) {
+      if (rt == 15 || *nlit == 4) return 0;
+      lit[*nlit] = *(const uint32_t *)src;
+      lit_at[(*nlit)++] = n;
+      out[n++] = 0xF8DF;                                    // LDR.W Rt, [PC, #pool]
+      out[n++] = (uint16_t)(rt << 12);                      // offset filled in later
+    }
+  }
+  return it_left ? 0 : n;
+}
+
 uintptr_t build_thumb_trampoline(uintptr_t orig_fn, size_t len) {
   orig_fn &= ~(uintptr_t)1;
-  size_t pad = (len & 2) ? 2 : 0;
-  size_t sz = len + pad + 8;
-  if (sz > 32) return 0;
+  uint16_t code[16];
+  uint32_t lit[4];
+  size_t nlit, lit_at[4];
+  if (len > 16) return 0;
+  size_t n = thumb_relocate(orig_fn, len, code, lit, &nlit, lit_at);
+  if (!n) return 0;
+
+  // code, NOP to 4-byte alignment, LDR.W PC,[PC] + return address, literal pool
+  size_t cb = n * 2;
+  size_t pad = (cb & 2) ? 2 : 0;
+  size_t pool = cb + pad + 8;
+  size_t sz = pool + nlit * 4;
+  if (sz > 64) return 0;
 
   SceKernelAllocMemBlockKernelOpt opt;
   memset(&opt, 0, sizeof(opt));
@@ -83,14 +157,19 @@ uintptr_t build_thumb_trampoline(uintptr_t orig_fn, size_t len) {
   void *base = NULL;
   if (sceKernelGetMemBlockBase(blk, &base) < 0 || !base) return 0;
 
-  uint8_t buf[32];
-  memcpy(buf, (const void *)orig_fn, len);
+  for (size_t i = 0; i < nlit; i++) {  // base is page-aligned, so offsets are addresses
+    size_t at = lit_at[i] * 2;
+    code[lit_at[i] + 1] |= (uint16_t)(pool + i * 4 - ((at + 4) & ~(size_t)3));
+  }
+  uint8_t buf[64];
+  memcpy(buf, code, cb);
   uint16_t nop = 0xbf00;
   uint32_t ldrpc = 0xf000f8df;
   uint32_t cont = (uint32_t)(orig_fn + len) | 1u;
-  if (pad) memcpy(buf + len, &nop, sizeof nop);
-  memcpy(buf + len + pad, &ldrpc, sizeof ldrpc);
-  memcpy(buf + len + pad + sizeof ldrpc, &cont, sizeof cont);
+  if (pad) memcpy(buf + cb, &nop, sizeof nop);
+  memcpy(buf + cb + pad, &ldrpc, sizeof ldrpc);
+  memcpy(buf + cb + pad + sizeof ldrpc, &cont, sizeof cont);
+  memcpy(buf + pool, lit, nlit * 4);
   kuKernelCpuUnrestrictedMemcpy(base, buf, sz);
   kuKernelFlushCaches(base, sz);
   return (uintptr_t)base | 1u;

@@ -54,8 +54,32 @@ void bink_patch_on_swap(uint64_t swap_end_us) {
 /* The companion's async audio worker services this pump once before the first
  * decoded-frame sequence is published, then never services it again on Vita.
  * Capture the handle at that first call; bink_snd_pump_on_swap drives the same
- * internally locked pump once per later frame-sequence advance. */
-#define BINK_SND_PUMP_OFF    0x85670u
+ * internally locked pump once per later frame-sequence advance.
+ *
+ * The pump is a static function, so there is no symbol to find it by. It sits
+ * at +0x85670 in 1.0.10 and +0x7e250 in 1.0.71 with identical code, so find it
+ * by its prologue and the struct loads that follow (bink+0x11c, bink+0x184). */
+static const uint16_t bink_pump_prologue[] = {
+  0xb5f0, 0xaf03, 0xe92d, 0x0f00, 0xb08d, 0x4682,  // push; add r7; stmdb; sub sp; mov sl,r0
+};
+static const uint16_t bink_pump_body[] = {        // at +0x16, past the stack-guard load
+  0xf8da, 0x111c, 0xf8da, 0x0184, 0xeb01, 0x0241, 0xeb00, 0x12c2, 0xf852, 0x2c28,
+};
+#define BINK_PUMP_BODY_AT 0x16
+
+static uintptr_t find_bink_snd_pump(so_module *port_mod) {
+  const uint8_t *p = (const uint8_t *)port_mod->text_base;
+  size_t end = port_mod->text_size - BINK_PUMP_BODY_AT - sizeof bink_pump_body;
+  uintptr_t found = 0;
+  for (size_t off = 0; off <= end; off += 2) {
+    if (memcmp(p + off, bink_pump_prologue, sizeof bink_pump_prologue) ||
+        memcmp(p + off + BINK_PUMP_BODY_AT, bink_pump_body, sizeof bink_pump_body))
+      continue;
+    if (found) return 0;  // ambiguous: hooking the wrong one is worse than none
+    found = (uintptr_t)(p + off);
+  }
+  return found;
+}
 
 static void (*BinkSndPump_orig)(void *bink);
 
@@ -103,7 +127,13 @@ static void bink_pump_log(void) {
 }
 
 static void install_bink_snd_pump(so_module *port_mod) {
-  uintptr_t fn = (port_mod->text_base + BINK_SND_PUMP_OFF) | 1u;
+  uintptr_t fn = find_bink_snd_pump(port_mod);
+  if (!fn) {
+    log_printf("[BINK:PUMP] pump not found in this build -- movie audio may stall");
+    return;
+  }
+  log_printf("[BINK:PUMP] found at +0x%x", (unsigned)(fn - port_mod->text_base));
+  fn |= 1u;
   size_t len = thumb_patch_len(fn);
   BinkSndPump_orig = (void *)build_thumb_trampoline(fn, len);
   if (!BinkSndPump_orig) {
