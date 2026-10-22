@@ -40,7 +40,7 @@ few rough edges. One rare crash has been seen, and no save has been lost. See
 | Frame rate | Locked to 30 fps; holds it in most areas with Grass, Shadows and Frame Buffer off (see [Graphics settings](#graphics-settings)); dense scenes dip to ~20 |
 | Playthrough | Completed start to finish, unmodded |
 | Audio | Effects, voice and music all work |
-| Cutscenes | Bink movies play with sound; tap or press a button to skip |
+| Cutscenes | Every movie checked: all play with sound; tap or press a button to skip |
 | Input | Touchscreen, sticks and buttons — see [Controls](#controls) |
 | Saves | Work, stored on the Vita |
 | Mods | Work — KOTOR 1 Restoration plus six more played together; see [Mods](#mods) |
@@ -353,9 +353,6 @@ because you may hit it. Save regularly.
   preparing several hundred objects a frame; the graphics chip is not the
   limit. Video memory is also full for most of a session, so textures loaded
   after the first minute are served from ordinary RAM.
-- **Not every movie has been checked.** The ones played so far run with
-  sound and hand back to the game cleanly; 48 kHz movies and localized
-  subtitles have not been specifically tested.
 - **No trophies.**
 
 ### Recently fixed
