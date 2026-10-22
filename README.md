@@ -25,11 +25,11 @@ with a from-scratch FMOD audio implementation over `sceAudiodec` and
 
 ## Status
 
-**Work in progress — good enough for a real playthrough, if you save regularly.**
+**The full game is playable — it has been played from start to finish on a Vita.**
 
-It boots, gets through character creation, and plays through the Endar Spire,
-Taris, Dantooine, Tatooine and Kashyyyk. Combat, dialogue, inventory,
-containers and saves all work, and it looks and sounds like the game.
+It boots, gets through character creation, and plays every planet through to
+the ending. Combat, dialogue, inventory, containers and saves all work, and it
+looks and sounds like the game.
 
 The two faults that used to wear a long session down are **fixed**: sound no
 longer thins out and goes silent, and the world geometry no longer tears into
@@ -37,7 +37,7 @@ spikes. Sessions of close to 100 minutes now end as healthy as they started.
 What remains is frame rate and a few rough edges. One rare crash has been seen
 and no save has been lost. See [Known issues](#known-issues).
 
-So: worth starting a proper playthrough on now. Save regularly all the same.
+So: start a full playthrough. Save regularly all the same.
 
 | | |
 |---|---|
