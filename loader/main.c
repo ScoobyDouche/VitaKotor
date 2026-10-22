@@ -1729,6 +1729,11 @@ int main(int argc, char *argv[]) {
   scePowerSetBusClockFrequency(222);
   scePowerSetGpuClockFrequency(222);
   scePowerSetGpuXbarClockFrequency(166);
+  // A clock plugin (PSVshell at 500 MHz) may override the request above; say
+  // what the CPU is actually running at, since every frame figure depends on it.
+  log_printf("[perf] clocks: ARM %d MHz, bus %d, GPU %d, xbar %d",
+             scePowerGetArmClockFrequency(), scePowerGetBusClockFrequency(),
+             scePowerGetGpuClockFrequency(), scePowerGetGpuXbarClockFrequency());
 
   if (check_kubridge() < 0)
     fatal_error("kubridge.skprx is not installed.\n\nAdd it to the *KERNEL section of ur0:tai/config.txt and reboot.");

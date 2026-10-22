@@ -343,6 +343,11 @@
 // the [prof] lines. Diagnostic only: ~10 timers a draw cost several ms a frame.
 #define GAME_PROF_DRAW (GAME_PROF && 0)
 
+// Count every GL call the port makes and print per-frame averages in the
+// 120-frame [glc] lines. Diagnostic for the render-thread work: it says which
+// calls would make the game thread wait. Costs a few us per GL call; ship 0.
+#define GL_CALL_CENSUS 0
+
 // KOTOR's Android loop turns an AI update over 33/67/100/133 ms into
 // 2/4/7/11 complete GameUpdate calls before the next presentation. On Vita the
 // extra no-present updates amplify one slow frame into a stutter cascade. Clear

@@ -17,6 +17,7 @@
  */
 
 #include <vitasdk.h>
+#include <kubridge.h>
 #include <vitaGL.h>
 #include <string.h>
 #include <stdlib.h>
@@ -37,6 +38,13 @@
 #include "gameprof.h"
 #include "lzma_cache.h"
 #include "obb_cache.h"
+
+#ifndef SCE_KERNEL_MEMBLOCK_TYPE_USER_RX
+#define SCE_KERNEL_MEMBLOCK_TYPE_USER_RX 0x0C20D050
+#endif
+#if GL_CALL_CENSUS
+static void glc_report(unsigned frames);
+#endif
 
 static inline float u2f(uint32_t u) { union { uint32_t u; float f; } c; c.u = u; return c.f; }
 
@@ -299,6 +307,11 @@ static GLuint   g_unit2d[GL_MAX_TEXUNITS];
 
 static GLuint   g_cur_arraybuf = 0;      /* last glBindBuffer(GL_ARRAY_BUFFER) */
 
+/* glDraw time is sampled on one draw in eight and scaled: two clock reads a
+ * draw cost ~0.8 ms a frame in the Upper City (0.68 us a read, log
+ * 2026-10-22), for a figure that only needs to be right on average. */
+static unsigned g_draw_sample;
+
 static inline void draw_note_source(void) {
   if (g_cur_arraybuf) { g_draw_vbo_win++; g_draw_vbo_frame++; }
   else { g_draw_client_win++; g_draw_client_frame++; }
@@ -309,9 +322,10 @@ static void glDrawArrays_t(GLenum mode, GLint first, GLsizei count) {
   if (g_draw_n < 20) log_printf("[GL] glDrawArrays(mode=0x%x, first=%d, count=%d) #%d",
                                (unsigned)mode, first, (int)count, g_draw_n);
   g_draw_n++; g_arrays_win++; g_arrays_frame++; g_arrays_tot++; draw_note_source();
+  if (++g_draw_sample & 7) { glDrawArrays(mode, first, count); return; }
   uint64_t t0 = sceKernelGetProcessTimeWide();
   glDrawArrays(mode, first, count);
-  g_prof_draw_us += sceKernelGetProcessTimeWide() - t0;
+  g_prof_draw_us += (sceKernelGetProcessTimeWide() - t0) * 8;
 }
 
 static void glDrawElements_t(GLenum mode, GLsizei count, GLenum type, const void *idx) {
@@ -319,9 +333,10 @@ static void glDrawElements_t(GLenum mode, GLsizei count, GLenum type, const void
   if (g_draw_n < 20) log_printf("[GL] glDrawElements(mode=0x%x, count=%d, type=0x%x) #%d",
                                (unsigned)mode, (int)count, (unsigned)type, g_draw_n);
   g_draw_n++; g_elements_win++; g_elements_frame++; g_elements_tot++; draw_note_source();
+  if (++g_draw_sample & 7) { glDrawElements(mode, count, type, idx); return; }
   uint64_t t0 = sceKernelGetProcessTimeWide();
   glDrawElements(mode, count, type, idx);
-  g_prof_draw_us += sceKernelGetProcessTimeWide() - t0;
+  g_prof_draw_us += (sceKernelGetProcessTimeWide() - t0) * 8;
 }
 volatile uint64_t g_last_swap_end_us;
 
@@ -459,6 +474,9 @@ void gl_patch_on_swap(uint64_t swap_begin_us, uint64_t swap_end_us) {
                (unsigned)(g_tex_up >> 10), (unsigned)(g_tex_down >> 10), g_tex_untracked,
                 g_tex16_n, (unsigned)(g_tex16_saved >> 10));
     gxmp_window_report();
+#if GL_CALL_CENSUS
+    glc_report(120);
+#endif
     gameprof_window_report();
     lzma_cache_report();
     obb_cache_report();
@@ -1316,4 +1334,93 @@ static const so_default_dynlib gl_dynlib[] = {
 };
 
 const int gl_dynlib_size = sizeof(gl_dynlib);
-const so_default_dynlib *gl_get_dynlib(void) { return gl_dynlib; }
+
+#if GL_CALL_CENSUS
+/* Every GL entry point, counted. The census decides what a render thread has
+ * to handle: calls that return something or read caller memory make the game
+ * thread wait for it, and how often they come per frame is the whole question.
+ * Each table entry is routed through a nine-word ARM thunk that bumps its
+ * counter and jumps on with r0-r3, lr and the stack untouched, so it works for
+ * any signature. Diagnostic only. */
+#define GLC_N (sizeof gl_dynlib / sizeof gl_dynlib[0])
+static so_default_dynlib g_glc_table[GLC_N];
+static volatile uint32_t g_glc[GLC_N];
+
+static const so_default_dynlib *glc_build(void) {
+  static int built = 0;
+  if (built) return built > 0 ? g_glc_table : gl_dynlib;
+  built = -1;
+  size_t sz = (GLC_N * 40 + 0xfff) & ~(size_t)0xfff;
+  SceKernelAllocMemBlockKernelOpt opt;
+  memset(&opt, 0, sizeof opt);
+  opt.size = sizeof opt;
+  SceUID blk = kuKernelAllocMemBlock("gl_census", SCE_KERNEL_MEMBLOCK_TYPE_USER_RX, sz, &opt);
+  void *base = NULL;
+  if (blk < 0 || sceKernelGetMemBlockBase(blk, &base) < 0 || !base) {
+    log_printf("[glc] census thunks FAILED (0x%08x) -- running uncounted", (unsigned)blk);
+    return gl_dynlib;
+  }
+  uint32_t *code = (uint32_t *)malloc(sz);
+  if (!code) return gl_dynlib;
+  memset(code, 0, sz);
+  for (unsigned i = 0; i < GLC_N; i++) {
+    uint32_t *t = code + i * 10;
+    t[0] = 0xe52d0004;                         /* push {r0}                 */
+    t[1] = 0xe59fc014;                         /* ldr  ip, [pc, #20] -> t[8] */
+    t[2] = 0xe59c0000;                         /* ldr  r0, [ip]             */
+    t[3] = 0xe2800001;                         /* add  r0, r0, #1           */
+    t[4] = 0xe58c0000;                         /* str  r0, [ip]             */
+    t[5] = 0xe49d0004;                         /* pop  {r0}                 */
+    t[6] = 0xe51ff004;                         /* ldr  pc, [pc, #-4] -> t[7] */
+    t[7] = (uint32_t)gl_dynlib[i].func;        /* target (Thumb bit kept)   */
+    t[8] = (uint32_t)&g_glc[i];                /* counter                   */
+    g_glc_table[i].symbol = gl_dynlib[i].symbol;
+    g_glc_table[i].func = (uintptr_t)base + i * 40;   /* ARM entry */
+  }
+  kuKernelCpuUnrestrictedMemcpy(base, code, sz);
+  kuKernelFlushCaches(base, sz);
+  free(code);
+  built = 1;
+  log_printf("[glc] GL call census armed: %u entry points counted", (unsigned)GLC_N);
+  return g_glc_table;
+}
+
+/* Per-frame averages over the window, busiest first. */
+static void glc_report(unsigned frames) {
+  static uint32_t prev[GLC_N];
+  uint32_t d[GLC_N];
+  unsigned idx[GLC_N], n = 0;
+  uint64_t total = 0;
+  for (unsigned i = 0; i < GLC_N; i++) {
+    uint32_t c = g_glc[i];
+    d[i] = c - prev[i];
+    prev[i] = c;
+    total += d[i];
+    if (d[i]) idx[n++] = i;
+  }
+  for (unsigned a = 0; a < n; a++)              /* selection sort, n <= 144 */
+    for (unsigned b = a + 1; b < n; b++)
+      if (d[idx[b]] > d[idx[a]]) { unsigned t = idx[a]; idx[a] = idx[b]; idx[b] = t; }
+  char line[480];
+  int o = snprintf(line, sizeof line, "[glc] %u GL calls/frame:",
+                   frames ? (unsigned)(total / frames) : 0u);
+  for (unsigned k = 0; k < n; k++) {
+    unsigned i = idx[k];
+    if (o > (int)sizeof line - 48) {
+      log_printf("%s", line);
+      o = snprintf(line, sizeof line, "[glc]  ");
+    }
+    o += snprintf(line + o, sizeof line - o, " %s=%.1f", gl_dynlib[i].symbol + 2,
+                  frames ? (double)d[i] / frames : 0.0);
+  }
+  log_printf("%s", line);
+}
+#endif
+
+const so_default_dynlib *gl_get_dynlib(void) {
+#if GL_CALL_CENSUS
+  return glc_build();
+#else
+  return gl_dynlib;
+#endif
+}
