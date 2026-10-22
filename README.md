@@ -25,26 +25,20 @@ with a from-scratch FMOD audio implementation over `sceAudiodec` and
 
 ## Status
 
-**The full game is playable — it has been played from start to finish on a Vita.**
+**The full game is playable.** The unmodded game has been played from start
+to finish on a Vita, through every planet to the ending.
 
-It boots, gets through character creation, and plays every planet through to
-the ending. Combat, dialogue, inventory, containers and saves all work, and it
-looks and sounds like the game.
-
-The two faults that used to wear a long session down are **fixed**: sound no
-longer thins out and goes silent, and the world geometry no longer tears into
-spikes. Sessions of close to 100 minutes now end as healthy as they started.
-What remains is frame rate and a few rough edges. One rare crash has been seen
-and no save has been lost. See [Known issues](#known-issues).
-
-So: start a full playthrough. Save regularly all the same.
+Combat, dialogue, inventory, containers, cutscenes and saves all work, and it
+looks and sounds like the game. What remains is frame rate in busy areas and a
+few rough edges. One rare crash has been seen, and no save has been lost. See
+[Known issues](#known-issues). Save regularly all the same.
 
 | | |
 |---|---|
 | Startup | ~2 min on first launch, then under a minute |
 | Area loads | Under a second to load; the loading screen then stays up 15–20 s while textures upload |
 | Frame rate | Locked to 30 fps; holds it in most areas with Grass, Shadows and Frame Buffer off (see [Graphics settings](#graphics-settings)); dense scenes dip to ~20 |
-| Session length | ~100 min tested with nothing fatal and nothing wearing down |
+| Playthrough | Completed start to finish, unmodded |
 | Audio | Effects, voice and music all work |
 | Cutscenes | Bink movies play with sound; tap or press a button to skip |
 | Input | Touchscreen, sticks and buttons — see [Controls](#controls) |
@@ -64,8 +58,8 @@ below says which fixes have not been released yet.
 - [`kubridge.skprx`](https://github.com/bythos14/kubridge/releases) installed as a taiHEN plugin
 - `libshacccg.suprx` in `ur0:data/` — the runtime shader compiler. Use
   [this installer](https://github.com/Rinnegatamante/vita-shacccg-installer) if
-  you don't have it. **Without it the game hangs on a black screen** at the
-  first shader compile, with no error message.
+  you don't have it. Without it the game stops at launch with a message
+  saying so.
 - Roughly **2.7 GB** free on `ux0:`
 
 **From your own copy of the game**
@@ -357,8 +351,8 @@ you a save. They are listed because you may hit them. Save regularly.
   or with a colour tint, and Sith armour can turn a bright solid colour (green
   has been seen) that changes from one area to the next. Each area loads its
   own reflection maps, and which of them goes wrong is being traced.
-- **Busy areas run at around 20 fps.** The Lower City holds about 40 fps, while
-  the Upper City and the Undercity sit near 20 with a crowd on screen. Nearly
+- **Busy areas run at around 20 fps.** The Lower City holds the 30 fps lock,
+  while the Upper City and the Undercity sit near 20 with a crowd on screen. Nearly
   all of that frame time is the game's own rendering code on one CPU core,
   preparing several hundred objects a frame; the graphics chip is not the
   limit. Video memory is also full for most of a session, so textures loaded
@@ -370,6 +364,12 @@ you a save. They are listed because you may hit them. Save regularly.
 
 ### Recently fixed
 
+- **Setup mistakes looked like a hang** *(not yet released)*. A missing
+  `kubridge`, `libshacccg`, `.so` file or `.obb` left a black screen. A message
+  box now says what is missing and where it goes.
+- **Textures could be corrupted with 16-bit textures on** *(not yet released)*,
+  when the game re-uploaded a texture or updated one on a texture unit it had
+  not just bound.
 - **The 1.0.7 / 1.0.71 APK would not run** *(v0.4.3)*. It is an older build
   than 1.0.10 and needed five more functions and a movie hook that does not
   rely on a fixed address.
@@ -403,7 +403,7 @@ a bug report.
 | Symptom | Likely cause |
 |---|---|
 | A message box at launch | It names the missing file and where it goes: `kubridge.skprx`, `libshacccg.suprx`, one of the four `.so` files, or an `.obb` |
-| Crashes immediately at launch, no message | `kubridge.skprx` not installed |
+| Closes or crashes at launch, no message | `kubridge.skprx` not loaded: check `ur0:tai/config.txt` and reboot |
 | Hangs at the loading spinner | An `.obb` is incomplete or still copying |
 | Textures look wrong | Set `GL_FILTER_REDUNDANT_BINDS 0` in `loader/config.h` and rebuild |
 
