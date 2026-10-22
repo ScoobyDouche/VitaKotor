@@ -397,9 +397,8 @@ static void mount_obbs(void) {
   int patch_ok = check_obb(OBB_PATCH_PATH);
   if (!main_ok || !patch_ok)
     fatal_error("The game data is missing or incomplete.\n\n"
-                "Copy main.<version>.com.aspyr.swkotor.obb to %s (~2.1 GB) and "
-                "patch.<version>.com.aspyr.swkotor.obb to %s (~453 MB).",
-                OBB_MAIN_PATH, OBB_PATCH_PATH);
+                "Copy your two .obb files to %s/ as main.obb (~2.1 GB) "
+                "and patch.obb (~453 MB).", DATA_PATH);
 
   g_io_trace = 1;   // trace miniz's fopen/fseek/ftell/fread through the mount
   if (mountObb) {
