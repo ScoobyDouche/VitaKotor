@@ -323,13 +323,9 @@ the mod and its version.
 
 ### Intermittent
 
-None of these is reliable enough to reproduce on demand, and none of them costs
-you a save. They are listed because you may hit them. Save regularly.
+It can't be reproduced on demand and doesn't cost you a save. It is listed
+because you may hit it. Save regularly.
 
-- **Input stopped responding once in an older build.** Around 50 minutes in,
-  the camera stick and touch input stopped doing anything while the game kept
-  running. It has not been seen since, but touch and buttons together have not
-  had a long session yet. Relaunching clears it.
 - **Rare crash right after an area-change auto-save.** Once, leaving the
   Leviathan, the game crashed while unloading the old area. The auto-save had
   already finished, so nothing was lost. It looks like a freeze because the
