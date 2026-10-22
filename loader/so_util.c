@@ -95,6 +95,7 @@ static size_t thumb_relocate(uintptr_t orig_fn, size_t len, uint16_t *out,
       } else if (((hw & 0xF800) == 0xF000 && (hw2 & 0x8000)) ||  // B/BL/BLX/Bcc.W
                  ((hw & 0xFE00) == 0xF800 && (hw & 0xF) == 0xF) ||  // other loads from PC
                  (hw & 0xFE5F) == 0xE85F ||                      // LDRD literal
+                 (hw & 0xFF3F) == 0xED1F ||                      // VLDR literal
                  (hw & 0xFFF0) == 0xE8D0 ||                      // TBB/TBH
                  (hw & 0xFBFF) == 0xF20F || (hw & 0xFBFF) == 0xF2AF) {  // ADR.W
         return 0;
@@ -131,6 +132,8 @@ static size_t thumb_relocate(uintptr_t orig_fn, size_t len, uint16_t *out,
   return it_left ? 0 : n;
 }
 
+#define TRAMP_PAGE 0x1000
+
 uintptr_t build_thumb_trampoline(uintptr_t orig_fn, size_t len) {
   orig_fn &= ~(uintptr_t)1;
   uint16_t code[16];
@@ -147,17 +150,27 @@ uintptr_t build_thumb_trampoline(uintptr_t orig_fn, size_t len) {
   size_t sz = pool + nlit * 4;
   if (sz > 64) return 0;
 
-  SceKernelAllocMemBlockKernelOpt opt;
-  memset(&opt, 0, sizeof(opt));
-  opt.size = sizeof(opt);
-  SceUID blk = kuKernelAllocMemBlock("hook_tramp", SCE_KERNEL_MEMBLOCK_TYPE_USER_RX,
-                                     (sz + 0xfff) & ~(size_t)0xfff, &opt);
-  if (blk < 0) return 0;
+  // Trampolines share RX pages in 64-byte slots: one page per hook cost ~100
+  // memblocks and ~400 KB for a few KB of code. Slots stay 4-byte aligned,
+  // which is all the offsets below rely on.
+  static uint8_t *page = NULL;
+  static size_t page_used = TRAMP_PAGE;
+  if (page_used + 64 > TRAMP_PAGE) {
+    SceKernelAllocMemBlockKernelOpt opt;
+    memset(&opt, 0, sizeof(opt));
+    opt.size = sizeof(opt);
+    SceUID blk = kuKernelAllocMemBlock("hook_tramp", SCE_KERNEL_MEMBLOCK_TYPE_USER_RX,
+                                       TRAMP_PAGE, &opt);
+    if (blk < 0) return 0;
+    void *p = NULL;
+    if (sceKernelGetMemBlockBase(blk, &p) < 0 || !p) { sceKernelFreeMemBlock(blk); return 0; }
+    page = (uint8_t *)p;
+    page_used = 0;
+  }
+  void *base = page + page_used;
+  page_used += 64;
 
-  void *base = NULL;
-  if (sceKernelGetMemBlockBase(blk, &base) < 0 || !base) return 0;
-
-  for (size_t i = 0; i < nlit; i++) {  // base is page-aligned, so offsets are addresses
+  for (size_t i = 0; i < nlit; i++) {  // base is 4-aligned, so offsets work as addresses
     size_t at = lit_at[i] * 2;
     code[lit_at[i] + 1] |= (uint16_t)(pool + i * 4 - ((at + 4) & ~(size_t)3));
   }
@@ -264,6 +277,10 @@ int so_load(so_module *mod, const char *filename, uintptr_t load_addr) {
       }
 
       char *zero = malloc(prog_size);
+      if (!zero) {
+        res = -1;
+        goto err_free_data;
+      }
       memset(zero, 0, prog_size);
       kuKernelCpuUnrestrictedMemcpy(prog_data, zero, prog_size);
       free(zero);
