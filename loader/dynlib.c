@@ -210,6 +210,17 @@ static void (*real_ZdaPv)(void *) = (void (*)(void *)) & _ZdaPv;
 game_thread_t g_game_threads[GAME_THREADS_MAX];
 volatile int g_game_threads_n = 0;
 
+int game_thread_register(uintptr_t entry) {
+  int slot = __atomic_fetch_add(&g_game_threads_n, 1, __ATOMIC_RELAXED);
+  if (slot >= GAME_THREADS_MAX) {
+    __atomic_fetch_sub(&g_game_threads_n, 1, __ATOMIC_RELAXED);
+    return -1;
+  }
+  g_game_threads[slot].thid  = -1;
+  g_game_threads[slot].entry = entry;
+  return slot;
+}
+
 typedef struct { void *(*fn)(void *); void *arg; int slot; } thread_shim_t;
 
 static void *pthread_thread_shim(void *p) {
@@ -223,19 +234,14 @@ static void *pthread_thread_shim(void *p) {
   if (slot >= 0 && slot < GAME_THREADS_MAX)
     g_game_threads[slot].thid = sceKernelGetThreadId();
   log_printf("[thread] started thid=0x%08x entry=%p", (unsigned)sceKernelGetThreadId(),
-             (void *)g_game_threads[slot >= 0 ? slot : 0].entry);
+             (void *)fn);
   thread_pin_self(thread_next_worker_mask(), "game-pthread");
   return fn(arg);
 }
 
 static int pthread_create_diag(pthread_t *t, const pthread_attr_t *a,
                                void *(*fn)(void *), void *arg) {
-  int slot = -1;
-  if (g_game_threads_n < GAME_THREADS_MAX) {
-    slot = g_game_threads_n++;
-    g_game_threads[slot].thid  = -1;
-    g_game_threads[slot].entry = (uintptr_t)fn;
-  }
+  int slot = game_thread_register((uintptr_t)fn);
   thread_shim_t *s = (thread_shim_t *)malloc(sizeof(*s));
   if (!s)                       // never fail the game's thread on our account
     return pthread_create(t, a, fn, arg);

@@ -36,5 +36,8 @@ void io_perf_snapshot(io_perf_t *out);
 typedef struct { SceUID thid; uintptr_t entry; } game_thread_t;
 extern game_thread_t g_game_threads[GAME_THREADS_MAX];
 extern volatile int  g_game_threads_n;
+/* Claim a registry slot for a thread about to start at `entry`; -1 when full.
+ * Safe from any thread. */
+int game_thread_register(uintptr_t entry);
 
 #endif

@@ -106,23 +106,6 @@ void input_probe_census(void) {
   input_stick_census();
 }
 
-/* Read the right stick straight from the pad. main() selects ANALOG_WIDE via
- * sceCtrlSetSamplingModeExt, so the Ext2 reader is the one that sees analog. */
-static void sample_rstick(void) {
-  SceCtrlData pad;
-  memset(&pad, 0, sizeof(pad));
-  if (sceCtrlPeekBufferPositiveExt2(0, &pad, 1) <= 0) return;
-  int dx = (int)pad.rx - 128, dy = (int)pad.ry - 128;
-  if (dx < 0) dx = -dx;
-  if (dy < 0) dy = -dy;
-  unsigned d = (unsigned)(dx > dy ? dx : dy);
-  /* 32/127 is well outside stick slop and well inside a deliberate push. */
-  if (d > 32) {
-    s_rstick_frames++;
-    if (d > s_rstick_max) s_rstick_max = d;
-  }
-}
-
 /* log215: jerky sticks with smooth touch steering. SDL's Vita backend reads the
  * pad with sceCtrlPeekBufferPositive2 -- NOT the Ext2 reader above, and the two
  * have separate sampling modes -- so read the stick both ways and count frames
@@ -144,6 +127,8 @@ static void stick_track(int r, int k, unsigned d) {
   if (now) s_stk[r][k].was = now;
 }
 
+/* main() selects ANALOG_WIDE via sceCtrlSetSamplingModeExt, so the Ext2 reader
+ * is the one that sees analog; its right stick also feeds the raw census. */
 static void sample_sticks(void) {
   SceCtrlData pad;
   for (int r = 0; r < 2; r++) {
@@ -151,8 +136,14 @@ static void sample_sticks(void) {
     int got = r ? sceCtrlPeekBufferPositive2(0, &pad, 1)
                 : sceCtrlPeekBufferPositiveExt2(0, &pad, 1);
     if (got <= 0) continue;
+    unsigned rd = stick_dev(pad.rx, pad.ry);
     stick_track(r, 0, stick_dev(pad.lx, pad.ly));
-    stick_track(r, 1, stick_dev(pad.rx, pad.ry));
+    stick_track(r, 1, rd);
+    /* 32/127 is well outside stick slop and well inside a deliberate push. */
+    if (r == 0 && rd > 32) {
+      s_rstick_frames++;
+      if (rd > s_rstick_max) s_rstick_max = rd;
+    }
   }
 }
 
@@ -196,7 +187,6 @@ void input_touch_pump(void) {
   /* Sampled before the IME early-out: the stick keeps meaning something to the
    * game whether or not the keyboard owns the panel. */
   s_frames++;
-  sample_rstick();
   sample_sticks();
   SceTouchData rear;
   if (sceTouchPeek(SCE_TOUCH_PORT_BACK, &rear, 1) > 0 && rear.reportNum > 0)

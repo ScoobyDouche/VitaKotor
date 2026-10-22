@@ -109,12 +109,7 @@ static int sdl_thread_shim(void *p) {
 }
 
 static SDL_Thread *SDL_CreateThread_hook(SDL_ThreadFunction fn, const char *name, void *data) {
-  int slot = -1;
-  if (g_game_threads_n < GAME_THREADS_MAX) {
-    slot = g_game_threads_n++;
-    g_game_threads[slot].thid  = -1;
-    g_game_threads[slot].entry = (uintptr_t)fn;
-  }
+  int slot = game_thread_register((uintptr_t)fn);
   sdl_thread_shim_t *s = (sdl_thread_shim_t *)malloc(sizeof(*s));
   if (!s)
     return SDL_CreateThread(fn, name, data);

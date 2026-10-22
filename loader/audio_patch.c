@@ -716,7 +716,7 @@ static void loud_note(const MixSnap *m, float v) {
     if (g_loud_n >= LOUD_MAX) { g_loud_dropped++; return; }
     r = &g_loud[g_loud_n];
     memset(r, 0, sizeof *r);
-    strncpy(r->name, nm, sizeof r->name - 1);
+    memcpy(r->name, nm, strnlen(nm, sizeof r->name - 1));   /* stays NUL-terminated */
     r->is3d = (uint8_t)m->is3d;
     r->dmin = 1e9f;
     g_loud_n++;
