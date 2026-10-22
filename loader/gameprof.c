@@ -56,6 +56,7 @@ static unsigned g_eng_n;
 typedef uint64_t (*fn6_t)(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
 typedef struct {
   const char *sym, *tag;
+  int port;              /* 1: the symbol is in libandroid_port.so */
   fn6_t orig;
   unsigned depth, calls;
   uint64_t us;
@@ -160,6 +161,27 @@ static hook_t g_hook[] = {
   { "_ZN21CSWGuiInGameCharacter4DrawEf",                       "charDraw"     },
   { "_ZN21CSWGuiInGameInventory4DrawEf",                       "invDraw"      },
   { "_ZN21CSWGuiInGameInventory15CreateItemEntryEP12CSWCCreatureRiR13CExoArrayListIP13CSWGuiControlEP8CSWSItemii", "invEntry" },
+#if GAME_PROF_DRAW
+  /* Per-mesh split of dynGeo (log-only diagnostic; ~10 timers a draw, so it
+   * costs several ms a frame itself). Only targets of at most six argument
+   * words: KotorProgram::SetAttributes takes eight, and timing it through the
+   * six-word pass-through fed it stack garbage (exploded every skinned mesh).
+   * Engine side, then the port's draw path:
+   * android_port_glDrawElements -> GlesKotorSetupShader (SetAttributes + the
+   * KotorProgram uniform setters) -> OpenGLES20Context::glDrawElements ->
+   * prepareToDraw -> OpenGLESState::setCurrentProgram -> vitaGL (glDraw). */
+  { "_ZN3Gob6RenderEb",                                        "gobRender"    },
+  { "_ZN11PartTriMesh4DrawEb",                                 "triMesh"      },
+  { "_ZN8PartSkin4DrawEb",                                     "skin"         },
+  { "_ZN14PartLightsaber4DrawEb",                              "saber"        },
+  { "_Z16LightPartTriMeshP11PartTriMesh4ListIP9PartLightEP5Scene", "lightTM" },
+  { "_ZN3Gob13CollectLightsER4ListIP9PartLightE",              "collectL"     },
+  { "android_port_glDrawElements",                             "apDraw",  1   },
+  { "_Z20GlesKotorSetupShaderv",                               "setupSh", 1   },
+  { "_ZN12KotorProgram3UseEv",                                 "kpUse",   1   },
+  { "_ZN8OpenGLES9OpenGLES217OpenGLES20Context13prepareToDrawEi", "prep",  1   },
+  { "_ZN8OpenGLES9OpenGLES213OpenGLESState17setCurrentProgramEi", "setProg", 1 },
+#endif
 };
 #define HOOK_N (sizeof g_hook / sizeof g_hook[0])
 
@@ -192,6 +214,9 @@ P(17) P(18) P(19) P(20) P(21) P(22) P(23) P(24) P(25) P(26) P(27) P(28) P(29) P(
 P(32) P(33) P(34) P(35) P(36) P(37) P(38) P(39) P(40) P(41) P(42) P(43) P(44) P(45) P(46)
 P(47) P(48) P(49) P(50) P(51) P(52) P(53) P(54) P(55) P(56) P(57) P(58) P(59) P(60) P(61)
 P(62) P(63) P(64) P(65) P(66) P(67) P(68) P(69) P(70)
+#if GAME_PROF_DRAW
+P(71) P(72) P(73) P(74) P(75) P(76) P(77) P(78) P(79) P(80) P(81)
+#endif
 #undef P
 
 /* log205: cMsg is 20-25 ms a frame in the cities but object updates are ~6 of
@@ -227,6 +252,10 @@ static fn6_t const g_probe[] = {
   probe_49, probe_50, probe_51, probe_52, probe_53, probe_54, probe_55, probe_56,
   probe_57, probe_58, probe_59, probe_60, probe_61, probe_62, probe_63, probe_64,
   probe_65, probe_66, probe_67, probe_68, probe_69, probe_70,
+#if GAME_PROF_DRAW
+  probe_71, probe_72, probe_73, probe_74, probe_75, probe_76, probe_77, probe_78,
+  probe_79, probe_80, probe_81,
+#endif
 };
 _Static_assert(sizeof g_probe / sizeof g_probe[0] == HOOK_N, "one probe per hook");
 
@@ -243,7 +272,7 @@ void gameprof_install(void) {
     else log_printf("[prof] %s missing", g_eng[i].sym);
   }
   for (unsigned i = 0; i < HOOK_N; i++) {
-    uintptr_t a = so_symbol(&kotor_mod, g_hook[i].sym);
+    uintptr_t a = so_symbol(g_hook[i].port ? &port_mod : &kotor_mod, g_hook[i].sym);
     if (!a) { log_printf("[prof] %s missing", g_hook[i].tag); continue; }
     g_hook[i].orig = (fn6_t)build_thumb_trampoline(a, thumb_patch_len(a));
     if (!g_hook[i].orig) { log_printf("[prof] %s trampoline FAILED", g_hook[i].tag); continue; }
@@ -252,6 +281,14 @@ void gameprof_install(void) {
   }
   log_printf("[prof] armed: %u/%u engine stopwatches, %u/%u timed functions",
              eng, (unsigned)ENG_N, hooked, (unsigned)HOOK_N);
+#if GAME_PROF_DRAW
+  /* what one timed call costs in clock reads, to subtract from the per-mesh split */
+  uint64_t t0 = sceKernelGetProcessTimeWide();
+  volatile uint64_t sink = 0;
+  for (int i = 0; i < 1000; i++) sink += sceKernelGetProcessTimeWide();
+  log_printf("[prof] per-mesh timers on; one clock read = %.2f us",
+             (double)(sceKernelGetProcessTimeWide() - t0) / 1000.0);
+#endif
 }
 
 void gameprof_after_update(void) {

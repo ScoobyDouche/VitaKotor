@@ -339,6 +339,9 @@
 // [prof] lines per 120-frame window. log197 put ~60 of an 80 ms Undercity
 // frame in CClientAIMaster::UpdateState; this says which part of it.
 #define GAME_PROF (!LOG_OFF)
+// Adds per-mesh timers (engine mesh/light code and the port's draw path) to
+// the [prof] lines. Diagnostic only: ~10 timers a draw cost several ms a frame.
+#define GAME_PROF_DRAW (GAME_PROF && 0)
 
 // KOTOR's Android loop turns an AI update over 33/67/100/133 ms into
 // 2/4/7/11 complete GameUpdate calls before the next presentation. On Vita the
