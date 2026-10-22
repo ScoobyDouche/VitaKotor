@@ -195,7 +195,7 @@ int log_jni_enabled(void) {
  * hooks stay (several do real work besides logging); only the lines go.
  *   [model]  resource/model-load probes from the chargen pool block (July)
  *   [vtx]    uniform/attribute layout dumps from the geometry spikes
- *   [GLSRC   shader source dump from the varying-overflow crash
+ *   [GLSRC   shader source dump from the varying-overflow crash (code removed)
  *   [res]    entry[...]  save-game key-table listing, ~70 lines per save
  * Failures still get through: the keep-rule below runs first. */
 static const char *const k_log_retired[] = {

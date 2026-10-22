@@ -119,32 +119,6 @@ static GLuint glCreateShader_t(GLenum type) {
 }
 
 static void glShaderSource_t(GLuint sh, GLsizei count, const GLchar *const *str, const GLint *len) {
-  log_printf("[GL] glShaderSource(sh=%u, count=%d) ===begin dump===", (unsigned)sh, count);
-  // Dump the define header (str[0]) line-by-line -- its concrete macro values
-  // decide which #if branches (and thus which varyings) are live. Also emit every
-  // 'varying' source line across all strings so we can count declared varyings.
-  char line[256];
-  for (int s = 0; s < count && str; s++) {
-    const char *p = str[s];
-    if (!p) continue;
-    int header = (s == 0);
-    while (*p) {
-      int n = 0;
-      while (n < 255 && p[n] && p[n] != '\n') { line[n] = p[n]; n++; }
-      line[n] = '\0';
-      // Header: log all lines. Other chunks: only 'varying' declaration lines.
-      if (header) {
-        if (n > 0) log_printf("[GLSRC h] %s", line);
-      } else {
-        const char *v = line; while (*v == ' ' || *v == '\t') v++;
-        if (!strncmp(v, "varying", 7)) log_printf("[GLSRC s%d] %s", s, line);
-      }
-      p += n;
-      if (*p == '\n') p++;
-    }
-  }
-  log_printf("[GL] glShaderSource(sh=%u) ===end dump===", (unsigned)sh);
-
   // vitaGL finds varying declarations by text-scanning for the keyword, with no
   // preprocessor evaluation at all -- so it reserves a GXM TEXCOORD slot for
   // every declaration in the ubershader, including the ~18 that the #if guards
@@ -317,6 +291,10 @@ static uint64_t g_tex16_saved = 0;          /* bytes NOT spent, lifetime */
 #define GL_MAX_TEXUNITS 8
 static unsigned g_active_unit = 0;
 static GLuint   g_bound2d[GL_MAX_TEXUNITS];
+/* What each unit really has bound to GL_TEXTURE_2D, so g_cur_tex can follow
+ * glActiveTexture. g_bound2d is the filter's shadow and is cleared whenever
+ * it might be stale, which makes it unfit to name the texture an upload hits. */
+static GLuint   g_unit2d[GL_MAX_TEXUNITS];
 
 
 static GLuint   g_cur_arraybuf = 0;      /* last glBindBuffer(GL_ARRAY_BUFFER) */
@@ -638,6 +616,8 @@ static void glActiveTexture_e(GLenum t) {
    * than folded onto unit 0, which would let unit 0's filter skip a bind it
    * never saw. */
   g_active_unit = (u < GL_MAX_TEXUNITS) ? u : GL_MAX_TEXUNITS;
+  /* Uploads go to the active unit's binding, not to the last one bound. */
+  g_cur_tex = (u < GL_MAX_TEXUNITS) ? g_unit2d[u] : 0;
   glActiveTexture(t);
 }
 
@@ -745,6 +725,9 @@ static void glDeleteTextures_e(GLsizei n, const GLuint *tex) {
         log_printf("[GL] cube texture %u deleted", (unsigned)tex[i]);
       if (tex[i] && tex[i] < TEXKIND_MAX) g_tex_kind[tex[i]] = TEXKIND_NONE;
       tex_release(tex[i]);
+      for (unsigned u = 0; u < GL_MAX_TEXUNITS; u++)
+        if (tex[i] && g_unit2d[u] == tex[i]) g_unit2d[u] = 0;
+      if (tex[i] && g_cur_tex == tex[i]) g_cur_tex = 0;
       if (tex[i] < TEXKIND_MAX && g_tex16[tex[i]] != TEX16_NONE) {
         g_tex16[tex[i]] = TEX16_NONE;      /* ids recycle; do not inherit a format */
         if (g_tex16_n) g_tex16_n--;
@@ -787,7 +770,10 @@ static void glBindTexture_e(GLenum tg, GLuint t) {
     g_nontex2d_binds++;
   }
 #endif
-  if (tg == GL_TEXTURE_2D) g_cur_tex = t;  // mirrored for the text-draw trace
+  if (tg == GL_TEXTURE_2D) {
+    g_cur_tex = t;
+    if (g_active_unit < GL_MAX_TEXUNITS) g_unit2d[g_active_unit] = t;
+  }
   glBindTexture(tg, t);
 }
 /* Attribute-offset witness (see g_vap_max_off). Only meaningful when a VBO is
@@ -864,6 +850,17 @@ static void tex16_pack(uint16_t *dst, const unsigned char *src, int w, int h, in
  * hand it to vitaGL. Always uploads exactly once. */
 int g_gl_tex16 = GL_TEX16_CONVERT;   /* swkotor.ini [Vita Options] TextureBits */
 
+/* Record what a level-0 upload left the bound id holding. Every level-0 path
+ * must call this, converted or not: an id re-specified at full precision while
+ * still marked 16-bit would have its next glTexSubImage2D packed to 16 bits
+ * into a 32-bit texture. */
+static void tex16_mark(GLint l, int kind) {
+  if (l != 0 || !g_cur_tex || g_cur_tex >= TEXKIND_MAX) return;
+  if (g_tex16[g_cur_tex] == TEX16_NONE && kind != TEX16_NONE) g_tex16_n++;
+  else if (g_tex16[g_cur_tex] != TEX16_NONE && kind == TEX16_NONE && g_tex16_n) g_tex16_n--;
+  g_tex16[g_cur_tex] = (uint8_t)kind;
+}
+
 static void tex_upload2d(GLenum tg, GLint l, GLint ifmt, GLsizei w, GLsizei h,
                          GLint b, GLenum f, GLenum ty, const void *px) {
   int kind = !g_gl_tex16  ? TEX16_NONE
@@ -874,10 +871,7 @@ static void tex_upload2d(GLenum tg, GLint l, GLint ifmt, GLsizei w, GLsizei h,
       tex16_pack(cv, (const unsigned char *)px, w, h, kind, NULL);
       GLenum ty16 = (kind == TEX16_4444) ? GL_UNSIGNED_SHORT_4_4_4_4
                                          : GL_UNSIGNED_SHORT_5_6_5;
-      if (g_cur_tex && g_cur_tex < TEXKIND_MAX && l == 0) {
-        if (g_tex16[g_cur_tex] == TEX16_NONE) g_tex16_n++;
-        g_tex16[g_cur_tex] = (uint8_t)kind;
-      }
+      tex16_mark(l, kind);
       g_tex16_saved += (uint64_t)w * h * (fmt_bpp(f) - 2u);
       tex_charge(g_cur_tex, tg, l, w, h, 2u);
       glTexImage2D(tg, l, ifmt, w, h, b, f, ty16, cv);
@@ -885,6 +879,7 @@ static void tex_upload2d(GLenum tg, GLint l, GLint ifmt, GLsizei w, GLsizei h,
       return;
     }
   }
+  tex16_mark(l, TEX16_NONE);
   tex_charge(g_cur_tex, tg, l, w, h, fmt_bpp(f));
   glTexImage2D(tg, l, ifmt, w, h, b, f, ty, px);
 }
@@ -1012,6 +1007,7 @@ static void glTexImage2D_body(GLenum tg, GLint l, GLint ifmt, GLsizei w, GLsizei
     GLsizei aw = gl_rt_align_w(w);
     if (aw != w)
       log_printf("[GL] RT pad: color tex %dx%d -> %dx%d", (int)w, (int)h, (int)aw, (int)h);
+    tex16_mark(l, TEX16_NONE);
     tex_charge(g_cur_tex, tg, l, aw, h, fmt_bpp(f));
     glTexImage2D(tg, l, ifmt, aw, h, b, f, ty, px);
     return;
@@ -1058,6 +1054,7 @@ static void glTexSubImage2D_e(GLenum tg, GLint l, GLint xo, GLint yo, GLsizei w,
 }
 static void glCompressedTexImage2D_e(GLenum tg, GLint l, GLenum ifmt, GLsizei w, GLsizei h,
                                      GLint b, GLsizei sz, const void *px) {
+  if (tg == GL_TEXTURE_2D) tex16_mark(l, TEX16_NONE);
   TEX_TIMED(glCompressedTexImage2D(tg, l, ifmt, w, h, b, sz, px));
 }
 static void glGenerateMipmap_e(GLenum tg) {
