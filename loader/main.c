@@ -66,17 +66,51 @@ int debugPrintf(const char *text, ...) {
   return 0;
 }
 
+// Which thread may draw: main() until the game thread exists, then the game
+// thread once vitaGL is up on it. GXM belongs to the thread that initialised it.
+static SceUID g_main_thid = -1;
+static volatile SceUID g_game_thid = -1;
+static volatile int g_vgl_up = 0;
+
+// Every setup mistake a player can make -- kubridge or libshacccg missing, the
+// .so files or OBBs not copied -- ends here, so the message has to reach the
+// screen and not only log.txt: a black screen that never changes reads as a
+// hang. A fatal error on any other thread (an assert inside the game) cannot
+// touch GXM, so it stays log-only and parks as before.
 void fatal_error(const char *fmt, ...) {
+  static volatile int entered = 0;
   va_list args;
-  char buf[1024];
+  char buf[512];
   va_start(args, fmt);
   vsnprintf(buf, sizeof(buf), fmt, args);
   va_end(args);
   log_printf("[CRASH] %s", buf);
+  log_flush();
 
-  // Show the message on-screen too, then wait so it can be read.
-  vglInit(0);
-  // (LiveArea/dialog wiring comes later; for now just spin.)
+  SceUID self = sceKernelGetThreadId();
+  int can_draw = !entered &&
+                 ((self == g_main_thid && g_game_thid < 0 && !g_vgl_up) ||
+                  (self == g_game_thid && g_vgl_up));
+  entered = 1;
+  if (can_draw) {
+    if (!g_vgl_up) { vglInit(0); g_vgl_up = 1; }
+    SceMsgDialogUserMessageParam msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.buttonType = SCE_MSG_DIALOG_BUTTON_TYPE_OK;
+    msg.msg = (SceChar8 *)buf;
+    SceMsgDialogParam param;
+    sceMsgDialogParamInit(&param);
+    param.mode = SCE_MSG_DIALOG_MODE_USER_MSG;
+    param.userMsgParam = &msg;
+    if (sceMsgDialogInit(&param) >= 0) {
+      while (sceMsgDialogGetStatus() != SCE_COMMON_DIALOG_STATUS_FINISHED) {
+        glClear(GL_COLOR_BUFFER_BIT);
+        vglSwapBuffers(GL_TRUE);
+      }
+      sceMsgDialogTerm();
+      sceKernelExitProcess(0);
+    }
+  }
   while (1)
     sceKernelDelayThread(1000 * 1000);
 }
@@ -117,10 +151,6 @@ static int load_module(so_module *mod, const char *path, uintptr_t addr) {
   so_flush_caches(mod);
   return 0;
 }
-
-// Game thread's kernel UID, published by game_main_thread so the watchdog can
-// sample it. -1 until the game thread starts.
-static volatile SceUID g_game_thid = -1;
 
 // Watchdog: every 3s, snapshot the game thread. runClocks rising => it's
 // spinning (CPU loop); runClocks frozen + status WAITING => blocked on a sync
@@ -366,9 +396,10 @@ static void mount_obbs(void) {
   int main_ok = check_obb(OBB_MAIN_PATH);
   int patch_ok = check_obb(OBB_PATCH_PATH);
   if (!main_ok || !patch_ok)
-    fatal_error("OBB archives invalid/empty at %s. Copy the real .obb game data "
-                "(main ~2.1GB, patch ~453MB) there; check ux0: free space.",
-                DATA_PATH);
+    fatal_error("The game data is missing or incomplete.\n\n"
+                "Copy main.<version>.com.aspyr.swkotor.obb to %s (~2.1 GB) and "
+                "patch.<version>.com.aspyr.swkotor.obb to %s (~453 MB).",
+                OBB_MAIN_PATH, OBB_PATCH_PATH);
 
   g_io_trace = 1;   // trace miniz's fopen/fseek/ftell/fread through the mount
   if (mountObb) {
@@ -1624,6 +1655,7 @@ static void *game_main_thread(void *arg) {
   // it may land on the game thread's core; keep it beside the other helpers.
   vglSetupGarbageCollector(0x10000100, thread_mask(CPU_AUX_B));
   vglInitExtended(0, SCREEN_W, SCREEN_H, MEMORY_VITAGL_THRESHOLD_MB * 1024 * 1024, GL_MSAA_MODE);
+  g_vgl_up = 1;
   gxmp_arm();
   apply_frame_lock();
   log_printf(">>> vitaGL application shader cache: %s", vgl_shader_cache_path);
@@ -1671,6 +1703,7 @@ static void *game_main_thread(void *arg) {
 }
 
 int main(int argc, char *argv[]) {
+  g_main_thid = sceKernelGetThreadId();
   log_init();
   log_printf("KOTOR Vita loader starting");
 
@@ -1699,29 +1732,29 @@ int main(int argc, char *argv[]) {
   scePowerSetGpuXbarClockFrequency(166);
 
   if (check_kubridge() < 0)
-    fatal_error("kubridge.skprx is not installed.");
+    fatal_error("kubridge.skprx is not installed.\n\nAdd it to the *KERNEL section of ur0:tai/config.txt and reboot.");
 
   // vitaGL compiles the game's GLSL at runtime via SceShaccCg (libshacccg.suprx),
   // which is NOT present on retail Vitas. Without it the first shader op hangs
   // silently; fail fast with a clear message instead (matches gtasa_vita).
   if (!file_exists("ur0:/data/libshacccg.suprx") &&
       !file_exists("ur0:/data/external/libshacccg.suprx"))
-    fatal_error("libshacccg.suprx is not installed (need it in ur0:/data/).");
+    fatal_error("libshacccg.suprx is not installed.\n\nPut it in ur0:data/ (see the README).");
 
   // Load the compression libs FIRST: the companion and libKOTOR list them as
   // NEEDED and import mz_zip_reader_*/LzmaUncompress, which then resolve
   // cross-module to these (the real miniz reads the OBB zips; ret0 stubs made
   // the game read a null zip central directory and crash).
   if (load_module(&lzma_mod, LZMA_SO, LZMA_LOAD_ADDRESS) < 0)
-    fatal_error("could not load %s", LZMA_SO);
+    fatal_error("Could not load %s.\n\nCopy it from lib/armeabi-v7a/ in your APK.", LZMA_SO);
   if (load_module(&miniz_mod, MINIZ_SO, MINIZ_LOAD_ADDRESS) < 0)
-    fatal_error("could not load %s", MINIZ_SO);
+    fatal_error("Could not load %s.\n\nCopy it from lib/armeabi-v7a/ in your APK.", MINIZ_SO);
 
   // Then the companion, so libKOTOR's imports of it resolve cross-module.
   if (load_module(&port_mod, ANDROID_PORT_SO, ANDROID_PORT_LOAD_ADDRESS) < 0)
-    fatal_error("could not load %s", ANDROID_PORT_SO);
+    fatal_error("Could not load %s.\n\nCopy it from lib/armeabi-v7a/ in your APK.", ANDROID_PORT_SO);
   if (load_module(&kotor_mod, SO_PATH, LOAD_ADDRESS) < 0)
-    fatal_error("could not load %s", SO_PATH);
+    fatal_error("Could not load %s.\n\nCopy it from lib/armeabi-v7a/ in your APK.", SO_PATH);
 
   // Now that both module bases are known, arm the CPU-fault handler so any
   // hardware fault (incl. during static ctors below or inside the game) writes

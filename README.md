@@ -402,9 +402,9 @@ a bug report.
 
 | Symptom | Likely cause |
 |---|---|
-| Black screen, no error | `libshacccg.suprx` missing from `ur0:data/` |
-| Crashes immediately at launch | `kubridge.skprx` not installed |
-| Hangs at the loading spinner | An `.obb` is missing, misnamed, or still copying |
+| A message box at launch | It names the missing file and where it goes: `kubridge.skprx`, `libshacccg.suprx`, one of the four `.so` files, or an `.obb` |
+| Crashes immediately at launch, no message | `kubridge.skprx` not installed |
+| Hangs at the loading spinner | An `.obb` is incomplete or still copying |
 | Textures look wrong | Set `GL_FILTER_REDUNDANT_BINDS 0` in `loader/config.h` and rebuild |
 
 Slow frames are reported as `[hitch]` lines in the log, with what the game
