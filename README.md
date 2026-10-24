@@ -348,19 +348,26 @@ because you may hit it. Save regularly.
   has been seen) that changes from one area to the next. Each area loads its
   own reflection maps, and which of them goes wrong is being traced.
 - **Busy areas run at around 20 fps.** The Lower City holds the 30 fps lock,
-  while the Upper City and the Undercity sit near 20 with a crowd on screen. Nearly
-  all of that frame time is the game's own rendering code on one CPU core,
+  while the Upper City and the Undercity sit near 20 with a crowd on screen. Most
+  of that frame time is the game's own rendering code on one CPU core,
   preparing several hundred objects a frame; the graphics chip is not the
-  limit. Video memory is also full for most of a session, so textures loaded
+  limit. Since v0.5.0 the GL calls themselves run on a second core, which took
+  about a tenth off each busy frame; what is left is the game's own code. Video memory is also full for most of a session, so textures loaded
   after the first minute are served from ordinary RAM.
+- **The loading screen runs twice when you load a save.** It fills once without
+  a tip, then again, quickly, with one. Nothing is lost and the save loads
+  normally; it happens in v0.4.3 as well (issue #13).
 - **No trophies.**
 
 ### Recently fixed
 
-- **Setup mistakes looked like a hang** *(not yet released)*. A missing
+- **Busy scenes ran slower** *(v0.5.0)*. The game's GL calls now run on a
+  second CPU core, so the core running the game no longer waits on the graphics
+  library: about 10% more frames in the Upper City and the Endar Spire fights.
+- **Setup mistakes looked like a hang** *(v0.5.0)*. A missing
   `kubridge`, `libshacccg`, `.so` file or `.obb` left a black screen. A message
   box now says what is missing and where it goes.
-- **Textures could be corrupted with 16-bit textures on** *(not yet released)*,
+- **Textures could be corrupted with 16-bit textures on** *(v0.5.0)*,
   when the game re-uploaded a texture or updated one on a texture unit it had
   not just bound.
 - **The 1.0.7 / 1.0.71 APK would not run** *(v0.4.3)*. It is an older build
