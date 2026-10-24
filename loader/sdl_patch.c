@@ -25,6 +25,7 @@
 #include "fs_patch.h"
 #include "bink_patch.h"
 #include "gl_patch.h"
+#include "gl_thread.h"
 #include "ime_patch.h"
 #include "input_patch.h"
 #include "so_util.h"
@@ -68,7 +69,7 @@ static void SDL_GL_SwapWindow_hook(SDL_Window *w) {
   // back buffer by vglSwapBuffers, and only when we ask for it. Passing GL_TRUE
   // unconditionally would cost a sceCommonDialogUpdate every frame of the game.
   uint64_t swap_begin = sceKernelGetProcessTimeWide();
-  vglSwapBuffers(ime_dialog_active() ? GL_TRUE : GL_FALSE);
+  gl_thread_swap(ime_dialog_active());   /* queued behind the frame's draws */
   uint64_t swap_end = sceKernelGetProcessTimeWide();
   gl_patch_on_swap(swap_begin, swap_end);
   bink_patch_on_swap(swap_end);

@@ -372,6 +372,30 @@
 // Set to 0 if lighting or skinning ever looks stale, to rule this out.
 #define GL_FILTER_REDUNDANT_PROGS 1
 
+// Render thread (gl_thread.c). The game's GL calls are queued and replayed by
+// a thread on core 2, so vitaGL's per-draw work (~12 us a draw, ~550 draws a
+// frame in the Upper City) leaves the game thread. Calls that return a value
+// or read memory we cannot size make the game wait for the queue and run
+// there instead; the [glq] line says how often. Set to 0 to put every GL call
+// back on the game thread, exactly as v0.4.3 ran.
+#define GL_THREAD 1
+// Let the game build frame N+1 while the render thread draws and presents
+// frame N (at most one frame in flight). 0 = the game waits for each frame
+// to finish drawing before it presents.
+#define GL_THREAD_ASYNC_SWAP 1
+// Ring size, a power of two. A busy frame is ~10k calls and ~200 KB.
+#define GL_THREAD_RING_KB 2048
+// Queued words that trigger a hand-over to the render thread. Larger means
+// fewer wake-ups, smaller means it starts sooner.
+#define GL_THREAD_FLUSH_WORDS 2048
+// Spin iterations before either side sleeps on its semaphore.
+#define GL_THREAD_SPIN 2000
+// Client-memory vertex data up to this size is copied into the ring with its
+// draw; anything bigger makes the game wait for the render thread instead.
+#define GL_THREAD_CLIENT_COPY_MAX (64 * 1024)
+#define GL_THREAD_PRIORITY 0x100000F8
+#define GL_THREAD_STACK (256 * 1024)
+
 // Answer vitaGL's per-draw vertex-program request from a cache. vitaGL asks the
 // GXM shader patcher for the program on EVERY draw (log210: ~680 a frame, 618
 // distinct variants all session), and gxm_patcher.c then makes a second patcher

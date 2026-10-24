@@ -31,6 +31,7 @@
 #include "input_patch.h"
 #include "sdl_patch.h"
 #include "gl_patch.h"
+#include "gl_thread.h"
 #include "ime_patch.h"
 #include "crash.h"
 #include "heap.h"
@@ -88,6 +89,8 @@ void fatal_error(const char *fmt, ...) {
   log_flush();
 
   SceUID self = sceKernelGetThreadId();
+  if (self == g_game_thid)
+    gl_thread_stop();      // GL back on this thread, or the dialog races the queue
   int can_draw = !entered &&
                  ((self == g_main_thid && g_game_thid < 0 && !g_vgl_up) ||
                   (self == g_game_thid && g_vgl_up));
@@ -675,8 +678,8 @@ static void install_aurresget_hook(void) {
  * GUI boundary to scissor while preserving any caller-owned scissor state. */
 #define GUI_VIEWPORT_STACK_MAX 16
 typedef struct {
-  GLboolean enabled;
-  GLint box[4];
+  int enabled;
+  int box[4];
 } GuiScissorState;
 
 static int (*AurGUISetupViewport_orig)(int x, int y, int w, int h,
@@ -699,9 +702,7 @@ static uintptr_t *find_jump_slot(so_module *mod, const char *name) {
 }
 
 static void gui_scissor_restore(const GuiScissorState *state) {
-  glScissor(state->box[0], state->box[1], state->box[2], state->box[3]);
-  if (state->enabled) glEnable(GL_SCISSOR_TEST);
-  else                glDisable(GL_SCISSOR_TEST);
+  gl_patch_scissor_restore(state->enabled, state->box);
 }
 
 static int AurGUISetupViewport_scissor(int x, int y, int w, int h,
@@ -715,8 +716,7 @@ static int AurGUISetupViewport_scissor(int x, int y, int w, int h,
   }
 
   GuiScissorState *state = &g_gui_scissor_stack[g_gui_scissor_depth++];
-  state->enabled = glIsEnabled(GL_SCISSOR_TEST);
-  glGetIntegerv(GL_SCISSOR_BOX, state->box);
+  gl_patch_scissor_save(&state->enabled, state->box);
   g_gl_gui_viewport_scope++;
   int rc = AurGUISetupViewport_orig(x, y, w, h, color, clear, alpha);
   if (!rc) {
@@ -1657,6 +1657,7 @@ static void *game_main_thread(void *arg) {
   g_vgl_up = 1;
   gxmp_arm();
   apply_frame_lock();
+  gl_thread_init();        // the render thread waits until the game's first frame
   log_printf(">>> vitaGL application shader cache: %s", vgl_shader_cache_path);
 
   // vitaGL ignores the return of sceGxmShaderPatcherCreate (gxm.c:561), so a

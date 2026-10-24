@@ -22,4 +22,8 @@ extern int g_gl_tex16;
 /* Scope for KOTOR's nested AurGUI viewport stack. */
 extern int g_gl_gui_viewport_scope;
 
+/* Save/restore the scissor around a GUI viewport (render-thread safe). */
+void gl_patch_scissor_save(int *enabled, int box[4]);
+void gl_patch_scissor_restore(int enabled, const int box[4]);
+
 #endif

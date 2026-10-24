@@ -38,6 +38,7 @@
 #include "gameprof.h"
 #include "lzma_cache.h"
 #include "obb_cache.h"
+#include "gl_thread.h"
 
 #ifndef SCE_KERNEL_MEMBLOCK_TYPE_USER_RX
 #define SCE_KERNEL_MEMBLOCK_TYPE_USER_RX 0x0C20D050
@@ -45,8 +46,36 @@
 #if GL_CALL_CENSUS
 static void glc_report(unsigned frames);
 #endif
+#if GL_THREAD
+static const char *glq_name_of(uintptr_t fn);
+#endif
 
 static inline float u2f(uint32_t u) { union { uint32_t u; float f; } c; c.u = u; return c.f; }
+
+/* Render-thread plumbing (GL_THREAD, gl_thread.c). Q() queues a vitaGL call
+ * whose arguments are all integers or pointers to GL-owned state; QC() also
+ * copies `bytes` of caller memory found at argument `pi`. With GL_THREAD off
+ * both are the plain call. Wrappers built on these run on the game thread and
+ * keep the shadow state below; every table entry that is not one of them
+ * reaches vitaGL through an RPC thunk instead (gl_get_dynlib). */
+#if GL_THREAD
+#define GLQ_NARG(...) GLQ_NARG_(__VA_ARGS__, 6, 5, 4, 3, 2, 1, 0)
+#define GLQ_NARG_(a, b, c, d, e, f, N, ...) N
+#define GLQ_PAD(...) GLQ_PAD_(__VA_ARGS__, 0, 0, 0, 0, 0, 0)
+#define GLQ_PAD_(a, b, c, d, e, f, ...) \
+  (uint32_t)(a), (uint32_t)(b), (uint32_t)(c), (uint32_t)(d), (uint32_t)(e), (uint32_t)(f)
+#define Q(f, ...) glq_put_fast((const void *)(f), GLQ_NARG(__VA_ARGS__), GLQ_PAD(__VA_ARGS__))
+#define Q0(f) glq_put((const void *)(f), 0, 0, 0, 0, 0, 0, 0)
+#define QC(f, pi, bytes, ...) do { \
+    const uint32_t a_[] = { GLQ_PAD(__VA_ARGS__) }; \
+    glq_put_copy((const void *)(f), GLQ_NARG(__VA_ARGS__), a_, (pi), \
+                 (const void *)a_[(pi)], (uint32_t)(bytes)); \
+  } while (0)
+#else
+#define Q(f, ...) f(__VA_ARGS__)
+#define Q0(f) f()
+#define QC(f, pi, bytes, ...) f(__VA_ARGS__)
+#endif
 
 // Per-call GL trace budget lives in config.h (GL_TRACE_LIMIT) so it can be
 // re-armed for bring-up without editing this file. Declared early so both
@@ -80,6 +109,140 @@ static void glVertexAttrib3f_s(uint32_t i, uint32_t v0, uint32_t v1, uint32_t v2
 static void glVertexAttrib4f_s(uint32_t i, uint32_t v0, uint32_t v1, uint32_t v2, uint32_t v3) {
   glVertexAttrib4f(i, u2f(v0), u2f(v1), u2f(v2), u2f(v3));
 }
+
+/* Shadow of the state the game reads back every frame, so those reads need
+ * not wait for the render thread. Kept by the wrappers below whether or not
+ * the queue is on, seeded from vitaGL when it starts and re-read after every
+ * RPC (glq_reseed), when anything vitaGL did behind our back is settled. The
+ * getters list which pnames the game asks for (from libandroid_port.so's
+ * call sites); everything else is an RPC. */
+static GLint    s_viewport[4];
+static GLint    s_fb;                    /* GL_FRAMEBUFFER_BINDING            */
+static GLint    s_blend_src = GL_ONE, s_blend_dst = GL_ZERO;
+static GLint    s_prog;                  /* GL_CURRENT_PROGRAM (unfiltered)   */
+static GLint    s_elembuf;               /* GL_ELEMENT_ARRAY_BUFFER_BINDING   */
+#if GL_THREAD
+static GLint    s_max_tex;
+#endif
+static GLboolean s_blend, s_scissor;
+static GLint    s_scissor_box[4];
+static uint32_t s_clear[4];              /* GL_COLOR_CLEAR_VALUE, float bits  */
+static uint32_t s_attr_en;               /* enabled vertex attribute arrays   */
+static uint32_t s_attr_client;           /* ... whose pointer is client memory */
+#define GLQ_ATTRS 16
+static struct { GLint size; GLenum type; GLboolean norm; GLsizei stride; const void *ptr; }
+  s_attr[GLQ_ATTRS];                     /* last glVertexAttribPointer per index */
+
+/* (2q) the float shims, queued: the render thread runs the _s shim. */
+static void glClearColor_q(uint32_t r, uint32_t g, uint32_t b, uint32_t a) {
+  s_clear[0] = r; s_clear[1] = g; s_clear[2] = b; s_clear[3] = a;
+  Q(glClearColor_s, r, g, b, a);
+}
+static void glClearDepthf_q(uint32_t d) { Q(glClearDepthf_s, d); }
+static void glDepthRangef_q(uint32_t n, uint32_t f) { Q(glDepthRangef_s, n, f); }
+static void glLineWidth_q(uint32_t w) { Q(glLineWidth_s, w); }
+static void glPolygonOffset_q(uint32_t f, uint32_t u) { Q(glPolygonOffset_s, f, u); }
+static void glTexParameterf_q(uint32_t t, uint32_t p, uint32_t v) { Q(glTexParameterf_s, t, p, v); }
+static void glUniform1f_q(uint32_t l, uint32_t a) { Q(glUniform1f_s, l, a); }
+static void glUniform2f_q(uint32_t l, uint32_t a, uint32_t b) { Q(glUniform2f_s, l, a, b); }
+static void glUniform3f_q(uint32_t l, uint32_t a, uint32_t b, uint32_t c) { Q(glUniform3f_s, l, a, b, c); }
+static void glUniform4f_q(uint32_t l, uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
+  Q(glUniform4f_s, l, a, b, c, d);
+}
+static void glVertexAttrib1f_q(uint32_t i, uint32_t a) { Q(glVertexAttrib1f_s, i, a); }
+static void glVertexAttrib2f_q(uint32_t i, uint32_t a, uint32_t b) { Q(glVertexAttrib2f_s, i, a, b); }
+static void glVertexAttrib3f_q(uint32_t i, uint32_t a, uint32_t b, uint32_t c) {
+  Q(glVertexAttrib3f_s, i, a, b, c);
+}
+static void glVertexAttrib4f_q(uint32_t i, uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
+  Q(glVertexAttrib4f_s, i, a, b, c, d);
+}
+
+/* Highest 16-bit index each element buffer holds, noted as the game uploads
+ * it. A client-vertex draw whose indices live in a VBO needs to know how many
+ * vertices to copy, and the buffer's own memory is vitaGL's; the loading
+ * screen draws ~1800 of these per window. An upper bound is all it takes, so
+ * sub-uploads only ever raise the figure. */
+#define IDXMAX_SLOTS 512
+static struct { GLuint buf; uint32_t max; } g_idxmax[IDXMAX_SLOTS];
+static int idxmax_slot(GLuint b, int add) {
+  if (!b) return -1;
+  unsigned h = ((uint32_t)b >> 4) * 2654435761u >> 23;   /* 9 bits */
+  for (unsigned k = 0; k < IDXMAX_SLOTS; k++) {
+    unsigned i = (h + k) & (IDXMAX_SLOTS - 1);
+    if (g_idxmax[i].buf == b) return (int)i;
+    if (!g_idxmax[i].buf) {
+      if (!add) return -1;
+      g_idxmax[i].buf = b;
+      g_idxmax[i].max = 0;
+      return (int)i;
+    }
+  }
+  return -1;
+}
+static void idxmax_note(GLuint b, const void *d, GLsizeiptr sz, int replace) {
+  int i = idxmax_slot(b, 1);
+  if (i < 0) return;
+  uint32_t mx = replace ? 0 : g_idxmax[i].max;
+  if (!d) mx = 0xFFFFu;                        /* contents unknown: worst case */
+  else {
+    const uint16_t *p = d;
+    for (GLsizeiptr k = 0; k < sz / 2; k++) if (p[k] > mx) mx = p[k];
+  }
+  g_idxmax[i].max = mx;
+}
+
+/* (1q) direct maps that are hot enough to queue. Array arguments are copied. */
+static void glEnableVertexAttribArray_q(GLuint i) {
+  if (i < 32) s_attr_en |= 1u << i;
+  Q(glEnableVertexAttribArray, i);
+}
+static void glDisableVertexAttribArray_q(GLuint i) {
+  if (i < 32) s_attr_en &= ~(1u << i);
+  Q(glDisableVertexAttribArray, i);
+}
+static void glBlendFuncSeparate_q(GLenum sr, GLenum dr, GLenum sa, GLenum da) {
+  s_blend_src = sr; s_blend_dst = dr;
+  Q(glBlendFuncSeparate, sr, dr, sa, da);
+}
+static void glBlendEquation_q(GLenum m) { Q(glBlendEquation, m); }
+static void glBlendEquationSeparate_q(GLenum a, GLenum b) { Q(glBlendEquationSeparate, a, b); }
+static void glStencilFunc_q(GLenum f, GLint r, GLuint m) { Q(glStencilFunc, f, r, m); }
+static void glStencilFuncSeparate_q(GLenum fc, GLenum f, GLint r, GLuint m) { Q(glStencilFuncSeparate, fc, f, r, m); }
+static void glStencilMask_q(GLuint m) { Q(glStencilMask, m); }
+static void glStencilMaskSeparate_q(GLenum fc, GLuint m) { Q(glStencilMaskSeparate, fc, m); }
+static void glStencilOp_q(GLenum a, GLenum b, GLenum c) { Q(glStencilOp, a, b, c); }
+static void glStencilOpSeparate_q(GLenum fc, GLenum a, GLenum b, GLenum c) { Q(glStencilOpSeparate, fc, a, b, c); }
+static void glUniform2i_q(GLint l, GLint a, GLint b) { Q(glUniform2i, l, a, b); }
+static void glUniform3i_q(GLint l, GLint a, GLint b, GLint c) { Q(glUniform3i, l, a, b, c); }
+static void glUniform4i_q(GLint l, GLint a, GLint b, GLint c, GLint d) { Q(glUniform4i, l, a, b, c, d); }
+static void glBufferSubData_q(GLenum t, GLintptr o, GLsizeiptr sz, const void *d) {
+  if (t == GL_ELEMENT_ARRAY_BUFFER && sz > 0) idxmax_note((GLuint)s_elembuf, d, sz, 0);
+  QC(glBufferSubData, 3, sz > 0 ? sz : 0, t, o, sz, d);
+}
+#define UNIFORM_V_Q(name, T, k) \
+  static void name##_q(GLint l, GLsizei n, const T *v) { QC(name, 2, (n > 0 ? n : 0) * (k) * 4, l, n, v); }
+UNIFORM_V_Q(glUniform1fv, GLfloat, 1)
+UNIFORM_V_Q(glUniform2fv, GLfloat, 2)
+UNIFORM_V_Q(glUniform3fv, GLfloat, 3)
+UNIFORM_V_Q(glUniform4fv, GLfloat, 4)
+UNIFORM_V_Q(glUniform1iv, GLint, 1)
+UNIFORM_V_Q(glUniform2iv, GLint, 2)
+UNIFORM_V_Q(glUniform3iv, GLint, 3)
+UNIFORM_V_Q(glUniform4iv, GLint, 4)
+#define UNIFORM_M_Q(name, k) \
+  static void name##_q(GLint l, GLsizei n, GLboolean tr, const GLfloat *v) { \
+    QC(name, 3, (n > 0 ? n : 0) * (k) * (k) * 4, l, n, tr, v); \
+  }
+UNIFORM_M_Q(glUniformMatrix2fv, 2)
+UNIFORM_M_Q(glUniformMatrix3fv, 3)
+UNIFORM_M_Q(glUniformMatrix4fv, 4)
+#define ATTRIB_V_Q(name, k) \
+  static void name##_q(GLuint i, const GLfloat *v) { QC(name, 1, (k) * 4, i, v); }
+ATTRIB_V_Q(glVertexAttrib1fv, 1)
+ATTRIB_V_Q(glVertexAttrib2fv, 2)
+ATTRIB_V_Q(glVertexAttrib3fv, 3)
+ATTRIB_V_Q(glVertexAttrib4fv, 4)
 
 /* -- (3) gap stubs: not implemented by vitaGL ------------------------------- */
 static void glBlendColor_g(uint32_t r, uint32_t g, uint32_t b, uint32_t a) { (void)r;(void)g;(void)b;(void)a; }
@@ -225,10 +388,13 @@ static void glLinkProgram_t(GLuint p) {
 static void glViewport_t(GLint x, GLint y, GLsizei w, GLsizei h) {
   if (g_gl_seq < GL_TRACE_LIMIT)  // silence with the rest of the per-call trace
     log_printf("[GL] glViewport(%d, %d, %d, %d)", x, y, (int)w, (int)h);
-  glViewport(x, y, w, h);
+  s_viewport[0] = x; s_viewport[1] = y; s_viewport[2] = w; s_viewport[3] = h;
+  Q(glViewport, x, y, w, h);
   if (g_gl_gui_viewport_scope) {
-    glScissor(x, y, w, h);
-    glEnable(GL_SCISSOR_TEST);
+    s_scissor_box[0] = x; s_scissor_box[1] = y; s_scissor_box[2] = w; s_scissor_box[3] = h;
+    Q(glScissor, x, y, w, h);
+    Q(glEnable, GL_SCISSOR_TEST);
+    s_scissor = GL_TRUE;
   }
 }
 // Draw/clear accounting. The first few of each are logged in full; after that we
@@ -244,7 +410,7 @@ static void glClear_t(GLbitfield mask) {
   if (g_clear_n < 5) log_printf("[GL] glClear(0x%x) #%d", (unsigned)mask, g_clear_n);
   g_clear_n++;
   g_clears_win++; g_clears_frame++;
-  glClear(mask);
+  Q(glClear, mask);
 }
 // g_cur_tex mirrors the GL_TEXTURE_2D binding.
 static unsigned g_cur_tex = 0;
@@ -317,26 +483,144 @@ static inline void draw_note_source(void) {
   else { g_draw_client_win++; g_draw_client_frame++; }
 }
 
-static void glDrawArrays_t(GLenum mode, GLint first, GLsizei count) {
-  if (loadscreen_active()) loadscreen_end();   /* first real frame: hand over */
-  if (g_draw_n < 20) log_printf("[GL] glDrawArrays(mode=0x%x, first=%d, count=%d) #%d",
-                               (unsigned)mode, first, (int)count, g_draw_n);
-  g_draw_n++; g_arrays_win++; g_arrays_frame++; g_arrays_tot++; draw_note_source();
+/* The draws themselves, timed; these run wherever the call executes, which is
+ * the render thread once the queue is on. */
+static void draw_arrays_x(GLenum mode, GLint first, GLsizei count) {
   if (++g_draw_sample & 7) { glDrawArrays(mode, first, count); return; }
   uint64_t t0 = sceKernelGetProcessTimeWide();
   glDrawArrays(mode, first, count);
   g_prof_draw_us += (sceKernelGetProcessTimeWide() - t0) * 8;
 }
-
-static void glDrawElements_t(GLenum mode, GLsizei count, GLenum type, const void *idx) {
-  if (loadscreen_active()) loadscreen_end();   /* first real frame: hand over */
-  if (g_draw_n < 20) log_printf("[GL] glDrawElements(mode=0x%x, count=%d, type=0x%x) #%d",
-                               (unsigned)mode, (int)count, (unsigned)type, g_draw_n);
-  g_draw_n++; g_elements_win++; g_elements_frame++; g_elements_tot++; draw_note_source();
+static void draw_elements_x(GLenum mode, GLsizei count, GLenum type, const void *idx) {
   if (++g_draw_sample & 7) { glDrawElements(mode, count, type, idx); return; }
   uint64_t t0 = sceKernelGetProcessTimeWide();
   glDrawElements(mode, count, type, idx);
   g_prof_draw_us += (sceKernelGetProcessTimeWide() - t0) * 8;
+}
+
+#if GL_THREAD
+static int g_glq_begun = 0;
+static void glq_begin(void);
+#define GLQ_BEGUN g_glq_begun
+
+/* A draw from client-memory vertices (the odd 2D element, ~1 a frame) reads
+ * them during the draw. Rather than make the game wait, copy each enabled
+ * client attribute's vertices [0, nverts) into the ring and queue a
+ * glVertexAttribPointer at the copy ahead of the draw. Only when no VBO is
+ * bound, so vitaGL takes the new pointer as an address, not a VBO offset.
+ * The shadow keeps the game's own pointer, so the next client draw re-points
+ * again. Returns 0 -> caller falls back to an RPC. */
+static unsigned glq_type_bytes(GLenum t) {
+  switch (t) {
+  case GL_BYTE: case GL_UNSIGNED_BYTE: return 1;
+  case GL_SHORT: case GL_UNSIGNED_SHORT: case GL_HALF_FLOAT_OES: case 0x140B: return 2;
+  default: return 4;
+  }
+}
+/* Why a client draw still went through an RPC, for the [glq] line. */
+enum { CF_OFF, CF_ELEMBUF, CF_VERTS, CF_ATTR, CF_BIG, CF_N };
+static unsigned g_cf[CF_N];
+static int glq_copy_client_attribs(uint32_t nverts) {
+  uint32_t m = s_attr_en & s_attr_client, total = 0, bytes[GLQ_ATTRS];
+  if (!g_glq_on) { g_cf[CF_OFF]++; return 0; }
+  if (!nverts || nverts > 0x10000u) { g_cf[CF_VERTS]++; return 0; }
+  for (unsigned i = 0; i < 32; i++) {
+    if (!(m & (1u << i))) continue;
+    if (i >= GLQ_ATTRS || !s_attr[i].ptr || s_attr[i].size < 1 || s_attr[i].size > 4) {
+      g_cf[CF_ATTR]++;
+      return 0;
+    }
+    uint32_t elem = (uint32_t)s_attr[i].size * glq_type_bytes(s_attr[i].type);
+    uint32_t st = s_attr[i].stride ? (uint32_t)s_attr[i].stride : elem;
+    bytes[i] = (nverts - 1u) * st + elem;
+    total += bytes[i];
+  }
+  if (total > GL_THREAD_CLIENT_COPY_MAX) { g_cf[CF_BIG]++; return 0; }
+  /* vitaGL takes a pointer as a VBO offset if a VBO is bound when it is set
+   * (as GL does), so set the copies with none bound and put it back after.
+   * The draw itself only reads the pointers captured here. */
+  if (g_cur_arraybuf) Q(glBindBuffer, GL_ARRAY_BUFFER, 0);
+  for (unsigned i = 0; i < GLQ_ATTRS; i++)
+    if (m & (1u << i))
+      QC(glVertexAttribPointer, 5, bytes[i], i, s_attr[i].size, s_attr[i].type,
+         s_attr[i].norm, s_attr[i].stride, s_attr[i].ptr);
+  if (g_cur_arraybuf) Q(glBindBuffer, GL_ARRAY_BUFFER, g_cur_arraybuf);
+  return 1;
+}
+static uint32_t glq_max_index(const void *idx, GLsizei count, GLenum type) {
+  uint32_t mx = 0;
+  if (type == GL_UNSIGNED_BYTE) {
+    const uint8_t *p = idx; for (GLsizei i = 0; i < count; i++) if (p[i] > mx) mx = p[i];
+  } else if (type == GL_UNSIGNED_INT) {
+    const uint32_t *p = idx; for (GLsizei i = 0; i < count; i++) if (p[i] > mx) mx = p[i];
+  } else {
+    const uint16_t *p = idx; for (GLsizei i = 0; i < count; i++) if (p[i] > mx) mx = p[i];
+  }
+  return mx;
+}
+#else
+#define GLQ_BEGUN 0
+#endif
+
+static void glDrawArrays_t(GLenum mode, GLint first, GLsizei count) {
+  if (loadscreen_active()) loadscreen_end();   /* first real frame: hand over */
+#if GL_THREAD
+  if (!g_glq_begun) glq_begin();               /* ...and from here on, queue */
+#endif
+  if (g_draw_n < 20) log_printf("[GL] glDrawArrays(mode=0x%x, first=%d, count=%d) #%d",
+                               (unsigned)mode, first, (int)count, g_draw_n);
+  g_draw_n++; g_arrays_win++; g_arrays_frame++; g_arrays_tot++; draw_note_source();
+#if GL_THREAD
+  /* Client-memory vertices are read during the draw, and their extent is the
+   * shader's business: let the game wait rather than guess what to copy. */
+  if (s_attr_en & s_attr_client) {
+    if (first >= 0 && count > 0 && glq_copy_client_attribs((uint32_t)first + (uint32_t)count)) {
+      Q(draw_arrays_x, mode, first, count);
+      return;
+    }
+    const uint32_t a[9] = { mode, (uint32_t)first, (uint32_t)count };
+    glq_rpc((const void *)draw_arrays_x, a);
+    return;
+  }
+#endif
+  Q(draw_arrays_x, mode, first, count);
+}
+
+static void glDrawElements_t(GLenum mode, GLsizei count, GLenum type, const void *idx) {
+  if (loadscreen_active()) loadscreen_end();   /* first real frame: hand over */
+#if GL_THREAD
+  if (!g_glq_begun) glq_begin();
+#endif
+  if (g_draw_n < 20) log_printf("[GL] glDrawElements(mode=0x%x, count=%d, type=0x%x) #%d",
+                               (unsigned)mode, (int)count, (unsigned)type, g_draw_n);
+  g_draw_n++; g_elements_win++; g_elements_frame++; g_elements_tot++; draw_note_source();
+#if GL_THREAD
+  unsigned isz = (type == GL_UNSIGNED_BYTE) ? 1u : (type == GL_UNSIGNED_INT) ? 4u : 2u;
+  if (s_attr_en & s_attr_client) {
+    int slot;
+    if (s_elembuf) {                           /* indices in a VBO */
+      if (type == GL_UNSIGNED_SHORT && count > 0 &&
+          (slot = idxmax_slot((GLuint)s_elembuf, 0)) >= 0 &&
+          glq_copy_client_attribs(g_idxmax[slot].max + 1u)) {
+        Q(draw_elements_x, mode, count, type, idx);
+        return;
+      }
+      g_cf[CF_ELEMBUF]++;
+    } else if (!idx || count <= 0) g_cf[CF_ELEMBUF]++;
+    else if (glq_copy_client_attribs(glq_max_index(idx, count, type) + 1u)) {
+      QC(draw_elements_x, 3, (uint32_t)count * isz, mode, count, type, idx);
+      return;
+    }
+    const uint32_t a[9] = { mode, (uint32_t)count, type, (uint32_t)idx };
+    glq_rpc((const void *)draw_elements_x, a);
+    return;
+  }
+  if (!s_elembuf && idx && count > 0) {        /* client index list: copy it */
+    QC(draw_elements_x, 3, (uint32_t)count * isz, mode, count, type, idx);
+    return;
+  }
+#endif
+  Q(draw_elements_x, mode, count, type, idx);
 }
 volatile uint64_t g_last_swap_end_us;
 
@@ -477,6 +761,13 @@ void gl_patch_on_swap(uint64_t swap_begin_us, uint64_t swap_end_us) {
 #if GL_CALL_CENSUS
     glc_report(120);
 #endif
+#if GL_THREAD
+    gl_thread_report(120, glq_name_of);
+    if (g_cf[CF_OFF] + g_cf[CF_ELEMBUF] + g_cf[CF_VERTS] + g_cf[CF_ATTR] + g_cf[CF_BIG])
+      log_printf("[glq]   client draws not copied: off=%u indexVBO=%u verts=%u attr=%u big=%u",
+                 g_cf[CF_OFF], g_cf[CF_ELEMBUF], g_cf[CF_VERTS], g_cf[CF_ATTR], g_cf[CF_BIG]);
+    memset(g_cf, 0, sizeof g_cf);
+#endif
     gameprof_window_report();
     lzma_cache_report();
     obb_cache_report();
@@ -529,7 +820,7 @@ static int g_glget_n = 0;
     } \
   } while (0)
 
-static void glGetIntegerv_t(GLenum pname, GLint *params) {
+static void glGetIntegerv_real(GLenum pname, GLint *params) {
   const GLint SENT = 0x0BADF00D;
   if (params) *params = SENT;
   glGetIntegerv(pname, params);
@@ -537,6 +828,46 @@ static void glGetIntegerv_t(GLenum pname, GLint *params) {
     log_printf("[GL] glGetIntegerv(0x%x) -> UNWRITTEN (vitaGL ignored enum)", (unsigned)pname);
   else
     GLGETLOG("[GL] glGetIntegerv(0x%x) -> %d", (unsigned)pname, params ? *params : 0);
+}
+
+#if GL_THREAD
+/* A getter the shadow cannot answer costs the game a wait for the render
+ * thread. Name each kind once so the next log says what to shadow. */
+static void glq_miss(const char *fn, GLenum pname) {
+  static uint32_t seen[32];
+  static unsigned n = 0;
+  uint32_t key = (uint32_t)pname ^ ((uint32_t)fn[5] << 24);
+  for (unsigned i = 0; i < n; i++) if (seen[i] == key) return;
+  if (n < 32) seen[n++] = key;
+  log_printf("[glq] %s(0x%x) is not shadowed: the game waits for the render thread",
+             fn, (unsigned)pname);
+}
+#endif
+
+static void glGetIntegerv_t(GLenum pname, GLint *params) {
+#if GL_THREAD
+  if (g_glq_on && params) {
+    switch (pname) {
+    case GL_VIEWPORT:            memcpy(params, s_viewport, sizeof s_viewport); return;
+    case GL_SCISSOR_BOX:         memcpy(params, s_scissor_box, sizeof s_scissor_box); return;
+    case GL_FRAMEBUFFER_BINDING: *params = s_fb; return;
+    case GL_TEXTURE_BINDING_2D:
+      if (g_active_unit < GL_MAX_TEXUNITS) { *params = (GLint)g_unit2d[g_active_unit]; return; }
+      break;
+    case GL_BLEND_SRC: case GL_BLEND_SRC_RGB: *params = s_blend_src; return;
+    case GL_BLEND_DST: case GL_BLEND_DST_RGB: *params = s_blend_dst; return;
+    case GL_MAX_TEXTURE_SIZE:    *params = s_max_tex; return;
+    case GL_ARRAY_BUFFER_BINDING: *params = (GLint)g_cur_arraybuf; return;
+    case GL_ELEMENT_ARRAY_BUFFER_BINDING: *params = s_elembuf; return;
+    case GL_CURRENT_PROGRAM:     *params = s_prog; return;
+    }
+    glq_miss("glGetIntegerv", pname);
+    const uint32_t a[9] = { pname, (uint32_t)params };
+    glq_rpc((const void *)glGetIntegerv_real, a);
+    return;
+  }
+#endif
+  glGetIntegerv_real(pname, params);
 }
 static void glGetBooleanv_t(GLenum pname, GLboolean *params) {
   const GLboolean SENT = 0x5A;
@@ -547,7 +878,32 @@ static void glGetBooleanv_t(GLenum pname, GLboolean *params) {
   else
     GLGETLOG("[GL] glGetBooleanv(0x%x) -> %d", (unsigned)pname, params ? *params : 0);
 }
+static void glGetFloatv_real(GLenum pname, GLfloat *params);
 static void glGetFloatv_t(GLenum pname, GLfloat *params) {
+#if GL_THREAD
+  if (g_glq_on && params) {
+    if (pname == GL_COLOR_CLEAR_VALUE) { memcpy(params, s_clear, sizeof s_clear); return; }
+    glq_miss("glGetFloatv", pname);
+    const uint32_t a[9] = { pname, (uint32_t)params };
+    glq_rpc((const void *)glGetFloatv_real, a);
+    return;
+  }
+#endif
+  glGetFloatv_real(pname, params);
+}
+static GLboolean glIsEnabled_q(GLenum cap) {
+#if GL_THREAD
+  if (g_glq_on) {
+    if (cap == GL_BLEND) return s_blend;
+    if (cap == GL_SCISSOR_TEST) return s_scissor;
+    glq_miss("glIsEnabled", cap);
+    const uint32_t a[9] = { cap };
+    return (GLboolean)glq_rpc((const void *)glIsEnabled, a);
+  }
+#endif
+  return glIsEnabled(cap);
+}
+static void glGetFloatv_real(GLenum pname, GLfloat *params) {
   union { uint32_t u; float f; } sent = { .u = 0x0BADF00D };
   if (params) *params = sent.f;
   glGetFloatv(pname, params);
@@ -576,10 +932,20 @@ static void glGetFloatv_t(GLenum pname, GLfloat *params) {
     else if (_s == GL_TRACE_LIMIT) \
       log_printf("[GL] per-call GL trace silenced after %d calls (steady state; " \
                  "frame/shader/link/crash logs continue)", GL_TRACE_LIMIT); \
-    loadscreen_note_gl(); \
+    if (!GLQ_BEGUN) loadscreen_note_gl();  /* the loadscreen is over by then */ \
   } while (0)
-static void glEnable_e(GLenum cap) { GLLOG("glEnable(0x%x)", (unsigned)cap); glEnable(cap); }
-static void glDisable_e(GLenum cap) { GLLOG("glDisable(0x%x)", (unsigned)cap); glDisable(cap); }
+static void glEnable_e(GLenum cap) {
+  GLLOG("glEnable(0x%x)", (unsigned)cap);
+  if (cap == GL_BLEND) s_blend = GL_TRUE;
+  else if (cap == GL_SCISSOR_TEST) s_scissor = GL_TRUE;
+  Q(glEnable, cap);
+}
+static void glDisable_e(GLenum cap) {
+  GLLOG("glDisable(0x%x)", (unsigned)cap);
+  if (cap == GL_BLEND) s_blend = GL_FALSE;
+  else if (cap == GL_SCISSOR_TEST) s_scissor = GL_FALSE;
+  Q(glDisable, cap);
+}
 /* Redundant-bind filter.
  *
  * log120: texBinds=1562368 against vboDraws=1549697 -- the game rebinds a texture
@@ -623,7 +989,7 @@ static void glUniform1i_e(GLint location, GLint v) {
                  (unsigned)g_cur_prog, (int)location, (int)v);
     }
   }
-  glUniform1i(location, v);
+  Q(glUniform1i, location, v);
 }
 
 
@@ -636,7 +1002,7 @@ static void glActiveTexture_e(GLenum t) {
   g_active_unit = (u < GL_MAX_TEXUNITS) ? u : GL_MAX_TEXUNITS;
   /* Uploads go to the active unit's binding, not to the last one bound. */
   g_cur_tex = (u < GL_MAX_TEXUNITS) ? g_unit2d[u] : 0;
-  glActiveTexture(t);
+  Q(glActiveTexture, t);
 }
 
 /* Cube-texture lifetime, for the armour.
@@ -754,7 +1120,7 @@ static void glDeleteTextures_e(GLsizei n, const GLuint *tex) {
   memset(g_bound2d, 0, sizeof g_bound2d);
   glDeleteTextures(n, tex);
 }
-static void glPixelStorei_e(GLenum p, GLint v) { GLLOG("glPixelStorei(0x%x,%d)", (unsigned)p, v); glPixelStorei(p, v); }
+static void glPixelStorei_e(GLenum p, GLint v) { GLLOG("glPixelStorei(0x%x,%d)", (unsigned)p, v); Q(glPixelStorei, p, v); }
 static void glGenTextures_e(GLsizei n, GLuint *t) { GLLOG("glGenTextures(%d)", (int)n); glGenTextures(n, t); }
 static void glBindTexture_e(GLenum tg, GLuint t) {
   GLLOG("glBindTexture(0x%x,%u)", (unsigned)tg, (unsigned)t);
@@ -780,7 +1146,7 @@ static void glBindTexture_e(GLenum tg, GLuint t) {
     /* untracked unit: always forward */
   } else if (tg == GL_TEXTURE_2D) {
     if (g_bound2d[g_active_unit] == t) {
-      g_bind_skipped_win++; g_bind_skipped_frame++; g_cur_tex = t; return;
+      g_bind_skipped_win++; g_bind_skipped_frame++; g_cur_tex = t; g_unit2d[g_active_unit] = t; return;
     }
     g_bound2d[g_active_unit] = t;
   } else {
@@ -792,7 +1158,7 @@ static void glBindTexture_e(GLenum tg, GLuint t) {
     g_cur_tex = t;
     if (g_active_unit < GL_MAX_TEXUNITS) g_unit2d[g_active_unit] = t;
   }
-  glBindTexture(tg, t);
+  Q(glBindTexture, tg, t);
 }
 /* Attribute-offset witness (see g_vap_max_off). Only meaningful when a VBO is
  * bound: with no buffer, `pointer` is a real client address and comparing it
@@ -804,7 +1170,15 @@ static void glVertexAttribPointer_e(GLuint index, GLint size, GLenum type, GLboo
     if ((uintptr_t)pointer > g_vap_max_off) g_vap_max_off = (uintptr_t)pointer;
     if ((uintptr_t)pointer > 0xFFFFu) g_vap_over64k++;
   }
-  glVertexAttribPointer(index, size, type, normalized, stride, pointer);
+  if (index < 32) {
+    if (g_cur_arraybuf) s_attr_client &= ~(1u << index);
+    else s_attr_client |= 1u << index;
+  }
+  if (index < GLQ_ATTRS) {
+    s_attr[index].size = size; s_attr[index].type = type; s_attr[index].norm = normalized;
+    s_attr[index].stride = stride; s_attr[index].ptr = pointer;
+  }
+  Q(glVertexAttribPointer, index, size, type, normalized, stride, pointer);
 }
 
 /* Sampler name->location, so the texture unit glUniform1i_e logs can be tied
@@ -1087,12 +1461,16 @@ static void glTexParameteri_e(GLenum tg, GLenum p, GLint v) {
     ncp++;
     log_printf("[GL] cube tex=%u min filter 0x%x", (unsigned)g_cur_cubetex, (unsigned)v);
   }
-  glTexParameteri(tg, p, v);
+  Q(glTexParameteri, tg, p, v);
 }
 static void glGenFramebuffers_e(GLsizei n, GLuint *f) { GLLOG("glGenFramebuffers(%d)", (int)n); glGenFramebuffers(n, f); }
-static void glBindFramebuffer_e(GLenum tg, GLuint f) { GLLOG("glBindFramebuffer(0x%x,%u)", (unsigned)tg, (unsigned)f); glBindFramebuffer(tg, f); }
+static void glBindFramebuffer_e(GLenum tg, GLuint f) {
+  GLLOG("glBindFramebuffer(0x%x,%u)", (unsigned)tg, (unsigned)f);
+  if (tg == GL_FRAMEBUFFER || tg == GL_DRAW_FRAMEBUFFER) s_fb = (GLint)f;
+  Q(glBindFramebuffer, tg, f);
+}
 static void glGenRenderbuffers_e(GLsizei n, GLuint *r) { GLLOG("glGenRenderbuffers(%d)", (int)n); glGenRenderbuffers(n, r); }
-static void glBindRenderbuffer_e(GLenum tg, GLuint r) { GLLOG("glBindRenderbuffer(0x%x,%u)", (unsigned)tg, (unsigned)r); glBindRenderbuffer(tg, r); }
+static void glBindRenderbuffer_e(GLenum tg, GLuint r) { GLLOG("glBindRenderbuffer(0x%x,%u)", (unsigned)tg, (unsigned)r); Q(glBindRenderbuffer, tg, r); }
 // The scrambled chargen/menu backgrounds are RENDER TARGETS, not uploads: every
 // `glTexImage2D(847x480, data=NULL)` is immediately followed by a matching
 // glRenderbufferStorage for the depth attachment, i.e. the game renders its 3D
@@ -1122,13 +1500,15 @@ static void glGenBuffers_e(GLsizei n, GLuint *b) { GLLOG("glGenBuffers(%d)", (in
 static void glBindBuffer_e(GLenum tg, GLuint b) {
   GLLOG("glBindBuffer(0x%x,%u)", (unsigned)tg, (unsigned)b);
   if (tg == GL_ARRAY_BUFFER) g_cur_arraybuf = b;
-  glBindBuffer(tg, b);
+  else if (tg == GL_ELEMENT_ARRAY_BUFFER) s_elembuf = (GLint)b;
+  Q(glBindBuffer, tg, b);
 }
 static void glBufferData_e(GLenum tg, GLsizeiptr sz, const void *d, GLenum u) {
   GLLOG("glBufferData(0x%x, %d bytes)", (unsigned)tg, (int)sz);
   g_bufdata_win++; g_bufdata_frame++;
   if (sz > 0) g_bufdata_bytes_frame += (uint64_t)sz;
-  glBufferData(tg, sz, d, u);
+  if (tg == GL_ELEMENT_ARRAY_BUFFER) idxmax_note((GLuint)s_elembuf, d, sz > 0 ? sz : 0, 1);
+  QC(glBufferData, 2, sz > 0 ? sz : 0, tg, sz, d, u);
 }
 static GLuint glCreateProgram_e(void) { GLLOG("glCreateProgram()"); GLuint p = glCreateProgram(); log_printf("[GL]  -> program %u", (unsigned)p); return p; }
 /* Redundant program-switch filter.
@@ -1159,43 +1539,65 @@ static GLuint glCreateProgram_e(void) { GLLOG("glCreateProgram()"); GLuint p = g
 static void glUseProgram_e(GLuint p) {
   GLLOG("glUseProgram(%u)", (unsigned)p);
   g_prog_win++; g_prog_frame++;
+  s_prog = (GLint)p;
 #if GL_FILTER_REDUNDANT_PROGS
   if (p && p == g_cur_prog) { g_prog_skipped_win++; g_prog_skipped_frame++; return; }
   g_cur_prog = p;
 #endif
-  glUseProgram(p);
+  Q(glUseProgram, p);
 }
 static void glDeleteProgram_e(GLuint p) {
   g_cur_prog = 0;
   glDeleteProgram(p);
 }
-static void glScissor_e(GLint x, GLint y, GLsizei w, GLsizei h) { GLLOG("glScissor(%d,%d,%d,%d)", x, y, (int)w, (int)h); glScissor(x, y, w, h); }
-static void glClearStencil_e(GLint s) { GLLOG("glClearStencil(%d)", s); glClearStencil(s); }
+static void glScissor_e(GLint x, GLint y, GLsizei w, GLsizei h) {
+  GLLOG("glScissor(%d,%d,%d,%d)", x, y, (int)w, (int)h);
+  s_scissor_box[0] = x; s_scissor_box[1] = y; s_scissor_box[2] = w; s_scissor_box[3] = h;
+  Q(glScissor, x, y, w, h);
+}
+
+/* For main.c's AurGUI viewport hooks, which save and restore the scissor
+ * around each GUI viewport: through the shadow and the queue, never straight
+ * into vitaGL from the game thread. */
+void gl_patch_scissor_save(int *enabled, int box[4]) {
+  *enabled = glIsEnabled_q(GL_SCISSOR_TEST);
+  glGetIntegerv_t(GL_SCISSOR_BOX, box);
+}
+void gl_patch_scissor_restore(int enabled, const int box[4]) {
+  glScissor_e(box[0], box[1], box[2], box[3]);
+  if (enabled) glEnable_e(GL_SCISSOR_TEST);
+  else         glDisable_e(GL_SCISSOR_TEST);
+}
+static void glClearStencil_e(GLint s) { GLLOG("glClearStencil(%d)", s); Q(glClearStencil, s); }
 static GLenum glGetError_e(void) { GLenum e = glGetError(); GLLOG("glGetError() -> 0x%x", (unsigned)e); return e; }
-static void glHint_e(GLenum t, GLenum m) { GLLOG("glHint(0x%x,0x%x)", (unsigned)t, (unsigned)m); glHint(t, m); }
-static void glFrontFace_e(GLenum m) { GLLOG("glFrontFace(0x%x)", (unsigned)m); glFrontFace(m); }
-static void glCullFace_e(GLenum m) { GLLOG("glCullFace(0x%x)", (unsigned)m); glCullFace(m); }
-static void glDepthFunc_e(GLenum f) { GLLOG("glDepthFunc(0x%x)", (unsigned)f); glDepthFunc(f); }
-static void glColorMask_e(GLboolean r, GLboolean g, GLboolean b, GLboolean a) { GLLOG("glColorMask(%d%d%d%d)", r, g, b, a); glColorMask(r, g, b, a); }
-static void glBlendFunc_e(GLenum s, GLenum d) { GLLOG("glBlendFunc(0x%x,0x%x)", (unsigned)s, (unsigned)d); glBlendFunc(s, d); }
-static void glDepthMask_e(GLboolean f) { GLLOG("glDepthMask(%d)", f); glDepthMask(f); }
+static void glHint_e(GLenum t, GLenum m) { GLLOG("glHint(0x%x,0x%x)", (unsigned)t, (unsigned)m); Q(glHint, t, m); }
+static void glFrontFace_e(GLenum m) { GLLOG("glFrontFace(0x%x)", (unsigned)m); Q(glFrontFace, m); }
+static void glCullFace_e(GLenum m) { GLLOG("glCullFace(0x%x)", (unsigned)m); Q(glCullFace, m); }
+static void glDepthFunc_e(GLenum f) { GLLOG("glDepthFunc(0x%x)", (unsigned)f); Q(glDepthFunc, f); }
+static void glColorMask_e(GLboolean r, GLboolean g, GLboolean b, GLboolean a) { GLLOG("glColorMask(%d%d%d%d)", r, g, b, a); Q(glColorMask, r, g, b, a); }
+static void glBlendFunc_e(GLenum s, GLenum d) {
+  GLLOG("glBlendFunc(0x%x,0x%x)", (unsigned)s, (unsigned)d);
+  s_blend_src = s; s_blend_dst = d;
+  Q(glBlendFunc, s, d);
+}
+static void glDepthMask_e(GLboolean f) { GLLOG("glDepthMask(%d)", f); Q(glDepthMask, f); }
 
 static const so_default_dynlib gl_dynlib[] = {
   /* (2) float-by-value shims */
-  { "glClearColor",                      (uintptr_t)&glClearColor_s },
-  { "glClearDepthf",                     (uintptr_t)&glClearDepthf_s },
-  { "glDepthRangef",                     (uintptr_t)&glDepthRangef_s },
-  { "glLineWidth",                       (uintptr_t)&glLineWidth_s },
-  { "glPolygonOffset",                   (uintptr_t)&glPolygonOffset_s },
-  { "glTexParameterf",                   (uintptr_t)&glTexParameterf_s },
-  { "glUniform1f",                       (uintptr_t)&glUniform1f_s },
-  { "glUniform2f",                       (uintptr_t)&glUniform2f_s },
-  { "glUniform3f",                       (uintptr_t)&glUniform3f_s },
-  { "glUniform4f",                       (uintptr_t)&glUniform4f_s },
-  { "glVertexAttrib1f",                  (uintptr_t)&glVertexAttrib1f_s },
-  { "glVertexAttrib2f",                  (uintptr_t)&glVertexAttrib2f_s },
-  { "glVertexAttrib3f",                  (uintptr_t)&glVertexAttrib3f_s },
-  { "glVertexAttrib4f",                  (uintptr_t)&glVertexAttrib4f_s },
+  { "glClearColor",                      (uintptr_t)&glClearColor_q },
+  { "glClearDepthf",                     (uintptr_t)&glClearDepthf_q },
+  { "glDepthRangef",                     (uintptr_t)&glDepthRangef_q },
+  { "glLineWidth",                       (uintptr_t)&glLineWidth_q },
+  { "glPolygonOffset",                   (uintptr_t)&glPolygonOffset_q },
+  { "glTexParameterf",                   (uintptr_t)&glTexParameterf_q },
+  { "glUniform1f",                       (uintptr_t)&glUniform1f_q },
+  { "glUniform2f",                       (uintptr_t)&glUniform2f_q },
+  { "glUniform3f",                       (uintptr_t)&glUniform3f_q },
+  { "glUniform4f",                       (uintptr_t)&glUniform4f_q },
+  { "glVertexAttrib1f",                  (uintptr_t)&glVertexAttrib1f_q },
+  { "glVertexAttrib2f",                  (uintptr_t)&glVertexAttrib2f_q },
+  { "glVertexAttrib3f",                  (uintptr_t)&glVertexAttrib3f_q },
+  { "glVertexAttrib4f",                  (uintptr_t)&glVertexAttrib4f_q },
   /* (3) gap stubs (not in vitaGL) */
   { "glBlendColor",                      (uintptr_t)&glBlendColor_g },
   { "glCompressedTexSubImage2D",         (uintptr_t)&glCompressedTexSubImage2D_g },
@@ -1259,10 +1661,10 @@ static const so_default_dynlib gl_dynlib[] = {
   /* (1) direct maps to vitaGL */
   { "glAttachShader",                    (uintptr_t)&glAttachShader },
   { "glBindAttribLocation",              (uintptr_t)&glBindAttribLocation },
-  { "glBlendEquation",                   (uintptr_t)&glBlendEquation },
-  { "glBlendEquationSeparate",           (uintptr_t)&glBlendEquationSeparate },
-  { "glBlendFuncSeparate",               (uintptr_t)&glBlendFuncSeparate },
-  { "glBufferSubData",                   (uintptr_t)&glBufferSubData },
+  { "glBlendEquation",                   (uintptr_t)&glBlendEquation_q },
+  { "glBlendEquationSeparate",           (uintptr_t)&glBlendEquationSeparate_q },
+  { "glBlendFuncSeparate",               (uintptr_t)&glBlendFuncSeparate_q },
+  { "glBufferSubData",                   (uintptr_t)&glBufferSubData_q },
   // GLES OES buffer-mapping ext: identical signatures to vitaGL's core maps.
   { "glMapBufferOES",                    (uintptr_t)&glMapBuffer },
   { "glUnmapBufferOES",                  (uintptr_t)&glUnmapBuffer },
@@ -1275,8 +1677,8 @@ static const so_default_dynlib gl_dynlib[] = {
   { "glDeleteRenderbuffers",             (uintptr_t)&glDeleteRenderbuffers },
   { "glDeleteShader",                    (uintptr_t)&glDeleteShader },
   { "glDeleteTextures",                  (uintptr_t)&glDeleteTextures_e },
-  { "glDisableVertexAttribArray",        (uintptr_t)&glDisableVertexAttribArray },
-  { "glEnableVertexAttribArray",         (uintptr_t)&glEnableVertexAttribArray },
+  { "glDisableVertexAttribArray",        (uintptr_t)&glDisableVertexAttribArray_q },
+  { "glEnableVertexAttribArray",         (uintptr_t)&glEnableVertexAttribArray_q },
   { "glFinish",                          (uintptr_t)&glFinish },
   { "glFlush",                           (uintptr_t)&glFlush },
   { "glGenerateMipmap",                  (uintptr_t)&glGenerateMipmap_e },
@@ -1295,7 +1697,7 @@ static const so_default_dynlib gl_dynlib[] = {
   { "glGetVertexAttribfv",               (uintptr_t)&glGetVertexAttribfv },
   { "glGetVertexAttribiv",               (uintptr_t)&glGetVertexAttribiv },
   { "glGetVertexAttribPointerv",         (uintptr_t)&glGetVertexAttribPointerv },
-  { "glIsEnabled",                       (uintptr_t)&glIsEnabled },
+  { "glIsEnabled",                       (uintptr_t)&glIsEnabled_q },
   { "glIsFramebuffer",                   (uintptr_t)&glIsFramebuffer },
   { "glIsProgram",                       (uintptr_t)&glIsProgram },
   { "glIsRenderbuffer",                  (uintptr_t)&glIsRenderbuffer },
@@ -1303,33 +1705,33 @@ static const so_default_dynlib gl_dynlib[] = {
   { "glReadPixels",                      (uintptr_t)&glReadPixels },
   { "glReleaseShaderCompiler",           (uintptr_t)&glReleaseShaderCompiler_t },
   { "glShaderBinary",                    (uintptr_t)&glShaderBinary },
-  { "glStencilFunc",                     (uintptr_t)&glStencilFunc },
-  { "glStencilFuncSeparate",             (uintptr_t)&glStencilFuncSeparate },
-  { "glStencilMask",                     (uintptr_t)&glStencilMask },
-  { "glStencilMaskSeparate",             (uintptr_t)&glStencilMaskSeparate },
-  { "glStencilOp",                       (uintptr_t)&glStencilOp },
-  { "glStencilOpSeparate",               (uintptr_t)&glStencilOpSeparate },
+  { "glStencilFunc",                     (uintptr_t)&glStencilFunc_q },
+  { "glStencilFuncSeparate",             (uintptr_t)&glStencilFuncSeparate_q },
+  { "glStencilMask",                     (uintptr_t)&glStencilMask_q },
+  { "glStencilMaskSeparate",             (uintptr_t)&glStencilMaskSeparate_q },
+  { "glStencilOp",                       (uintptr_t)&glStencilOp_q },
+  { "glStencilOpSeparate",               (uintptr_t)&glStencilOpSeparate_q },
   { "glTexParameteriv",                  (uintptr_t)&glTexParameteriv },
   { "glTexSubImage2D",                   (uintptr_t)&glTexSubImage2D_e },
-  { "glUniform1fv",                      (uintptr_t)&glUniform1fv },
+  { "glUniform1fv",                      (uintptr_t)&glUniform1fv_q },
   { "glUniform1i",                       (uintptr_t)&glUniform1i_e },
-  { "glUniform1iv",                      (uintptr_t)&glUniform1iv },
-  { "glUniform2fv",                      (uintptr_t)&glUniform2fv },
-  { "glUniform2i",                       (uintptr_t)&glUniform2i },
-  { "glUniform2iv",                      (uintptr_t)&glUniform2iv },
-  { "glUniform3fv",                      (uintptr_t)&glUniform3fv },
-  { "glUniform3i",                       (uintptr_t)&glUniform3i },
-  { "glUniform3iv",                      (uintptr_t)&glUniform3iv },
-  { "glUniform4fv",                      (uintptr_t)&glUniform4fv },
-  { "glUniform4i",                       (uintptr_t)&glUniform4i },
-  { "glUniform4iv",                      (uintptr_t)&glUniform4iv },
-  { "glUniformMatrix2fv",                (uintptr_t)&glUniformMatrix2fv },
-  { "glUniformMatrix3fv",                (uintptr_t)&glUniformMatrix3fv },
-  { "glUniformMatrix4fv",                (uintptr_t)&glUniformMatrix4fv },
-  { "glVertexAttrib1fv",                 (uintptr_t)&glVertexAttrib1fv },
-  { "glVertexAttrib2fv",                 (uintptr_t)&glVertexAttrib2fv },
-  { "glVertexAttrib3fv",                 (uintptr_t)&glVertexAttrib3fv },
-  { "glVertexAttrib4fv",                 (uintptr_t)&glVertexAttrib4fv },
+  { "glUniform1iv",                      (uintptr_t)&glUniform1iv_q },
+  { "glUniform2fv",                      (uintptr_t)&glUniform2fv_q },
+  { "glUniform2i",                       (uintptr_t)&glUniform2i_q },
+  { "glUniform2iv",                      (uintptr_t)&glUniform2iv_q },
+  { "glUniform3fv",                      (uintptr_t)&glUniform3fv_q },
+  { "glUniform3i",                       (uintptr_t)&glUniform3i_q },
+  { "glUniform3iv",                      (uintptr_t)&glUniform3iv_q },
+  { "glUniform4fv",                      (uintptr_t)&glUniform4fv_q },
+  { "glUniform4i",                       (uintptr_t)&glUniform4i_q },
+  { "glUniform4iv",                      (uintptr_t)&glUniform4iv_q },
+  { "glUniformMatrix2fv",                (uintptr_t)&glUniformMatrix2fv_q },
+  { "glUniformMatrix3fv",                (uintptr_t)&glUniformMatrix3fv_q },
+  { "glUniformMatrix4fv",                (uintptr_t)&glUniformMatrix4fv_q },
+  { "glVertexAttrib1fv",                 (uintptr_t)&glVertexAttrib1fv_q },
+  { "glVertexAttrib2fv",                 (uintptr_t)&glVertexAttrib2fv_q },
+  { "glVertexAttrib3fv",                 (uintptr_t)&glVertexAttrib3fv_q },
+  { "glVertexAttrib4fv",                 (uintptr_t)&glVertexAttrib4fv_q },
   { "glVertexAttribPointer",             (uintptr_t)&glVertexAttribPointer_e },
 };
 
@@ -1346,9 +1748,9 @@ const int gl_dynlib_size = sizeof(gl_dynlib);
 static so_default_dynlib g_glc_table[GLC_N];
 static volatile uint32_t g_glc[GLC_N];
 
-static const so_default_dynlib *glc_build(void) {
+static const so_default_dynlib *glc_build(const so_default_dynlib *src) {
   static int built = 0;
-  if (built) return built > 0 ? g_glc_table : gl_dynlib;
+  if (built) return built > 0 ? g_glc_table : src;
   built = -1;
   size_t sz = (GLC_N * 40 + 0xfff) & ~(size_t)0xfff;
   SceKernelAllocMemBlockKernelOpt opt;
@@ -1358,10 +1760,10 @@ static const so_default_dynlib *glc_build(void) {
   void *base = NULL;
   if (blk < 0 || sceKernelGetMemBlockBase(blk, &base) < 0 || !base) {
     log_printf("[glc] census thunks FAILED (0x%08x) -- running uncounted", (unsigned)blk);
-    return gl_dynlib;
+    return src;
   }
   uint32_t *code = (uint32_t *)malloc(sz);
-  if (!code) return gl_dynlib;
+  if (!code) return src;
   memset(code, 0, sz);
   for (unsigned i = 0; i < GLC_N; i++) {
     uint32_t *t = code + i * 10;
@@ -1372,9 +1774,9 @@ static const so_default_dynlib *glc_build(void) {
     t[4] = 0xe58c0000;                         /* str  r0, [ip]             */
     t[5] = 0xe49d0004;                         /* pop  {r0}                 */
     t[6] = 0xe51ff004;                         /* ldr  pc, [pc, #-4] -> t[7] */
-    t[7] = (uint32_t)gl_dynlib[i].func;        /* target (Thumb bit kept)   */
+    t[7] = (uint32_t)src[i].func;          /* target (Thumb bit kept)   */
     t[8] = (uint32_t)&g_glc[i];                /* counter                   */
-    g_glc_table[i].symbol = gl_dynlib[i].symbol;
+    g_glc_table[i].symbol = src[i].symbol;
     g_glc_table[i].func = (uintptr_t)base + i * 40;   /* ARM entry */
   }
   kuKernelCpuUnrestrictedMemcpy(base, code, sz);
@@ -1417,10 +1819,118 @@ static void glc_report(unsigned frames) {
 }
 #endif
 
-const so_default_dynlib *gl_get_dynlib(void) {
-#if GL_CALL_CENSUS
-  return glc_build();
-#else
-  return gl_dynlib;
+#if GL_THREAD
+/* Which table entries may run on the game thread while the queue is on: the
+ * wrappers above that keep the shadow and queue their vitaGL call. Every
+ * other entry reaches vitaGL through an RPC thunk, so it runs on the render
+ * thread in order, with the game waiting -- correct for any signature. */
+static const char *const glq_native[] = {
+  "glViewport", "glClear", "glDrawArrays", "glDrawElements", "glGetIntegerv",
+  "glGetFloatv", "glIsEnabled", "glGetError",
+  "glEnable", "glDisable", "glActiveTexture", "glPixelStorei", "glBindTexture",
+  "glTexParameteri", "glBindFramebuffer", "glBindRenderbuffer", "glBindBuffer",
+  "glBufferData", "glBufferSubData", "glUseProgram", "glScissor", "glClearStencil",
+  "glHint", "glFrontFace", "glCullFace", "glDepthFunc", "glColorMask",
+  "glBlendFunc", "glBlendFuncSeparate", "glBlendEquation", "glBlendEquationSeparate",
+  "glDepthMask", "glUniform1i", "glUniform2i", "glUniform3i", "glUniform4i",
+  "glUniform1f", "glUniform2f", "glUniform3f", "glUniform4f",
+  "glUniform1fv", "glUniform2fv", "glUniform3fv", "glUniform4fv",
+  "glUniform1iv", "glUniform2iv", "glUniform3iv", "glUniform4iv",
+  "glUniformMatrix2fv", "glUniformMatrix3fv", "glUniformMatrix4fv",
+  "glVertexAttribPointer", "glEnableVertexAttribArray", "glDisableVertexAttribArray",
+  "glVertexAttrib1f", "glVertexAttrib2f", "glVertexAttrib3f", "glVertexAttrib4f",
+  "glVertexAttrib1fv", "glVertexAttrib2fv", "glVertexAttrib3fv", "glVertexAttrib4fv",
+  "glStencilFunc", "glStencilFuncSeparate", "glStencilMask", "glStencilMaskSeparate",
+  "glStencilOp", "glStencilOpSeparate", "glClearColor", "glClearDepthf",
+  "glDepthRangef", "glLineWidth", "glPolygonOffset", "glTexParameterf",
+};
+#define GLQ_N (sizeof gl_dynlib / sizeof gl_dynlib[0])
+static so_default_dynlib g_glq_table[GLQ_N];
+static int g_glq_ok = 0;                 /* thunks built: safe to start */
+
+static int glq_is_native(const char *sym) {
+  for (unsigned k = 0; k < sizeof glq_native / sizeof glq_native[0]; k++)
+    if (!strcmp(sym, glq_native[k])) return 1;
+  return 0;
+}
+
+static const so_default_dynlib *glq_build(const so_default_dynlib *base) {
+  static uintptr_t targets[GLQ_N], thunks[GLQ_N];
+  static unsigned at[GLQ_N];
+  static int built = 0;                  /* every module resolves this table */
+  if (built) return g_glq_ok ? g_glq_table : base;
+  built = 1;
+  unsigned k = 0;
+  for (unsigned i = 0; i < GLQ_N; i++) {
+    g_glq_table[i] = base[i];
+    if (!glq_is_native(base[i].symbol)) { at[k] = i; targets[k++] = base[i].func; }
+  }
+  if (!glq_make_rpc_thunks(targets, thunks, k)) {
+    log_printf("[glq] no RPC thunks -- GL stays on the game thread");
+    return base;
+  }
+  for (unsigned m = 0; m < k; m++) g_glq_table[at[m]].func = thunks[m];
+  g_glq_ok = 1;
+  log_printf("[glq] %u GL entry points queue, %u go through RPC", (unsigned)(GLQ_N - k), k);
+  return g_glq_table;
+}
+
+/* Re-read what the shadow mirrors. Runs on the game thread with the render
+ * thread idle: at queue start, and after every RPC. */
+static void glq_reseed(void) {
+  GLint v = 0;
+  glGetIntegerv(GL_VIEWPORT, s_viewport);
+  glGetIntegerv(GL_SCISSOR_BOX, s_scissor_box);
+  glGetIntegerv(GL_FRAMEBUFFER_BINDING, &s_fb);
+  glGetIntegerv(GL_BLEND_SRC, &s_blend_src);
+  glGetIntegerv(GL_BLEND_DST, &s_blend_dst);
+  glGetIntegerv(GL_CURRENT_PROGRAM, &s_prog);
+  glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &s_elembuf);
+  glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &v);
+  g_cur_arraybuf = (GLuint)v;
+  s_blend = glIsEnabled(GL_BLEND);
+  s_scissor = glIsEnabled(GL_SCISSOR_TEST);
+  glGetFloatv(GL_COLOR_CLEAR_VALUE, (GLfloat *)s_clear);
+  v = GL_TEXTURE0;
+  glGetIntegerv(GL_ACTIVE_TEXTURE, &v);
+  unsigned u = (unsigned)v - 0x84C0u;
+  g_active_unit = (u < GL_MAX_TEXUNITS) ? u : GL_MAX_TEXUNITS;
+  if (u < GL_MAX_TEXUNITS) {
+    v = 0;
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &v);
+    g_unit2d[u] = (GLuint)v;
+    g_cur_tex = (GLuint)v;
+  }
+}
+
+static void glq_begin(void) {
+  g_glq_begun = 1;
+  if (!g_glq_ok) return;
+  glGetIntegerv(GL_MAX_TEXTURE_SIZE, &s_max_tex);
+  glq_reseed();
+  g_glq_after_rpc = glq_reseed;
+  gl_thread_start();
+}
+
+static const char *glq_name_of(uintptr_t fn) {
+  if (fn == (uintptr_t)draw_arrays_x) return "drawArrays(client)";
+  if (fn == (uintptr_t)draw_elements_x) return "drawElements(client)";
+  if (fn == (uintptr_t)glGetIntegerv_real) return "glGetIntegerv";
+  if (fn == (uintptr_t)glGetFloatv_real) return "glGetFloatv";
+  if (fn == (uintptr_t)glIsEnabled) return "glIsEnabled";
+  for (unsigned i = 0; i < GLQ_N; i++)
+    if (gl_dynlib[i].func == fn) return gl_dynlib[i].symbol;
+  return NULL;
+}
 #endif
+
+const so_default_dynlib *gl_get_dynlib(void) {
+  const so_default_dynlib *t = gl_dynlib;
+#if GL_THREAD
+  t = glq_build(t);
+#endif
+#if GL_CALL_CENSUS
+  t = glc_build(t);
+#endif
+  return t;
 }
