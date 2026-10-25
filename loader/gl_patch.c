@@ -1040,6 +1040,12 @@ static void glActiveTexture_e(GLenum t) {
 #define TEXKIND_2D   1
 #define TEXKIND_CUBE 2
 static uint8_t  g_tex_kind[TEXKIND_MAX];
+/* Normalization cubes (see GL_NORMCUBE_SUBSTITUTE), recognised at upload, and
+ * the last cube that was a real reflection map, which stands in for them. */
+static uint8_t  g_normcube[TEXKIND_MAX];
+static GLuint   g_last_envcube = 0;
+static unsigned g_normcube_swaps = 0, g_normcube_skips = 0;
+static GLuint   g_normcube_pending = 0;
 
 /* ---- live texture census ---------------------------------------------------
  * vitaGL's free pools fall from 79 MB vram / 87 MB ram at boot to single-digit
@@ -1109,7 +1115,8 @@ static void glDeleteTextures_e(GLsizei n, const GLuint *tex) {
     for (GLsizei i = 0; i < n; i++) {
       if (tex_kind_get(tex[i]) == TEXKIND_CUBE)
         log_printf("[GL] cube texture %u deleted", (unsigned)tex[i]);
-      if (tex[i] && tex[i] < TEXKIND_MAX) g_tex_kind[tex[i]] = TEXKIND_NONE;
+      if (tex[i] && tex[i] < TEXKIND_MAX) { g_tex_kind[tex[i]] = TEXKIND_NONE; g_normcube[tex[i]] = 0; }
+      if (tex[i] && tex[i] == g_last_envcube) g_last_envcube = 0;
       tex_release(tex[i]);
       for (unsigned u = 0; u < GL_MAX_TEXUNITS; u++)
         if (tex[i] && g_unit2d[u] == tex[i]) g_unit2d[u] = 0;
@@ -1133,6 +1140,19 @@ static void glBindTexture_e(GLenum tg, GLuint t) {
   GLLOG("glBindTexture(0x%x,%u)", (unsigned)tg, (unsigned)t);
   g_texbind_win++; g_texbind_frame++;
   if (tg == GL_TEXTURE_CUBE_MAP) {
+#if GL_NORMCUBE_SUBSTITUTE
+    if (t && t < TEXKIND_MAX && g_normcube[t]) {
+      if (!g_last_envcube) { g_normcube_skips++; return; }   /* keep what the unit has */
+      g_normcube_swaps++;
+      if (!(g_normcube_swaps & (g_normcube_swaps - 1)))      /* 1, 2, 4, 8 ... */
+        log_printf("[GL] normalization cube %u bound -> using reflection cube %u instead "
+                   "(%u swaps, %u kept the unit's cube)", (unsigned)t,
+                   (unsigned)g_last_envcube, g_normcube_swaps, g_normcube_skips);
+      t = g_last_envcube;
+    } else if (t && tex_kind_get(t) == TEXKIND_CUBE) {
+      g_last_envcube = t;
+    }
+#endif
     g_cur_cubetex = t;
     if (tex_kind_get(t) == TEXKIND_2D) {          /* THE fault, if it happens */
       static unsigned w1 = 0;
@@ -1326,6 +1346,36 @@ static void glTexImage2D_body(GLenum tg, GLint l, GLint ifmt, GLsizei w, GLsizei
                  (unsigned)f, (unsigned)ty, px ? "yes" : "NULL", avg, faces);
     }
     nc++;
+#if GL_NORMCUBE_SUBSTITUTE
+    /* A normalization cube stores each texel's direction as colour: on +X (face
+     * 0) red is 200-255 while green and blue range ~55-200; on -X (face 1) red
+     * is 0-55. Sample 64 texels of each rather than trust an average. */
+    if (l == 0 && face <= 1 && px && f == GL_RGB && ty == GL_UNSIGNED_BYTE &&
+        w >= 16 && h >= 16 && g_cur_cubetex && g_cur_cubetex < TEXKIND_MAX) {
+      const unsigned char *q = (const unsigned char *)px;
+      unsigned hits = 0, n = (unsigned)w * (unsigned)h;
+      for (unsigned k = 0; k < 64; k++) {
+        const unsigned char *t3 = q + (size_t)((k * 2654435761u) % n) * 3;
+        int r_ok = face == 0 ? t3[0] >= 180 : t3[0] <= 75;
+        if (r_ok && t3[1] >= 40 && t3[1] <= 215 && t3[2] >= 40 && t3[2] <= 215) hits++;
+      }
+      if (face == 0)
+        g_normcube_pending = (hits >= 60) ? g_cur_cubetex : 0;
+      else if (g_normcube_pending == g_cur_cubetex && hits < 60)
+        g_normcube_pending = 0;            /* reddish +X, but -X is not cyan */
+      else if (g_normcube_pending == g_cur_cubetex)
+        log_printf("[GL] cube tex=%u is a normalization cube -- "
+                   "will not be used as a reflection", (unsigned)g_cur_cubetex);
+    }
+    /* Arm it only once its last face is in: a substitution while the faces are
+     * still arriving would send them into the reflection cube instead. vitaGL
+     * ignores cube mip levels above 0, so later levels do not matter. */
+    if (l == 0 && face == 5 && g_normcube_pending && g_cur_cubetex == g_normcube_pending) {
+      g_normcube[g_normcube_pending] = 1;
+      if (g_last_envcube == g_normcube_pending) g_last_envcube = 0;
+      g_normcube_pending = 0;
+    }
+#endif
     tex_charge(g_cur_cubetex, tg, l, w, h, fmt_bpp(f));   /* cubes bind their own id */
     glTexImage2D(tg, l, ifmt, w, h, b, f, ty, px);
     return;                        // none of the 2D heuristics below apply

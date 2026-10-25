@@ -360,6 +360,15 @@
 // Set to 0 if textures ever look wrong, to rule this out.
 #define GL_FILTER_REDUNDANT_BINDS 1
 
+// Issue #11, the shifting neon reflections. The engine builds a NORMALIZATION
+// cube map for bump mapping (256x256 RGB, each face one flat direction colour:
+// +X red, -X cyan, +Y green, -Y magenta, +Z blue, -Z yellow) and binds it where
+// kotor.frag's one cube sampler expects the reflection map -- the port's bump
+// maths is commented out, so nothing can use it correctly. Those six colours are
+// exactly the neon armour in the screenshots. 1 = whenever the game binds that
+// cube, bind the last real reflection cube instead. 0 = the old behaviour.
+#define GL_NORMCUBE_SUBSTITUTE 1
+
 // Skip glUseProgram calls that re-select the program already current. vitaGL's
 // glUseProgram does no GXM work but marks every uniform dirty, so a redundant
 // one costs a full uniform re-upload (u_boneMatrices[51] included) on the next
