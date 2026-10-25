@@ -138,6 +138,9 @@
  * with room to recover after a stall. */
 #define RING_FRAMES      32768u
 #define FEED_MAX_FRAMES  4096u
+/* RIFF stream-mode assets at or under this many decoded bytes load whole even
+ * with AUDIO_STREAM_ALL; see createSound. */
+#define STREAM_WHOLE_RIFF_MAX (1024u * 1024u)
 
 typedef struct {
   AudioMp3Stream *dec;
@@ -857,7 +860,22 @@ static void mix_grain(void) {
   }
   unlock();
 
-  for (int i = 0; i < ndoomed; i++) stream_close(doomed[i]);
+  for (int i = 0; i < ndoomed; i++) {
+    Stream *d = doomed[i];
+    /* stream_close waits for a progressive load to let go of the file, and
+     * that read can sit behind the game's own card I/O (an area-change save)
+     * for seconds. Never wait here: that is every sound stopping. Cancel it
+     * and look again next grain. */
+    if (__atomic_load_n(&d->loading, __ATOMIC_ACQUIRE)) {
+      __atomic_store_n(&d->cancel, 1, __ATOMIC_RELEASE);
+      lock();
+      d->retire_next = g_stream_retire;
+      g_stream_retire = d;
+      unlock();
+      continue;
+    }
+    stream_close(d);
+  }
 
   {
     SceUInt64 t0 = sceKernelGetProcessTimeWide();
@@ -1688,12 +1706,25 @@ static int Sys_createSound(void *self, const char *name, unsigned mode,
     if (audio_mp3_probe(buf, len, &est)) {
       unsigned need = est.nsamples * est.channels * 2u;
       int too_big = need > STREAM_PCM_MAX || g_pcm_bytes + need > PCM_BUDGET_BYTES;
+      /* Oct 24 log: an area ran seven ~3 s ambient loops as RIFF PCM streams,
+       * each replayed off its END every 3 s -- seven rings refilled from the top,
+       * re-read through the companion each time, and starving for tens of
+       * samples at every restart. Plain PCM or ADPCM that small costs a memcpy
+       * or a few ms to load whole, and then the PCM cache serves every replay.
+       * MP3 (voice) still streams: that decode is the stall streaming removed.
+       * A progressive load (file over 2x PROG_HEAD_BYTES) skipped the cache
+       * lookup above, so it keeps streaming rather than decode on every play. */
+      int small_riff = !too_big && need <= STREAM_WHOLE_RIFF_MAX &&
+                       !audio_mp3_stream_needs_hw(buf, len);
+#if AUDIO_STREAM_PROGRESSIVE
+      if (ph) small_riff = 0;
+#endif
       /* log201: every voice line was decoded whole, on the game thread, before
        * createSound returned -- 200-350 ms of frozen frame per line of dialogue.
        * Stream every stream-mode asset, not just the oversized ones; if that
        * cannot be done (decoder cap, a format the streamer does not take) a
        * sound that fits still gets the whole decode below. */
-      if (too_big || AUDIO_STREAM_ALL) {
+      if (too_big || (AUDIO_STREAM_ALL && !small_riff)) {
 #if AUDIO_STREAM_LONG_ASSETS
         /* Too big to hold decoded, so stream it: the compressed bytes plus a
          * ring instead of the whole waveform, and no decode stall on start.
@@ -1887,6 +1918,36 @@ static void vo_log(const VoSnap *v, const char *ev) {
              v->ms, v->len);
 }
 
+/* ---- menu / item sound trace ---------------------------------------------
+ * Issue #10: menu clicks and equip sounds "disappear". The voice trace above
+ * skips every effect, and the loudness census only aggregates, so nothing says
+ * whether the game asked for a click, whether we played it, or who cut it off.
+ * gui_* (menu) and i_* (inventory/equip) effects are a few per button press:
+ * trace their play, stop and release with the position reached. */
+#define UI_TRACE_MAX 4000
+static unsigned g_ui_lines = 0;
+typedef struct { char name[24]; int chan, is3d, paused; unsigned ms, len; float vol; } UiSnap;
+static int ui_snap(const Chan *c, UiSnap *u) {
+  if (!c->snd || c->snd->st || !c->snd->ent || g_ui_lines >= UI_TRACE_MAX) return 0;
+  const char *n = c->snd->ent->name;
+  if (strncmp(n, "gui_", 4) && strncmp(n, "i_", 2)) return 0;
+  memcpy(u->name, n, sizeof u->name);
+  u->chan = (int)(c - g_chan);
+  u->is3d = c->snd->is3d;
+  u->paused = c->paused;
+  u->vol = c->vol;
+  unsigned rate = c->snd->pcm.rate ? c->snd->pcm.rate : 1;
+  u->ms  = (unsigned)(c->pos * 1000.0 / rate);
+  u->len = c->snd->pcm.ms;
+  return 1;
+}
+static void ui_log(const UiSnap *u, const char *ev) {
+  g_ui_lines++;
+  log_printf("[snd] ui %-8s %-16s %s chan %d at %u/%u ms vol %.2f%s", ev, u->name,
+             u->is3d ? "3D" : "2D", u->chan, u->ms, u->len, u->vol,
+             u->paused ? " (paused)" : "");
+}
+
 static int Sys_playSound(void *self, void *sound, void *group, int paused, void **outch) {
   (void)self; (void)group;
   g_play_calls++;
@@ -1919,9 +1980,11 @@ static int Sys_playSound(void *self, void *sound, void *group, int paused, void 
     }
   }
   VoSnap vs; int vo = c ? vo_snap(c, &vs) : 0;
+  UiSnap us; int ui = c ? ui_snap(c, &us) : 0;
   unlock();
   if (!c) { g_play_nochan++; return FMOD_ERR_INVALID_PARAM; }
   if (vo) vo_log(&vs, paused ? "play(p)" : "play");
+  if (ui) ui_log(&us, "play");
   if (outch) *outch = c;
   if (g_played < 24)
     log_printf("[snd] playSound -> chan %d (%u ms, paused=%d)",
@@ -1966,9 +2029,11 @@ static int Snd_release(void *self) {
   lock();
   g_rel_calls++;
   VoSnap rv; int rvo = 0;
+  UiSnap ru; int rui = 0;
   for (int i = 0; i < g_nchannels; i++)
     if (g_chan[i].used && g_chan[i].snd == s) {
       if (g_chan[i].playing && !rvo) rvo = vo_snap(&g_chan[i], &rv);
+      if (g_chan[i].playing && !rui) rui = ui_snap(&g_chan[i], &ru);
       if (g_chan[i].playing)     g_rel_kill_live++;   /* died with no END at all */
       if (g_chan[i].end_pending) g_rel_kill_pend++;   /* END built, never sent */
       g_chan[i].playing = 0; g_chan[i].used = 0;
@@ -1997,6 +2062,7 @@ static int Snd_release(void *self) {
   s->tag[0] = 0;
   unlock();
   if (rvo) vo_log(&rv, "release");
+  if (rui) ui_log(&ru, "released");
   /* No audio thread to hand it to (output never opened, or shutting down), so
    * nothing can be inside it and closing here is safe. */
   if (st && !handed) stream_close(st);
@@ -2036,10 +2102,12 @@ static int Ch_stop(void *self) {
    * of those and every slot is held (log193). The caller's slot is Reset
    * straight after stop() either way, so doing nothing is the correct stop. */
   VoSnap vs; int vo = vo_snap(c, &vs);
+  UiSnap us; int ui = (c->used && c->playing) ? ui_snap(c, &us) : 0;
   if (g_stop_owner && c->used && c->userdata != g_stop_owner) {
     g_stop_foreign++;
     unlock();
     if (vo) vo_log(&vs, "REFUSED");
+    if (ui) ui_log(&us, "REFUSED");
     return FMOD_OK;
   }
   const char *vev = !c->used ? "stop-st" : c->playing ? "stop" : "stop-end";
@@ -2053,6 +2121,7 @@ static int Ch_stop(void *self) {
   c->gen     = ++g_chan_gen;
   unlock();
   if (vo) vo_log(&vs, vev);
+  if (ui) ui_log(&us, "stopped");
   return FMOD_OK;
 }
 /* Who paused it. A long stream paused while the menus were in use and never

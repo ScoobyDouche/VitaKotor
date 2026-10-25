@@ -253,6 +253,14 @@ static void log_event(const char *via, const SDL_Event *e) {
                (unsigned)e->jhat.value, hat_n);
   }
 
+  // Issue #10: menu clicks "disappear". One line per button press, so the
+  // [snd] ui trace beside it can say whether the game asked for a sound at all.
+  static unsigned btn_n = 0;
+  if (t == SDL_JOYBUTTONDOWN && btn_n < 3000) {
+    btn_n++;
+    log_printf("[input] press button=%u", (unsigned)e->jbutton.button);
+  }
+
   // log215: on the Endar Spire the sticks moved in jerks while touch steering
   // stayed smooth, and 0x600 ran at a flat ~2870 per window (8 per frame, every
   // frame) against ~600 elsewhere -- while the raw read in input_patch.c saw the
