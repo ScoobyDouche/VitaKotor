@@ -26,7 +26,15 @@
 // buffer under the lock and nothing more; every LOG_FLUSH_MS (or sooner, once
 // the buffer is half full) the writer swaps buffers and writes the full one out
 // with only the I/O lock held. A logging thread touches the card only when the
-// writer has fallen a whole buffer behind.
+// writer has fallen a whole buffer behind, and then it drops the line rather
+// than wait: the audio thread logs too, and a stall there is a sound dropout.
+//
+// The writer must be created at a priority the kernel accepts. It was asked for
+// at 0x10000120 (192, one past the lowest user priority, 191) from the day it
+// was written, creation failed, and every log up to v0.5.0 says "on the logging
+// thread": the flush stayed inline. In the Oct 24 log 37 of 76 short hitches
+// held a flush, and a 3.4 s sound dropout during an area-change save was the
+// audio thread doing the card write for an UNDERRUN line.
 //
 // Two invariants matter more than the speed:
 //   * A CPU fault must never deadlock on the log. crash.c calls log_panic()
@@ -53,7 +61,8 @@ static int      g_kicked;       // wake already signalled for this buffer
 static volatile int g_panic;
 
 // stats, reported by the writer once a minute
-static unsigned g_st_writes, g_st_kb, g_st_sync;
+static unsigned g_st_writes, g_st_kb, g_st_sync, g_st_dropped;
+static int      g_writer_err;   // sceKernelCreateThread/StartThread result, for the header
 static uint32_t g_st_max_us;
 
 // Lock only when there is a mutex and we are not handling a fault. Before
@@ -137,9 +146,10 @@ static int log_writer(SceSize args, void *argp) {
 
     uint64_t now = sceKernelGetProcessTimeWide();
     if (now - last_report >= 60ULL * 1000000ULL && g_st_writes) {
-      log_printf("[log] writer: %u writes, %u KB, max %.1f ms; %u overflow writes on a logging thread",
-                 g_st_writes, g_st_kb, g_st_max_us / 1000.0f, g_st_sync);
-      g_st_writes = g_st_kb = 0;
+      log_printf("[log] writer: %u writes, %u KB, max %.1f ms; %u overflow writes on a logging thread, "
+                 "%u lines dropped (buffer full)",
+                 g_st_writes, g_st_kb, g_st_max_us / 1000.0f, g_st_sync, g_st_dropped);
+      g_st_writes = g_st_kb = g_st_dropped = 0;
       g_st_max_us = 0;
       last_report = now;
     }
@@ -283,8 +293,16 @@ void log_printf(const char *fmt, ...) {
     return;
   }
   int held = log_lock();
+  if (g_buf_n + n > LOG_BUF_BYTES && g_writer_up) {
+    // The writer is a whole buffer behind, i.e. stuck on the card. Waiting for
+    // it would put this thread on the card too; lose the line instead.
+    g_st_dropped++;
+    log_unlock(held);
+    sceKernelSignalSema(g_wake, 1);
+    return;
+  }
   if (g_buf_n + n > LOG_BUF_BYTES) {
-    // The writer is a whole buffer behind (or not running): write it out here.
+    // No writer thread: write it out here.
     int io = io_lock();
     log_drain();
     io_unlock(io);
@@ -349,9 +367,11 @@ void log_init(void) {
   // Below the game and audio threads: the card can wait, they cannot.
   g_wake = sceKernelCreateSema("kotor_log_wake", 0, 0, 1, NULL);
   if (g_io_mtx >= 0 && g_wake >= 0) {
-    SceUID th = sceKernelCreateThread("kotor_log", log_writer, 0x10000120, 0x4000, 0,
+    // 0x10000118 = 184: user priorities run 64..191 (0x10000100 = 160).
+    SceUID th = sceKernelCreateThread("kotor_log", log_writer, 0x10000118, 0x4000, 0,
                                       thread_mask(CPU_AUX_B), NULL);
-    if (th >= 0 && sceKernelStartThread(th, 0, NULL) >= 0) {
+    g_writer_err = th;
+    if (th >= 0 && (g_writer_err = sceKernelStartThread(th, 0, NULL)) >= 0) {
       g_writer_up = 1;
       thread_census_add(th, "log");
     }
@@ -370,5 +390,8 @@ void log_init(void) {
   log_printf("=== log buffered: 2x%d KB, flush every %d ms on %s (mutex=0x%x) ===",
              LOG_BUFFER_KB, LOG_FLUSH_MS, g_writer_up ? "the writer thread" : "the logging thread",
              (unsigned)g_log_mtx);
+  if (!g_writer_up)
+    log_printf("[log] writer thread failed 0x%08X -- every flush runs on a logging thread",
+               (unsigned)g_writer_err);
 #endif
 }
