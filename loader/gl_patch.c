@@ -1503,6 +1503,34 @@ static void glBindBuffer_e(GLenum tg, GLuint b) {
   else if (tg == GL_ELEMENT_ARRAY_BUFFER) s_elembuf = (GLint)b;
   Q(glBindBuffer, tg, b);
 }
+/* GL resets a binding to 0 when the bound buffer is deleted. vitaGL 38d2f97
+ * frees the buffer and keeps the binding (vertex_array_unit,
+ * cur_vao->index_array_unit), so a later draw with client indices reads them
+ * at freed->ptr + the pointer: VitaKotor2 crashed on exactly that loading an
+ * area (their a0c5803). Unbind first, as GL would. This is not a native entry,
+ * so with the render thread on it runs there through an RPC and the shadow is
+ * reseeded from vitaGL afterwards; vitaGL's own answer is the binding here. */
+static unsigned g_glbuf_unbinds = 0;
+static void glDeleteBuffers_e(GLsizei n, const GLuint *buffers) {
+  if (buffers && n > 0) {
+    GLint ab = 0, eb = 0;
+    glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &ab);
+    glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &eb);
+    int unbind_array = 0, unbind_elem = 0;
+    for (GLsizei i = 0; i < n; i++) {
+      if (!buffers[i]) continue;
+      if ((GLuint)ab == buffers[i]) unbind_array = 1;
+      if ((GLuint)eb == buffers[i]) unbind_elem = 1;
+    }
+    if (unbind_array) { glBindBuffer(GL_ARRAY_BUFFER, 0); g_cur_arraybuf = 0; }
+    if (unbind_elem) { glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0); s_elembuf = 0; }
+    if ((unbind_array || unbind_elem) && (++g_glbuf_unbinds <= 4 || g_glbuf_unbinds % 256 == 0))
+      log_printf("[glbuf] buffer deleted while bound (%s%s%s): unbound first (%u so far)",
+                 unbind_array ? "vertex" : "", unbind_array && unbind_elem ? ", " : "",
+                 unbind_elem ? "index" : "", g_glbuf_unbinds);
+  }
+  glDeleteBuffers(n, buffers);
+}
 static void glBufferData_e(GLenum tg, GLsizeiptr sz, const void *d, GLenum u) {
   GLLOG("glBufferData(0x%x, %d bytes)", (unsigned)tg, (int)sz);
   g_bufdata_win++; g_bufdata_frame++;
@@ -1671,7 +1699,7 @@ static const so_default_dynlib gl_dynlib[] = {
   { "glCompressedTexImage2D",            (uintptr_t)&glCompressedTexImage2D_e },
   { "glCopyTexImage2D",                  (uintptr_t)&glCopyTexImage2D },
   { "glCopyTexSubImage2D",               (uintptr_t)&glCopyTexSubImage2D },
-  { "glDeleteBuffers",                   (uintptr_t)&glDeleteBuffers },
+  { "glDeleteBuffers",                   (uintptr_t)&glDeleteBuffers_e },
   { "glDeleteFramebuffers",              (uintptr_t)&glDeleteFramebuffers },
   { "glDeleteProgram",                   (uintptr_t)&glDeleteProgram_e },
   { "glDeleteRenderbuffers",             (uintptr_t)&glDeleteRenderbuffers },

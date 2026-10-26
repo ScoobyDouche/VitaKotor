@@ -158,6 +158,7 @@ typedef struct {
    * where the decoding happens: rewinding the decoder from the game thread
    * would be reaching into state the audio thread is using without the lock. */
   int       restart;
+  void     *retire_next;  /* the close queue (g_stream_retire): next stream in it */
   /* Progressive load (AUDIO_STREAM_PROGRESSIVE): the rest of `src` is still
    * being read in by the loader thread. `loading` is set when the job is queued
    * and cleared by the loader once it has let go of the file and the buffer;
@@ -356,9 +357,11 @@ static unsigned g_stream_underruns = 0;    /* mixer wanted a frame we lacked */
 /* Streams whose Sound has been released, waiting for the audio thread to close
  * them. Decoding happens OUTSIDE the mixer lock -- see mix_grain -- so the game
  * thread must not free a decoder the audio thread may be inside. It hands the
- * stream over here instead and the audio thread closes it between grains. */
-static Stream  *g_stream_retire[MAX_SOUNDS];
-static int      g_stream_retire_n = 0;
+ * stream over here instead and the audio thread closes it between grains.
+ * A list through Stream.retire_next, so it never fills: a 128-slot array used
+ * to make the game thread close the stream itself when full, possibly while the
+ * audio thread was decoding it (fix from VitaKotor2, e2b6c4f). */
+static Stream  *g_stream_retire = NULL;
 /* How long the audio thread spends decoding, and how much of that is inside the
  * lock. Decoding under the lock is what put the game thread to sleep waiting on
  * createSound: measure it rather than trust that moving it out was enough. */
@@ -796,14 +799,17 @@ static void mix_grain(void) {
    * lock of their own. What the lock must still cover is the shared bits: the
    * reader channel's position, the restart flag playSound sets, and the handover
    * of streams whose Sound has been released. Snapshot those, then let go. */
-  struct { Stream *st; uint64_t pos; int havepos; } feed[MAX_SOUNDS];
+  struct { Stream *st; uint64_t pos; int havepos; int restart; } feed[MAX_SOUNDS];
   Stream *doomed[MAX_SOUNDS];
   int nfeed = 0, ndoomed = 0;
   int nmix = 0;
 
   lock();
   g_mix_active = 1;
-  while (g_stream_retire_n > 0) doomed[ndoomed++] = g_stream_retire[--g_stream_retire_n];
+  while (g_stream_retire && ndoomed < MAX_SOUNDS) {   /* the rest wait for the next grain */
+    doomed[ndoomed++] = g_stream_retire;
+    g_stream_retire = (Stream *)g_stream_retire->retire_next;
+  }
   for (int i = 0; i < MAX_SOUNDS; i++) {
     Snd *s = &g_snd[i];
     if (!s->used || !s->st) continue;
@@ -814,6 +820,11 @@ static void mix_grain(void) {
     feed[nfeed].st      = s->st;
     feed[nfeed].havepos = (rd && rd->used && rd->playing && rd->snd == s);
     feed[nfeed].pos     = feed[nfeed].havepos ? (uint64_t)rd->pos : 0;
+    /* playSound sets restart under this lock. Taking it here, not in the
+     * unlocked decode below, means a replay that lands while this thread is
+     * decoding is seen next grain instead of being cleared unseen. */
+    feed[nfeed].restart = s->st->restart;
+    s->st->restart = 0;
     nfeed++;
   }
   g_mix_lis.px = g_lis_px; g_mix_lis.py = g_lis_py; g_mix_lis.pz = g_lis_pz;
@@ -851,10 +862,9 @@ static void mix_grain(void) {
     SceUInt64 t0 = sceKernelGetProcessTimeWide();
     for (int i = 0; i < nfeed; i++) {
       Stream *st = feed[i].st;
-      if (st->restart) {          /* playSound asked for the track from the top */
+      if (feed[i].restart) {      /* playSound asked for the track from the top */
         audio_mp3_stream_rewind(st->dec);
         audio_ring_reset(&st->ring);
-        st->restart = 0;
       }
       if (feed[i].havepos) audio_ring_retire(&st->ring, feed[i].pos);
       audio_ring_feed(&st->ring, stream_fill_cb, st, FEED_MAX_FRAMES);
@@ -1976,8 +1986,9 @@ static int Snd_release(void *self) {
    * freeing it from under itself would be a use-after-free. It closes the
    * stream between grains, where it is certainly not using it. */
   int handed = 0;
-  if (st && g_running && g_stream_retire_n < MAX_SOUNDS) {
-    g_stream_retire[g_stream_retire_n++] = st;
+  if (st && g_running) {
+    st->retire_next = g_stream_retire;
+    g_stream_retire = st;
     handed = 1;
   }
   memset(&s->pcm, 0, sizeof s->pcm);
