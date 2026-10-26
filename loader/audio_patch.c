@@ -69,6 +69,7 @@
 #include "sdl_patch.h"
 #include "log.h"
 #include "threads.h"
+#include "main.h"
 
 /* ---- output format -------------------------------------------------------
  * Sources are mono at 32000 or 22050 Hz (measured across the OBB). We mix to one
@@ -2054,7 +2055,14 @@ static int Ch_stop(void *self) {
   if (vo) vo_log(&vs, vev);
   return FMOD_OK;
 }
+/* Who paused it. A long stream paused while the menus were in use and never
+ * resumed (log 2026-10-26, "20" at 239 s): FModAudioSystem's resume-all skips
+ * a channel PauseChannel marked (+24), so the caller says which path held it.
+ * libandroid_port callers: PauseChannel 0x74028, ResumeChannel 0x7409e,
+ * PauseAll 0x7316a, ResumeAll 0x731bc, CheckAppBackgroundStatus 0x72ee8,
+ * HandleChannelEnd 0x74a74. Reads the return address, so never wrap this. */
 static int Ch_setPaused(void *self, int paused) {
+  uintptr_t ra = (uintptr_t)__builtin_return_address(0);
   if (!chan_valid(self)) return FMOD_ERR_INVALID_PARAM;
   lock();                       /* the mixer reads this flag on the audio thread */
   Chan *c = (Chan *)self;
@@ -2063,7 +2071,13 @@ static int Ch_setPaused(void *self, int paused) {
   c->paused = paused ? 1 : 0;
   if (paused) g_pause_set++; else g_pause_clr++;
   unlock();
-  if (vo) vo_log(&vs, paused ? "pause" : "RESUME");
+  if (vo) {
+    uintptr_t off = (ra >= port_mod.text_base && ra < port_mod.text_base + port_mod.text_size)
+                    ? (ra & ~1u) - port_mod.text_base : 0;
+    g_vo_lines++;
+    log_printf("[snd] vo %-7s \"%s\" chan %d at %u/%u ms (from port+0x%x)",
+               paused ? "pause" : "RESUME", vs.tag, vs.chan, vs.ms, vs.len, (unsigned)off);
+  }
   return FMOD_OK;
 }
 static int Ch_setVolume(void *self, uint32_t v) {          /* softfp float */
