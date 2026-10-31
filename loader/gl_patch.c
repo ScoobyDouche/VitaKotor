@@ -36,6 +36,7 @@
 #include "loadscreen.h"
 #include "gxm_patcher.h"
 #include "gameprof.h"
+#include "srv_overlap.h"
 #include "lzma_cache.h"
 #include "obb_cache.h"
 #include "gl_thread.h"
@@ -769,6 +770,7 @@ void gl_patch_on_swap(uint64_t swap_begin_us, uint64_t swap_end_us) {
     memset(g_cf, 0, sizeof g_cf);
 #endif
     gameprof_window_report();
+    srv_overlap_window_report();
     lzma_cache_report();
     obb_cache_report();
     sdl_miss_cache_report();

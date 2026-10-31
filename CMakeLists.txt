@@ -70,6 +70,7 @@ add_executable(KOTOR
   loader/heap.c
   loader/bigalloc.c
   loader/gameprof.c
+  loader/srv_overlap.c
   loader/lzma_cache.c
   loader/log.c
   loader/sce_pad.c

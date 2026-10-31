@@ -35,6 +35,7 @@
 
 #include "config.h"
 #include "gl_thread.h"
+#include "srv_overlap.h"
 #include "threads.h"
 #include "log.h"
 
@@ -227,6 +228,7 @@ static inline void commit(uint32_t words) {
 
 void glq_put(const void *fn, unsigned n, uint32_t a0, uint32_t a1, uint32_t a2,
              uint32_t a3, uint32_t a4, uint32_t a5) {
+  SRV_OV_GL_GUARD();
   if (!g_glq_on || g_glq_in_rpc) {
     ((fn6_t)fn)(a0, a1, a2, a3, a4, a5);
     return;
@@ -241,6 +243,7 @@ void glq_put(const void *fn, unsigned n, uint32_t a0, uint32_t a1, uint32_t a2,
 
 void glq_put_copy(const void *fn, unsigned n, const uint32_t *args,
                   unsigned ptr_arg, const void *src, uint32_t bytes) {
+  SRV_OV_GL_GUARD();
   uint32_t a[9] = { 0 };
   for (unsigned i = 0; i < n && i < 9; i++) a[i] = args[i];
   uint32_t words = 2 + n + ((bytes + 3u) >> 2);
@@ -274,6 +277,7 @@ static void rpc_note(const void *fn, uint64_t us) {
 }
 
 uint32_t glq_rpc(const void *fn, const uint32_t *a) {
+  SRV_OV_GL_GUARD();
   if (!g_glq_on || g_glq_in_rpc)
     return ((fn9_t)fn)(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8]);
   uint64_t t0 = now_us();

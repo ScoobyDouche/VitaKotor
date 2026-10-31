@@ -44,6 +44,7 @@
 #include "threads.h"
 #include "ini_write.h"
 #include "script_fix.h"
+#include "srv_overlap.h"
 
 // SDL.h would #define main to SDL_main; this is the only SDL call made here.
 extern int SDL_setenv(const char *name, const char *value, int overwrite);
@@ -1309,6 +1310,8 @@ static void read_vita_options(void) {
       g_grass_wind = atoi(v) != 0;
     if (ini_get(text, "Vita Options", "TextureBits", v, sizeof(v)) && v[0])
       g_gl_tex16 = atoi(v) != 32;
+    if (ini_get(text, "Vita Options", "ServerOverlap", v, sizeof(v)) && v[0])
+      g_srv_overlap_enabled = atoi(v) != 0;
     free(text);
     break;
   }
@@ -1810,6 +1813,7 @@ int main(int argc, char *argv[]) {
   // game polls getCurrentLanguage from its first frame onwards.
   resolve_language();
   read_vita_options();
+  srv_overlap_install();   // after the ini (ServerOverlap) and every body hook
   repair_sound_bias();
   modset_scan();          // before the game opens anything on the card
 

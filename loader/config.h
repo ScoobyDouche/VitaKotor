@@ -497,6 +497,15 @@
 // swkotor.ini [Vita Options] FrameLock overrides it.
 #define FRAME_LOCK_FPS 30
 
+// Server/render overlap (srv_overlap.h): the server's AI tick runs on core 1
+// during the 3D pass instead of after it. SRV_OVERLAP_BUILD 0 compiles it out;
+// SRV_OVERLAP is the default, swkotor.ini [Vita Options] ServerOverlap
+// overrides it (0 = the old order). The worker's stack holds the AI's script
+// VM and pathfinding; the game thread gets 4 MB.
+#define SRV_OVERLAP_BUILD 1
+#define SRV_OVERLAP 1
+#define SRV_OVERLAP_STACK (2 * 1024 * 1024)
+
 // Draw distance cap, in metres; 0 = the area's own fog end. The engine culls
 // at the fog end, which is 500 m in Dantooine's open areas. Only areas that
 // have fog on are capped. log250: a 150 m cap left Dantooine's render cost
