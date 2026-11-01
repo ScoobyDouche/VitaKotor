@@ -53,7 +53,10 @@ static unsigned g_eng_n;
  * other target the extra words are just the caller's stack, read and ignored.
  * AAPCS keeps sp 8-aligned at each call, so the re-pushed pair lands where
  * the callee looks for it. Recursion is timed once, at the outermost call. */
-typedef uint64_t (*fn6_t)(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
+/* Eight words: r0-r3 plus four stack slots, enough for the 7-argument mipmap
+ * builders. Fewer-argument functions just see stack slots they never read. */
+typedef uint64_t (*fn6_t)(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+                          uint32_t, uint32_t);
 typedef struct {
   const char *sym, *tag;
   int port;              /* 1: the symbol is in libandroid_port.so */
@@ -121,6 +124,11 @@ static hook_t g_hook[] = {
   { "_ZN16CAurTextureBasic9LoadImageEv",                       "texLoadImage" },
   { "_ZN16CAurTextureBasic7glImageEb",                         "texGlImage"   },
   { "_ZN11CAurTexture7glImageEbPh",                            "texGlImage2"  },
+  /* Nov 1: glImage is ~5x the GL calls under it during area loads; the rest is
+   * CPU mipmap and normal-map building on the game thread. */
+  { "_Z17AurBuild2DMipMapsiiiPhb",                             "mipAur"       },
+  { "_Z17gluBuild2DMipmapsjiiijjPKv",                          "mipGlu",   1  },
+  { "_Z21BuildTextureNormalMapPhfRiS0_iib",                    "normalMap"    },
   { "_ZN7CResTGA18OnResourceServicedEv",                       "tgaServiced"  },
   { "_ZN7CResTGA18ReadUnmappedRLETGAEv",                       "tgaRLE"       },
   { "_ZN7CResTGA21ReadColorMappedRLETGAEv",                    "tgaRLEmap"    },
@@ -155,31 +163,31 @@ uint64_t g_prof_draw_us;
 uint64_t g_prof_tex_frame_us;
 unsigned g_prof_tex_frame_n;
 
-static inline uint64_t timed(hook_t *h, uint32_t a, uint32_t b, uint32_t c, uint32_t d,
-                             uint32_t e, uint32_t f) {
-  if (h->depth++) {
-    uint64_t r = h->orig(a, b, c, d, e, f);
-    h->depth--;
+static inline uint64_t timed(hook_t *hk, uint32_t a, uint32_t b, uint32_t c, uint32_t d,
+                             uint32_t e, uint32_t f, uint32_t g, uint32_t h) {
+  if (hk->depth++) {
+    uint64_t r = hk->orig(a, b, c, d, e, f, g, h);
+    hk->depth--;
     return r;
   }
   uint64_t t0 = sceKernelGetProcessTimeWide();
-  uint64_t r = h->orig(a, b, c, d, e, f);
+  uint64_t r = hk->orig(a, b, c, d, e, f, g, h);
   uint64_t dt = sceKernelGetProcessTimeWide() - t0;
-  h->us += dt;
-  h->frame_us += dt;
-  h->calls++;
-  h->depth--;
+  hk->us += dt;
+  hk->frame_us += dt;
+  hk->calls++;
+  hk->depth--;
   return r;
 }
 
 #define P(i) static uint64_t probe_##i(uint32_t a, uint32_t b, uint32_t c, uint32_t d, \
-                                     uint32_t e, uint32_t f) \
-  { return timed(&g_hook[i], a, b, c, d, e, f); }
+                                     uint32_t e, uint32_t f, uint32_t g, uint32_t h) \
+  { return timed(&g_hook[i], a, b, c, d, e, f, g, h); }
 P(0) P(1) P(2) P(3) P(4) P(5) P(6) P(7) P(8) P(9) P(10) P(11) P(12) P(14) P(15) P(16)
 P(17) P(18) P(19) P(20) P(21) P(22) P(23) P(24) P(25) P(26) P(27) P(28) P(29) P(30) P(31)
-P(32) P(33) P(34) P(35) P(36) P(37) P(38) P(39) P(40) P(41) P(42)
+P(32) P(33) P(34) P(35) P(36) P(37) P(38) P(39) P(40) P(41) P(42) P(43) P(44) P(45)
 #if GAME_PROF_DRAW
-P(43) P(44) P(45) P(46) P(47) P(48) P(49) P(50) P(51) P(52) P(53)
+P(46) P(47) P(48) P(49) P(50) P(51) P(52) P(53) P(54) P(55) P(56)
 #endif
 #undef P
 
@@ -193,11 +201,11 @@ static uint64_t g_cmsg_us[64][32];
 static unsigned g_cmsg_n[64][32];
 
 static uint64_t probe_cmsg(uint32_t a, uint32_t b, uint32_t c, uint32_t d,
-                           uint32_t e, uint32_t f) {
+                           uint32_t e, uint32_t f, uint32_t g, uint32_t h) {
   const unsigned char *m = (const unsigned char *)(uintptr_t)b;
   int outer = g_hook[CMSG_HOOK].depth == 0;
   uint64_t t0 = sceKernelGetProcessTimeWide();
-  uint64_t r = timed(&g_hook[CMSG_HOOK], a, b, c, d, e, f);
+  uint64_t r = timed(&g_hook[CMSG_HOOK], a, b, c, d, e, f, g, h);
   if (outer && m && c >= 3) {
     unsigned maj = m[1] & 63, min = m[2] & 31;
     g_cmsg_us[maj][min] += sceKernelGetProcessTimeWide() - t0;
@@ -212,10 +220,10 @@ static fn6_t const g_probe[] = {
   probe_17, probe_18, probe_19, probe_20, probe_21, probe_22, probe_23, probe_24,
   probe_25, probe_26, probe_27, probe_28, probe_29, probe_30, probe_31, probe_32,
   probe_33, probe_34, probe_35, probe_36, probe_37, probe_38, probe_39, probe_40,
-  probe_41, probe_42,
+  probe_41, probe_42, probe_43, probe_44, probe_45,
 #if GAME_PROF_DRAW
-  probe_43, probe_44, probe_45, probe_46, probe_47, probe_48, probe_49, probe_50,
-  probe_51, probe_52, probe_53,
+  probe_46, probe_47, probe_48, probe_49, probe_50, probe_51, probe_52, probe_53,
+  probe_54, probe_55, probe_56,
 #endif
 };
 _Static_assert(sizeof g_probe / sizeof g_probe[0] == HOOK_N, "one probe per hook");
