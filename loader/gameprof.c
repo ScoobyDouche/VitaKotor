@@ -129,6 +129,17 @@ static hook_t g_hook[] = {
   { "_Z17AurBuild2DMipMapsiiiPhb",                             "mipAur"       },
   { "_Z17gluBuild2DMipmapsjiiijjPKv",                          "mipGlu",   1  },
   { "_Z21BuildTextureNormalMapPhfRiS0_iib",                    "normalMap"    },
+  /* Nov 1 (Davik's estate, lowest settings): 80-400 ms frames where the
+   * engine's own per-object client update (g_AIObjectTime) peaks at 110-154 ms,
+   * right after a dialogue line advances. Which object type is it? */
+  { "_ZN12CSWCCreature8AIUpdateEv",                            "cCreature"    },
+  { "_ZN15CSWCSoundObject8AIUpdateEv",                         "cSoundObj"    },
+  { "_ZN13CSWCPlaceable8AIUpdateEv",                           "cPlaceable"   },
+  { "_ZN16CSWCVisualEffect8AIUpdateEv",                        "cVfx"         },
+  { "_ZN12CSWCCreature7LipSyncERK7CResRef",                    "lipSync"      },
+  /* Each new dialogue line costs 60-100 ms of guiDraw (310 ms for the first,
+   * with FreeType's init). Is it FTGL rasterising new glyphs? */
+  { "_ZN17FTTextureFontImpl13MakeGlyphImplEP16FT_GlyphSlotRec_", "ftGlyph", 1  },
   { "_ZN7CResTGA18OnResourceServicedEv",                       "tgaServiced"  },
   { "_ZN7CResTGA18ReadUnmappedRLETGAEv",                       "tgaRLE"       },
   { "_ZN7CResTGA21ReadColorMappedRLETGAEv",                    "tgaRLEmap"    },
@@ -186,8 +197,9 @@ static inline uint64_t timed(hook_t *hk, uint32_t a, uint32_t b, uint32_t c, uin
 P(0) P(1) P(2) P(3) P(4) P(5) P(6) P(7) P(8) P(9) P(10) P(11) P(12) P(14) P(15) P(16)
 P(17) P(18) P(19) P(20) P(21) P(22) P(23) P(24) P(25) P(26) P(27) P(28) P(29) P(30) P(31)
 P(32) P(33) P(34) P(35) P(36) P(37) P(38) P(39) P(40) P(41) P(42) P(43) P(44) P(45)
+P(46) P(47) P(48) P(49) P(50) P(51)
 #if GAME_PROF_DRAW
-P(46) P(47) P(48) P(49) P(50) P(51) P(52) P(53) P(54) P(55) P(56)
+P(52) P(53) P(54) P(55) P(56) P(57) P(58) P(59) P(60) P(61) P(62)
 #endif
 #undef P
 
@@ -220,10 +232,11 @@ static fn6_t const g_probe[] = {
   probe_17, probe_18, probe_19, probe_20, probe_21, probe_22, probe_23, probe_24,
   probe_25, probe_26, probe_27, probe_28, probe_29, probe_30, probe_31, probe_32,
   probe_33, probe_34, probe_35, probe_36, probe_37, probe_38, probe_39, probe_40,
-  probe_41, probe_42, probe_43, probe_44, probe_45,
+  probe_41, probe_42, probe_43, probe_44, probe_45, probe_46, probe_47, probe_48,
+  probe_49, probe_50, probe_51,
 #if GAME_PROF_DRAW
-  probe_46, probe_47, probe_48, probe_49, probe_50, probe_51, probe_52, probe_53,
-  probe_54, probe_55, probe_56,
+  probe_52, probe_53, probe_54, probe_55, probe_56, probe_57, probe_58, probe_59,
+  probe_60, probe_61, probe_62,
 #endif
 };
 _Static_assert(sizeof g_probe / sizeof g_probe[0] == HOOK_N, "one probe per hook");

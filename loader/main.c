@@ -785,7 +785,17 @@ static int LzmaUncompress_hook(unsigned char *dest, size_t *destLen,
 #endif
   int rc = LzmaUncompress_orig(dest, destLen, src, srcLen, props, propsSize);
 #if LZMA_CACHE_KB
-  lzma_cache_note_miss_us(sceKernelGetProcessTimeWide() - t0);
+  uint64_t dt = sceKernelGetProcessTimeWide() - t0;
+  lzma_cache_note_miss_us(dt);
+  /* Nov 1: game-thread stalls of 100-400 ms after a dialogue line, with one
+   * 127-471 KB archive read each and the time in no timed function. Name the
+   * slow decompressions and who asked for them. */
+  static unsigned slow_n;
+  if (dt >= 20000 && slow_n++ < 300)
+    log_printf("[lzma] slow miss %u ms: %u KB -> %u KB on %s, LR=%p", (unsigned)(dt / 1000),
+               (unsigned)(sl_in >> 10), (unsigned)(*destLen >> 10),
+               sceKernelGetThreadId() == g_game_thid ? "game thread" : "other thread",
+               __builtin_return_address(0));
   if (rc == 0 && key)
     lzma_cache_put(key, dl_in, sl_in, dest, *destLen, *srcLen);
 #endif
