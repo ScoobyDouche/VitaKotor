@@ -184,7 +184,7 @@ forward.
 apk/                  extracted APK  (GIT-IGNORED — never commit)
 com.aspyr.swkotor/    OBB game data  (GIT-IGNORED — never commit)
 loader/               so-loader source (main.c, so_util, dynlib, jni/audio/bink, log)
-tools/                build helpers and host-side unit tests (test_*.c)
+tools/                build helpers and host-side unit tests (test_*.c; run them all with tools/run_host_tests.sh)
 patches/              the vitaGL patch the shipped binary depends on
 docs/releases/        release notes, one file per version
 build/                CMake build output (GIT-IGNORED) -> build/KOTOR.vpk
