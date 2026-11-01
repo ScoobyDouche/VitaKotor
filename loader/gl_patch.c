@@ -129,6 +129,11 @@ static GLboolean s_blend, s_scissor;
 static GLint    s_scissor_box[4];
 static uint32_t s_clear[4];              /* GL_COLOR_CLEAR_VALUE, float bits  */
 static uint32_t s_attr_en;               /* enabled vertex attribute arrays   */
+#if GL_FILTER_REDUNDANT_STATE
+static int      s_depth_mask = -1, s_color_mask = -1;  /* -1: not known yet */
+static int64_t  s_stencil_mask = -1;
+#endif
+static unsigned g_state_skipped_win = 0;  /* repeated state calls not queued */
 static uint32_t s_attr_client;           /* ... whose pointer is client memory */
 #define GLQ_ATTRS 16
 static struct { GLint size; GLenum type; GLboolean norm; GLsizei stride; const void *ptr; }
@@ -194,11 +199,19 @@ static void idxmax_note(GLuint b, const void *d, GLsizeiptr sz, int replace) {
 }
 
 /* (1q) direct maps that are hot enough to queue. Array arguments are copied. */
+/* GL_FILTER_REDUNDANT_STATE: the game re-sends attribute enables, the active
+ * unit and the write masks around every draw whether or not they changed. */
 static void glEnableVertexAttribArray_q(GLuint i) {
+#if GL_FILTER_REDUNDANT_STATE
+  if (i < 32 && (s_attr_en & (1u << i))) { g_state_skipped_win++; return; }
+#endif
   if (i < 32) s_attr_en |= 1u << i;
   Q(glEnableVertexAttribArray, i);
 }
 static void glDisableVertexAttribArray_q(GLuint i) {
+#if GL_FILTER_REDUNDANT_STATE
+  if (i < 32 && !(s_attr_en & (1u << i))) { g_state_skipped_win++; return; }
+#endif
   if (i < 32) s_attr_en &= ~(1u << i);
   Q(glDisableVertexAttribArray, i);
 }
@@ -210,8 +223,19 @@ static void glBlendEquation_q(GLenum m) { Q(glBlendEquation, m); }
 static void glBlendEquationSeparate_q(GLenum a, GLenum b) { Q(glBlendEquationSeparate, a, b); }
 static void glStencilFunc_q(GLenum f, GLint r, GLuint m) { Q(glStencilFunc, f, r, m); }
 static void glStencilFuncSeparate_q(GLenum fc, GLenum f, GLint r, GLuint m) { Q(glStencilFuncSeparate, fc, f, r, m); }
-static void glStencilMask_q(GLuint m) { Q(glStencilMask, m); }
-static void glStencilMaskSeparate_q(GLenum fc, GLuint m) { Q(glStencilMaskSeparate, fc, m); }
+static void glStencilMask_q(GLuint m) {
+#if GL_FILTER_REDUNDANT_STATE
+  if (s_stencil_mask == (int64_t)m) { g_state_skipped_win++; return; }
+  s_stencil_mask = m;
+#endif
+  Q(glStencilMask, m);
+}
+static void glStencilMaskSeparate_q(GLenum fc, GLuint m) {
+#if GL_FILTER_REDUNDANT_STATE
+  s_stencil_mask = fc == GL_FRONT_AND_BACK ? (int64_t)m : -1;
+#endif
+  Q(glStencilMaskSeparate, fc, m);
+}
 static void glStencilOp_q(GLenum a, GLenum b, GLenum c) { Q(glStencilOp, a, b, c); }
 static void glStencilOpSeparate_q(GLenum fc, GLenum a, GLenum b, GLenum c) { Q(glStencilOpSeparate, fc, a, b, c); }
 static void glUniform2i_q(GLint l, GLint a, GLint b) { Q(glUniform2i, l, a, b); }
@@ -745,7 +769,8 @@ void gl_patch_on_swap(uint64_t swap_begin_us, uint64_t swap_end_us) {
                over50, over80);
     log_printf("[GL]   per-window: clientArrayDraws=%u vboDraws=%u  texBinds=%u "
                "(skipped %u = %u%%) progSwitches=%u (skipped %u = %u%%) "
-               "bufferUploads=%u nonTex2DBinds=%u maxAttrOff=0x%x over64k=%u\n"
+               "bufferUploads=%u nonTex2DBinds=%u maxAttrOff=0x%x over64k=%u "
+               "repeatedStateDropped=%u\n"
                "[GL]   textures live: %u KB in %u ids (peak %u KB); "
                "lifetime %u KB up / %u KB released, %u untracked ids; "
                "16-bit: %u ids, %u KB saved",
@@ -754,7 +779,7 @@ void gl_patch_on_swap(uint64_t swap_begin_us, uint64_t swap_end_us) {
                g_prog_win, g_prog_skipped_win,
                g_prog_win ? (g_prog_skipped_win * 100 / g_prog_win) : 0,
                g_bufdata_win, g_nontex2d_binds,
-               (unsigned)g_vap_max_off, g_vap_over64k,
+               (unsigned)g_vap_max_off, g_vap_over64k, g_state_skipped_win,
                (unsigned)(g_tex_live >> 10), g_tex_n_live, (unsigned)(g_tex_peak >> 10),
                (unsigned)(g_tex_up >> 10), (unsigned)(g_tex_down >> 10), g_tex_untracked,
                 g_tex16_n, (unsigned)(g_tex16_saved >> 10));
@@ -784,7 +809,7 @@ void gl_patch_on_swap(uint64_t swap_begin_us, uint64_t swap_end_us) {
                (unsigned)(sdl.delay_requested_us / 1000u),
                (unsigned)(sdl.delay_actual_us / 1000u), sdl.delay_max_us / 1000u);
     memset(skip_groups, 0, sizeof skip_groups);
-    g_bind_skipped_win = g_prog_skipped_win = 0;
+    g_bind_skipped_win = g_prog_skipped_win = g_state_skipped_win = 0;
     g_arrays_win = g_elements_win = g_clears_win = 0;
     g_draw_client_win = g_draw_vbo_win = 0;
     g_texbind_win = g_prog_win = g_bufdata_win = 0;
@@ -1001,6 +1026,9 @@ static void glActiveTexture_e(GLenum t) {
   /* A unit past the shadow table is left untracked (GL_MAX_TEXUNITS) rather
    * than folded onto unit 0, which would let unit 0's filter skip a bind it
    * never saw. */
+#if GL_FILTER_REDUNDANT_STATE
+  if (u < GL_MAX_TEXUNITS && u == g_active_unit) { g_state_skipped_win++; return; }
+#endif
   g_active_unit = (u < GL_MAX_TEXUNITS) ? u : GL_MAX_TEXUNITS;
   /* Uploads go to the active unit's binding, not to the last one bound. */
   g_cur_tex = (u < GL_MAX_TEXUNITS) ? g_unit2d[u] : 0;
@@ -1040,12 +1068,20 @@ static void glActiveTexture_e(GLenum t) {
 #define TEXKIND_2D   1
 #define TEXKIND_CUBE 2
 static uint8_t  g_tex_kind[TEXKIND_MAX];
-/* Normalization cubes (see GL_NORMCUBE_SUBSTITUTE), recognised at upload, and
- * the last cube that was a real reflection map, which stands in for them. */
-static uint8_t  g_normcube[TEXKIND_MAX];
-static GLuint   g_last_envcube = 0;
-static unsigned g_normcube_swaps = 0, g_normcube_skips = 0;
+/* A normalization cube (see GL_NORMCUBE_SUBSTITUTE) recognised from its +X
+ * face, overwritten once its last face is in. */
 static GLuint   g_normcube_pending = 0;
+
+/* Issue #11, reflections that follow the area. GLRender::EnableFragmentShaders
+ * remembers the texture id it last bound on units 0-3 (a static it alone reads
+ * and writes) and skips a bind when the id matches. Other render paths bind
+ * textures without telling it, so a sword -- CM_Baremetal in every sword TXI --
+ * kept sampling whatever cube an area mesh had left on unit 2: gold in the
+ * Vulkar base, green in the cantina. Any bind made outside that function, and
+ * the delete of an id it holds, marks the slot stale so its next bind goes
+ * through. main.c finds the static and brackets the function with g_in_efs. */
+volatile uint32_t *g_efs_bind_cache = NULL;
+int g_in_efs = 0;
 
 /* ---- live texture census ---------------------------------------------------
  * vitaGL's free pools fall from 79 MB vram / 87 MB ram at boot to single-digit
@@ -1115,8 +1151,9 @@ static void glDeleteTextures_e(GLsizei n, const GLuint *tex) {
     for (GLsizei i = 0; i < n; i++) {
       if (tex_kind_get(tex[i]) == TEXKIND_CUBE)
         log_printf("[GL] cube texture %u deleted", (unsigned)tex[i]);
-      if (tex[i] && tex[i] < TEXKIND_MAX) { g_tex_kind[tex[i]] = TEXKIND_NONE; g_normcube[tex[i]] = 0; }
-      if (tex[i] && tex[i] == g_last_envcube) g_last_envcube = 0;
+      if (tex[i] && tex[i] < TEXKIND_MAX) g_tex_kind[tex[i]] = TEXKIND_NONE;
+      for (unsigned u = 0; g_efs_bind_cache && u < 4; u++)
+        if (tex[i] && g_efs_bind_cache[u] == tex[i]) g_efs_bind_cache[u] = 0xFFFFFFFFu;
       tex_release(tex[i]);
       for (unsigned u = 0; u < GL_MAX_TEXUNITS; u++)
         if (tex[i] && g_unit2d[u] == tex[i]) g_unit2d[u] = 0;
@@ -1139,20 +1176,9 @@ static void glGenTextures_e(GLsizei n, GLuint *t) { GLLOG("glGenTextures(%d)", (
 static void glBindTexture_e(GLenum tg, GLuint t) {
   GLLOG("glBindTexture(0x%x,%u)", (unsigned)tg, (unsigned)t);
   g_texbind_win++; g_texbind_frame++;
+  if (g_efs_bind_cache && !g_in_efs && g_active_unit < 4)
+    g_efs_bind_cache[g_active_unit] = 0xFFFFFFFFu;
   if (tg == GL_TEXTURE_CUBE_MAP) {
-#if GL_NORMCUBE_SUBSTITUTE
-    if (t && t < TEXKIND_MAX && g_normcube[t]) {
-      if (!g_last_envcube) { g_normcube_skips++; return; }   /* keep what the unit has */
-      g_normcube_swaps++;
-      if (!(g_normcube_swaps & (g_normcube_swaps - 1)))      /* 1, 2, 4, 8 ... */
-        log_printf("[GL] normalization cube %u bound -> using reflection cube %u instead "
-                   "(%u swaps, %u kept the unit's cube)", (unsigned)t,
-                   (unsigned)g_last_envcube, g_normcube_swaps, g_normcube_skips);
-      t = g_last_envcube;
-    } else if (t && tex_kind_get(t) == TEXKIND_CUBE) {
-      g_last_envcube = t;
-    }
-#endif
     g_cur_cubetex = t;
     if (tex_kind_get(t) == TEXKIND_2D) {          /* THE fault, if it happens */
       static unsigned w1 = 0;
@@ -1370,14 +1396,35 @@ static void glTexImage2D_body(GLenum tg, GLint l, GLint ifmt, GLsizei w, GLsizei
     /* Arm it only once its last face is in: a substitution while the faces are
      * still arriving would send them into the reflection cube instead. vitaGL
      * ignores cube mip levels above 0, so later levels do not matter. */
+    int overwrite = 0;
     if (l == 0 && face == 5 && g_normcube_pending && g_cur_cubetex == g_normcube_pending) {
-      g_normcube[g_normcube_pending] = 1;
-      if (g_last_envcube == g_normcube_pending) g_last_envcube = 0;
       g_normcube_pending = 0;
+      overwrite = 1;
     }
 #endif
     tex_charge(g_cur_cubetex, tg, l, w, h, fmt_bpp(f));   /* cubes bind their own id */
     glTexImage2D(tg, l, ifmt, w, h, b, f, ty, px);
+#if GL_NORMCUBE_SUBSTITUTE
+    /* The bind-time swap never fired on hardware (log 2026-10-25: 18 detections,
+     * 0 swaps) -- the game binds the cube once, before its faces are in, and
+     * never again, so the unit keeps the normalization cube. kotor.frag never
+     * reads one for bump mapping (that path is commented out), so its contents
+     * are only ever seen as a reflection: replace them outright with a plain
+     * silver cube. vitaGL only uses level 0 of a cube. */
+    if (overwrite) {
+      unsigned char *grey = malloc((size_t)w * h * 3);
+      if (grey) {
+        for (size_t i = 0; i < (size_t)w * h; i++) {
+          grey[i * 3 + 0] = 120; grey[i * 3 + 1] = 124; grey[i * 3 + 2] = 132;
+        }
+        for (GLenum fc = GL_TEXTURE_CUBE_MAP_POSITIVE_X; fc <= GL_TEXTURE_CUBE_MAP_NEGATIVE_Z; fc++)
+          glTexImage2D(fc, 0, ifmt, w, h, b, GL_RGB, GL_UNSIGNED_BYTE, grey);
+        free(grey);
+        log_printf("[GL] cube tex=%u: normalization cube overwritten with silver",
+                   (unsigned)g_cur_cubetex);
+      }
+    }
+#endif
     return;                        // none of the 2D heuristics below apply
   }
   if (tg != GL_TEXTURE_2D) { tex_charge(g_cur_tex, tg, l, w, h, fmt_bpp(f));
@@ -1722,13 +1769,28 @@ static void glHint_e(GLenum t, GLenum m) { GLLOG("glHint(0x%x,0x%x)", (unsigned)
 static void glFrontFace_e(GLenum m) { GLLOG("glFrontFace(0x%x)", (unsigned)m); Q(glFrontFace, m); }
 static void glCullFace_e(GLenum m) { GLLOG("glCullFace(0x%x)", (unsigned)m); Q(glCullFace, m); }
 static void glDepthFunc_e(GLenum f) { GLLOG("glDepthFunc(0x%x)", (unsigned)f); Q(glDepthFunc, f); }
-static void glColorMask_e(GLboolean r, GLboolean g, GLboolean b, GLboolean a) { GLLOG("glColorMask(%d%d%d%d)", r, g, b, a); Q(glColorMask, r, g, b, a); }
+static void glColorMask_e(GLboolean r, GLboolean g, GLboolean b, GLboolean a) {
+  GLLOG("glColorMask(%d%d%d%d)", r, g, b, a);
+#if GL_FILTER_REDUNDANT_STATE
+  int m = (r ? 1 : 0) | (g ? 2 : 0) | (b ? 4 : 0) | (a ? 8 : 0);
+  if (m == s_color_mask) { g_state_skipped_win++; return; }
+  s_color_mask = m;
+#endif
+  Q(glColorMask, r, g, b, a);
+}
 static void glBlendFunc_e(GLenum s, GLenum d) {
   GLLOG("glBlendFunc(0x%x,0x%x)", (unsigned)s, (unsigned)d);
   s_blend_src = s; s_blend_dst = d;
   Q(glBlendFunc, s, d);
 }
-static void glDepthMask_e(GLboolean f) { GLLOG("glDepthMask(%d)", f); Q(glDepthMask, f); }
+static void glDepthMask_e(GLboolean f) {
+  GLLOG("glDepthMask(%d)", f);
+#if GL_FILTER_REDUNDANT_STATE
+  if ((f ? 1 : 0) == s_depth_mask) { g_state_skipped_win++; return; }
+  s_depth_mask = f ? 1 : 0;
+#endif
+  Q(glDepthMask, f);
+}
 
 static const so_default_dynlib gl_dynlib[] = {
   /* (2) float-by-value shims */

@@ -112,38 +112,11 @@ static hook_t g_hook[] = {
   { "_ZN11CSWCMessage37HandleServerToPlayerUpdate_PlayerInfoEv",           "updPlayer"},
   { "_ZN11CSWCMessage39HandleServerToPlayerUpdate_GuiInventoryEv",         "updInv"   },
   { "_ZN11CSWCMessage39HandleServerToPlayerUpdateVisualEffectsEP10CSWCObject", "updVfx" },
-  /* log237: every L/R tab switch in the in-game menu freezes ~1.1 s with no
-   * card read, no model built and no texture upload, and Cross on the equip
-   * screen ~1.5 s. These are the menu's entry points; the hitch blame line
-   * says which of them the time was in. Prologues checked against the
-   * disassembly; SetActiveControlID, Equip::SetActiveSlot, AttachModel,
-   * Options::OnPanelAdded, GuiManager::AddPanel/RemovePanel and
-   * 3DSceneView::Draw branch or read pc in the patched bytes and are left out. */
-  { "_ZN16CSWGuiInGameMenu14OnShoulderLeftEP13CSWGuiControl",  "menuL"        },
-  { "_ZN16CSWGuiInGameMenu15OnShoulderRightEP13CSWGuiControl", "menuR"        },
-  { "_ZN17CSWGuiInGameEquip12OnPanelAddedEv",                  "equipAdd"     },
-  { "_ZN17CSWGuiInGameEquip14OnPanelRemovedEv",                "equipRemove"  },
-  { "_ZN17CSWGuiInGameEquip12SetCharacterEP12CSWCCreature",    "equipSetChar" },
-  { "_ZN17CSWGuiInGameEquip15UpdateInventoryEv",               "equipInv"     },
-  { "_ZN17CSWGuiInGameEquip11OnEnterSlotEP13CSWGuiControl",    "equipEnter"   },
-  { "_ZN17CSWGuiInGameEquip14OnItemSelectedEP13CSWGuiControl", "equipItemSel" },
-  { "_ZN17CSWGuiInGameEquip9EquipItemEP8CSWSItemii",           "equipItem"    },
-  { "_ZN17CSWGuiInGameEquip11UnequipItemEmi",                  "unequipItem"  },
-  { "_ZN17CSWGuiInGameEquip6UpdateEf",                         "equipUpdate"  },
-  { "_ZN21CSWGuiInGameCharacter12OnPanelAddedEv",              "charAdd"      },
-  { "_ZN21CSWGuiInGameCharacter14OnPanelRemovedEv",            "charRemove"   },
-  { "_ZN21CSWGuiInGameCharacter8SetStatsEv",                   "charStats"    },
-  { "_ZN21CSWGuiInGameInventory12OnPanelAddedEv",              "invAdd"       },
-  { "_ZN21CSWGuiInGameInventory14OnPanelRemovedEv",            "invRemove"    },
-  { "_ZN21CSWGuiInGameInventory19PopulateItemListBoxEv",       "invPopulate"  },
-  { "_ZN21CSWGuiInGameAbilities12OnPanelAddedEv",              "abiAdd"       },
-  { "_ZN19CSWGuiInGameJournal12OnPanelAddedEv",                "jouAdd"       },
-  { "_ZN15CSWGuiInGameMap12OnPanelAddedEv",                    "mapAdd"       },
-  { "_ZN20CSWGuiInGameMessages12OnPanelAddedEv",               "msgAdd"       },
   /* log238: equip hovers re-create 18-29 textures (up to 3 MB) and inventory
    * 89 icons (1.3 MB) every time, ~5 ms a texture with the bytes already in
-   * RAM; and the equip tab's ~1 s is outside every menu hook above. The
-   * texture path from resource to GL, and the per-frame GUI draw/update. */
+   * RAM. The texture path from resource to GL, and the per-frame GUI
+   * draw/update. (The per-screen menu timers that found the log237 tab
+   * freezes -- swkotor.ini rewrites, see ini_write.c -- are gone.) */
   { "_ZN16CAurTextureBasic4InitEPc",                           "texInit"      },
   { "_ZN16CAurTextureBasic9LoadImageEv",                       "texLoadImage" },
   { "_ZN16CAurTextureBasic7glImageEb",                         "texGlImage"   },
@@ -154,13 +127,6 @@ static hook_t g_hook[] = {
   { "_ZN7CResTPC18OnResourceServicedEv",                       "tpcServiced"  },
   { "_ZN13CSWGuiManager4DrawEf",                               "guiDraw"      },
   { "_ZN13CSWGuiManager6UpdateEf",                             "guiUpdate"    },
-  { "_ZN13CSWGuiManager16HandleInputEventEii",                 "guiInput"     },
-  { "_ZN16CSWGuiInGameMenu16HandleInputEventEii",              "menuInput"    },
-  { "_ZN17CSWGuiInGameEquip16HandleInputEventEii",             "equipInput"   },
-  { "_ZN17CSWGuiInGameEquip4DrawEf",                           "equipDraw"    },
-  { "_ZN21CSWGuiInGameCharacter4DrawEf",                       "charDraw"     },
-  { "_ZN21CSWGuiInGameInventory4DrawEf",                       "invDraw"      },
-  { "_ZN21CSWGuiInGameInventory15CreateItemEntryEP12CSWCCreatureRiR13CExoArrayListIP13CSWGuiControlEP8CSWSItemii", "invEntry" },
 #if GAME_PROF_DRAW
   /* Per-mesh split of dynGeo (log-only diagnostic; ~10 timers a draw, so it
    * costs several ms a frame itself). Only targets of at most six argument
@@ -211,11 +177,9 @@ static inline uint64_t timed(hook_t *h, uint32_t a, uint32_t b, uint32_t c, uint
   { return timed(&g_hook[i], a, b, c, d, e, f); }
 P(0) P(1) P(2) P(3) P(4) P(5) P(6) P(7) P(8) P(9) P(10) P(11) P(12) P(14) P(15) P(16)
 P(17) P(18) P(19) P(20) P(21) P(22) P(23) P(24) P(25) P(26) P(27) P(28) P(29) P(30) P(31)
-P(32) P(33) P(34) P(35) P(36) P(37) P(38) P(39) P(40) P(41) P(42) P(43) P(44) P(45) P(46)
-P(47) P(48) P(49) P(50) P(51) P(52) P(53) P(54) P(55) P(56) P(57) P(58) P(59) P(60) P(61)
-P(62) P(63) P(64) P(65) P(66) P(67) P(68) P(69) P(70)
+P(32) P(33) P(34) P(35) P(36) P(37) P(38) P(39) P(40) P(41) P(42)
 #if GAME_PROF_DRAW
-P(71) P(72) P(73) P(74) P(75) P(76) P(77) P(78) P(79) P(80) P(81)
+P(43) P(44) P(45) P(46) P(47) P(48) P(49) P(50) P(51) P(52) P(53)
 #endif
 #undef P
 
@@ -248,13 +212,10 @@ static fn6_t const g_probe[] = {
   probe_17, probe_18, probe_19, probe_20, probe_21, probe_22, probe_23, probe_24,
   probe_25, probe_26, probe_27, probe_28, probe_29, probe_30, probe_31, probe_32,
   probe_33, probe_34, probe_35, probe_36, probe_37, probe_38, probe_39, probe_40,
-  probe_41, probe_42, probe_43, probe_44, probe_45, probe_46, probe_47, probe_48,
-  probe_49, probe_50, probe_51, probe_52, probe_53, probe_54, probe_55, probe_56,
-  probe_57, probe_58, probe_59, probe_60, probe_61, probe_62, probe_63, probe_64,
-  probe_65, probe_66, probe_67, probe_68, probe_69, probe_70,
+  probe_41, probe_42,
 #if GAME_PROF_DRAW
-  probe_71, probe_72, probe_73, probe_74, probe_75, probe_76, probe_77, probe_78,
-  probe_79, probe_80, probe_81,
+  probe_43, probe_44, probe_45, probe_46, probe_47, probe_48, probe_49, probe_50,
+  probe_51, probe_52, probe_53,
 #endif
 };
 _Static_assert(sizeof g_probe / sizeof g_probe[0] == HOOK_N, "one probe per hook");
@@ -378,8 +339,7 @@ void gameprof_io_note(const char *op, const char *path, uint64_t us) {
 
 /* Which timed functions a hitch frame spent its time in: every hook with
  * 2 ms or more this frame, largest first. Times are inclusive, so a caller
- * and the callee under it both appear (menuL holds equipAdd, render holds
- * singlePass). */
+ * and the callee under it both appear (render holds singlePass). */
 void gameprof_hitch_blame(void) {
   char b[512];
   int o = snprintf(b, sizeof b, "[hitch]   in:");

@@ -848,6 +848,67 @@ static void DoFog_hook(void *scene) {
   DoFog_orig(scene);
 }
 
+/* Reflection bind cache (issue #11, see gl_patch.c). GLRender::
+ * EnableFragmentShaders builds its per-unit static's address -- "ldr rN,
+ * [pc, #k]; add rN, pc" -- once per unit it binds (11 times, 0x5c6ef0 in
+ * 1.0.10); one other pc-relative load is a GOT slot. Decode them all and take
+ * the address that comes up most. */
+static int (*EnableFragmentShaders_orig)(int id, void *t0, void *t1, void *t2, void *t3) = NULL;
+
+static int EnableFragmentShaders_hook(int id, void *t0, void *t1, void *t2, void *t3) {
+  g_in_efs++;
+  int r = EnableFragmentShaders_orig(id, t0, t1, t2, t3);
+  g_in_efs--;
+  return r;
+}
+
+static volatile uint32_t *find_efs_cache(uintptr_t fn) {
+  const uint16_t *c = (const uint16_t *)(fn & ~1u);
+  uint32_t lit[16] = { 0 }, addr[8] = { 0 };
+  unsigned hits[8] = { 0 }, best = 0;
+  for (int i = 0; i < 0x7a0 / 2; i++) {
+    uint16_t h = c[i];
+    uintptr_t at = (uintptr_t)&c[i];
+    if ((h & 0xF800) == 0x4800) {                        /* ldr rN, [pc, #imm8*4] */
+      lit[(h >> 8) & 7] = *(const uint32_t *)(((at + 4) & ~3u) + (h & 0xFF) * 4u);
+    } else if (h == 0xF8DF) {                            /* ldr.w rN, [pc, #imm12] */
+      uint16_t h2 = c[i + 1];
+      lit[h2 >> 12] = *(const uint32_t *)(((at + 4) & ~3u) + (h2 & 0xFFF));
+      i++;
+    } else if ((h & 0xFF78) == 0x4478) {                 /* add rN, pc */
+      unsigned rd = (h & 7) | ((h >> 4) & 8);
+      if (!lit[rd]) continue;
+      uint32_t a = lit[rd] + (uint32_t)(at + 4);
+      for (unsigned k = 0; k < 8; k++)
+        if (!hits[k] || addr[k] == a) { addr[k] = a; hits[k]++; break; }
+    } else if ((h & 0xF800) == 0xF000 || (h & 0xF800) == 0xE800 || (h & 0xF800) == 0xF800) {
+      i++;                                               /* skip a 32-bit instruction */
+    }
+  }
+  for (unsigned k = 1; k < 8; k++)
+    if (hits[k] > hits[best]) best = k;
+  if (hits[best] < 8) {
+    log_printf("[GL] bind cache: only %u references in EnableFragmentShaders, off",
+               hits[best]);
+    return NULL;
+  }
+  return (volatile uint32_t *)(uintptr_t)addr[best];
+}
+
+static void install_bind_cache_fix(void) {
+  const char *sym = "_ZN8GLRender21EnableFragmentShadersEiP11CAurTextureS1_S1_S1_";
+  uintptr_t a = so_symbol(&kotor_mod, sym);
+  if (!a) { log_printf("[GL] bind cache: EnableFragmentShaders missing"); return; }
+  volatile uint32_t *cache = find_efs_cache(a);
+  if (!cache) return;
+  hook_named(sym, (uintptr_t)&EnableFragmentShaders_hook,
+             (void **)&EnableFragmentShaders_orig, "EnableFragmentShaders");
+  if (!EnableFragmentShaders_orig) return;
+  g_efs_bind_cache = cache;
+  log_printf("[GL] bind cache: EnableFragmentShaders' unit cache at %p, kept honest",
+             (void *)cache);
+}
+
 static void install_model_timers(void) {
   hook_named("_Z13NewCAurObjectPcS_P9SDL_RWopsS1_", (uintptr_t)&NewCAurObject_probe,
              (void **)&NewCAurObject_orig, "NewCAurObject");
@@ -1808,6 +1869,7 @@ int main(int argc, char *argv[]) {
   install_lzma_cache();
   install_model_timers();
   hook_named("_ZN5Scene5DoFogEv", (uintptr_t)&DoFog_hook, (void **)&DoFog_orig, "Scene::DoFog");
+  install_bind_cache_fix();
   install_frame_hooks();
   gameprof_install();
   ini_write_install();

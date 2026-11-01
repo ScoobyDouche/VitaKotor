@@ -114,6 +114,7 @@ static void log_drain(void) {
 static int log_writer(SceSize args, void *argp) {
   (void)args; (void)argp;
   uint64_t last_report = sceKernelGetProcessTimeWide();
+  uint64_t last_close = last_report;
   while (!g_panic) {
     SceUInt timeout = LOG_FLUSH_MS * 1000;
     sceKernelWaitSema(g_wake, 1, &timeout);
@@ -135,7 +136,10 @@ static int log_writer(SceSize args, void *argp) {
 
       uint64_t t0 = sceKernelGetProcessTimeWide();
       log_write_direct(out, n);
-      log_close();   // durable on the card, as the inline flush was
+      if (t0 - last_close >= (uint64_t)LOG_CLOSE_MS * 1000) {
+        log_close();   // durable on the card
+        last_close = t0;
+      }
       uint32_t us = (uint32_t)(sceKernelGetProcessTimeWide() - t0);
       sceKernelUnlockMutex(g_io_mtx, 1);
 

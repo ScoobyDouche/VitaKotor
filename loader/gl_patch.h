@@ -19,6 +19,11 @@ extern volatile uint64_t g_last_swap_end_us;
  * the first texture upload; ids converted under one setting keep it. */
 extern int g_gl_tex16;
 
+/* GLRender::EnableFragmentShaders' per-unit "last bound id" static, and
+ * nonzero while it runs (see gl_patch.c, issue #11). */
+extern volatile uint32_t *g_efs_bind_cache;
+extern int g_in_efs;
+
 /* Scope for KOTOR's nested AurGUI viewport stack. */
 extern int g_gl_gui_viewport_scope;
 

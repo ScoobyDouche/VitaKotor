@@ -316,9 +316,16 @@
 // which has its own path) at most LOG_FLUSH_MS of log is unwritten.
 //
 // Two buffers of this size: one fills while the writer thread empties the
-// other (see log.c). A busy second is ~10-20 KB, so 64 KB leaves headroom.
-#define LOG_BUFFER_KB  64
-#define LOG_FLUSH_MS   1000
+// other (see log.c). A busy second is ~10-20 KB, so 128 KB covers a few.
+//
+// 2026-10-25: a write of a few KB took 4-6 s on the card many times a session,
+// and twice the game thread froze for exactly that long behind it (the game
+// reads its OBB from the same card). Open-append-close every second is the
+// worst pattern for cheap SD cards, so write less often and keep the file open,
+// closing it only every LOG_CLOSE_MS. A process exit still closes it.
+#define LOG_BUFFER_KB  128
+#define LOG_FLUSH_MS   5000
+#define LOG_CLOSE_MS   30000
 
 // glGet* value trace. The diagnostic value is all in init (~18 cap queries);
 // steady-state values are noise, and log119 still spent 231 lines on them. The
@@ -365,8 +372,8 @@
 // +X red, -X cyan, +Y green, -Y magenta, +Z blue, -Z yellow) and binds it where
 // kotor.frag's one cube sampler expects the reflection map -- the port's bump
 // maths is commented out, so nothing can use it correctly. Those six colours are
-// exactly the neon armour in the screenshots. 1 = whenever the game binds that
-// cube, bind the last real reflection cube instead. 0 = the old behaviour.
+// exactly the neon armour in the screenshots. 1 = paint that cube plain silver
+// once its faces are uploaded. 0 = the old behaviour.
 #define GL_NORMCUBE_SUBSTITUTE 1
 
 // Skip glUseProgram calls that re-select the program already current. vitaGL's
@@ -380,6 +387,14 @@
 // uniform re-upload, and that cannot be filtered away from here.
 // Set to 0 if lighting or skinning ever looks stale, to rule this out.
 #define GL_FILTER_REDUNDANT_PROGS 1
+
+// Drop repeated state calls before they are queued: glActiveTexture of the
+// unit already active, enabling an attribute array that is already on (or
+// disabling one that is off), and glDepthMask/glColorMask/glStencilMask with
+// the value already set. The census (log 2026-10-23) counts ~2700 ActiveTexture,
+// ~2400 EnableVertexAttribArray and ~1000 mask calls in a 13k-call city frame.
+// The [GL] per-window line reports repeatedStateDropped. 0 = queue them all.
+#define GL_FILTER_REDUNDANT_STATE 1
 
 // Render thread (gl_thread.c). The game's GL calls are queued and replayed by
 // a thread on core 2, so vitaGL's per-draw work (~12 us a draw, ~550 draws a
