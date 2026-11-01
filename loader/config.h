@@ -411,7 +411,9 @@
 #define GL_THREAD_SPIN 2000
 // Client-memory vertex data up to this size is copied into the ring with its
 // draw; anything bigger makes the game wait for the render thread instead.
-#define GL_THREAD_CLIENT_COPY_MAX (64 * 1024)
+// 64 KB left one draw a frame over it in Taris (Oct 31 log, ~0.7 ms of game-
+// thread drain each); a record may be up to a quarter of the ring (512 KB).
+#define GL_THREAD_CLIENT_COPY_MAX (256 * 1024)
 #define GL_THREAD_PRIORITY 0x100000F8
 #define GL_THREAD_STACK (256 * 1024)
 

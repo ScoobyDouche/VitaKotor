@@ -545,6 +545,7 @@ static unsigned glq_type_bytes(GLenum t) {
 /* Why a client draw still went through an RPC, for the [glq] line. */
 enum { CF_OFF, CF_ELEMBUF, CF_VERTS, CF_ATTR, CF_BIG, CF_N };
 static unsigned g_cf[CF_N];
+static uint32_t g_cf_big_max;             /* largest refused copy this window */
 static int glq_copy_client_attribs(uint32_t nverts) {
   uint32_t m = s_attr_en & s_attr_client, total = 0, bytes[GLQ_ATTRS];
   if (!g_glq_on) { g_cf[CF_OFF]++; return 0; }
@@ -560,7 +561,11 @@ static int glq_copy_client_attribs(uint32_t nverts) {
     bytes[i] = (nverts - 1u) * st + elem;
     total += bytes[i];
   }
-  if (total > GL_THREAD_CLIENT_COPY_MAX) { g_cf[CF_BIG]++; return 0; }
+  if (total > GL_THREAD_CLIENT_COPY_MAX) {
+    g_cf[CF_BIG]++;
+    if (total > g_cf_big_max) g_cf_big_max = total;
+    return 0;
+  }
   /* vitaGL takes a pointer as a VBO offset if a VBO is bound when it is set
    * (as GL does), so set the copies with none bound and put it back after.
    * The draw itself only reads the pointers captured here. */
@@ -624,13 +629,15 @@ static void glDrawElements_t(GLenum mode, GLsizei count, GLenum type, const void
   if (s_attr_en & s_attr_client) {
     int slot;
     if (s_elembuf) {                           /* indices in a VBO */
+      /* A failed copy counts its own reason; only an unknown index range
+       * counts here. */
       if (type == GL_UNSIGNED_SHORT && count > 0 &&
-          (slot = idxmax_slot((GLuint)s_elembuf, 0)) >= 0 &&
-          glq_copy_client_attribs(g_idxmax[slot].max + 1u)) {
-        Q(draw_elements_x, mode, count, type, idx);
-        return;
-      }
-      g_cf[CF_ELEMBUF]++;
+          (slot = idxmax_slot((GLuint)s_elembuf, 0)) >= 0) {
+        if (glq_copy_client_attribs(g_idxmax[slot].max + 1u)) {
+          Q(draw_elements_x, mode, count, type, idx);
+          return;
+        }
+      } else g_cf[CF_ELEMBUF]++;
     } else if (!idx || count <= 0) g_cf[CF_ELEMBUF]++;
     else if (glq_copy_client_attribs(glq_max_index(idx, count, type) + 1u)) {
       QC(draw_elements_x, 3, (uint32_t)count * isz, mode, count, type, idx);
@@ -790,9 +797,11 @@ void gl_patch_on_swap(uint64_t swap_begin_us, uint64_t swap_end_us) {
 #if GL_THREAD
     gl_thread_report(120, glq_name_of);
     if (g_cf[CF_OFF] + g_cf[CF_ELEMBUF] + g_cf[CF_VERTS] + g_cf[CF_ATTR] + g_cf[CF_BIG])
-      log_printf("[glq]   client draws not copied: off=%u indexVBO=%u verts=%u attr=%u big=%u",
-                 g_cf[CF_OFF], g_cf[CF_ELEMBUF], g_cf[CF_VERTS], g_cf[CF_ATTR], g_cf[CF_BIG]);
+      log_printf("[glq]   client draws not copied: off=%u indexVBO=%u verts=%u attr=%u big=%u (max %u KB)",
+                 g_cf[CF_OFF], g_cf[CF_ELEMBUF], g_cf[CF_VERTS], g_cf[CF_ATTR], g_cf[CF_BIG],
+                 (unsigned)(g_cf_big_max >> 10));
     memset(g_cf, 0, sizeof g_cf);
+    g_cf_big_max = 0;
 #endif
     gameprof_window_report();
     srv_overlap_window_report();
