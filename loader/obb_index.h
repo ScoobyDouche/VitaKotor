@@ -38,7 +38,4 @@ void obbidx_finish(ObbIndex *ix);
 
 void obbidx_close(ObbIndex *ix);
 
-/* 1 when this index is replaying a cache rather than recording one. */
-int obbidx_is_serving(const ObbIndex *ix);
-
 #endif

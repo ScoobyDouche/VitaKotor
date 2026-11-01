@@ -134,10 +134,6 @@ int modset_scan(void) {
 
 int modset_count(void) { return s_count; }
 
-const char *modset_name(int i) {
-  return (i >= 0 && i < s_count) ? s_set[i].name : NULL;
-}
-
 const char *modset_label(int i) {
   return (i >= 0 && i < s_count) ? s_set[i].label : NULL;
 }

@@ -26,3 +26,6 @@ test-translation/
 mods/
 # Backup of the Vita card (ux0:data/kotor) -- game libs, saves
 OGHARDWARE/
+
+# Hardware logs pulled from the card (large, machine-local)
+logs/

@@ -317,7 +317,6 @@ static void build_vm(void) {
   VM(6, GetEnv);                // slot 6  (offset 0x18)
 }
 
-void *jni_get_vm(void)  { return fake_vm; }
 void *jni_get_env(void) { return fake_env; }
 
 void *Android_JNI_GetEnv(void) {

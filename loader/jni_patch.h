@@ -19,8 +19,7 @@ void jni_setup(void);
 // before jni_setup(). Values are the INI_LANG_* ids in ini.h.
 void jni_set_language(int id);
 
-// Accessors for the fake JavaVM* / JNIEnv* (needed when we invoke the entry).
-void *jni_get_vm(void);
+// Accessor for the fake JNIEnv* (needed when we invoke the entry).
 void *jni_get_env(void);
 
 // Entries this layer contributes to the resolver (Android_JNI_GetEnv, etc.).

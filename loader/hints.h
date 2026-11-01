@@ -53,9 +53,7 @@ int hints_load(LzmaUncompressFn lzma, int lang);
  * or NULL if it could not be resolved. Valid until hints_free(). */
 const char *hints_loading(void);
 
-/* How many hints are available, and one of them. hints_get() returns NULL for
- * an out-of-range index. */
-int hints_count(void);
+/* One hint. NULL for an out-of-range index. */
 const char *hints_get(int i);
 
 /* Drop the text. Every pointer from hints_get() dangles afterwards. */

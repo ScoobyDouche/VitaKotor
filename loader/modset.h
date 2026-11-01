@@ -39,9 +39,8 @@ int modset_scan(void);
 
 int modset_count(void);
 
-/* The folder name, and the CP1252 upper-case label the menu draws. NULL for an
- * out-of-range index. */
-const char *modset_name(int i);
+/* The CP1252 upper-case label the menu draws. NULL for an out-of-range
+ * index. */
 const char *modset_label(int i);
 
 /* The active index, or -1 for vanilla. */

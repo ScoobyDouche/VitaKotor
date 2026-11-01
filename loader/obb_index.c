@@ -115,7 +115,6 @@ ObbIndex *obbidx_open(const char *archive_path, long archive_size) {
 #endif
 }
 
-int obbidx_is_serving(const ObbIndex *ix) { return ix && ix->serving; }
 
 int obbidx_serve(ObbIndex *ix, long off, void *dst, long len) {
   if (!ix || !ix->serving || !dst || len <= 0) return 0;

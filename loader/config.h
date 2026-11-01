@@ -145,11 +145,6 @@
 #define OBB_INDEX_MAX_RANGE  4096   // ignore reads bigger than this: asset data,
                                     // not metadata, and it would bloat the cache
 
-// Read archives with sceIoPread instead of fseek+fread. One syscall per read
-// rather than two, and no newlib buffer to invalidate -- which matters because
-// every archive read is preceded by a seek to the virtual handle's position.
-#define OBB_USE_PREAD        1
-
 // Progress bar for startup. The game draws NOTHING until its first draw call --
 // log124 measured that at 69.3s, later even than the "Main Menu" analytics
 // string at 56.1s -- so without this the console looks hung for over a minute.

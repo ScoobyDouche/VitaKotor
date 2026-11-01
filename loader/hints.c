@@ -174,8 +174,6 @@ static int arena_put(const char *s, unsigned n) {
 
 /* ---- public ---------------------------------------------------------------- */
 
-int hints_count(void) { return g_n; }
-
 const char *hints_get(int i) {
   return (i >= 0 && i < g_n) ? g_hint[i] : NULL;
 }

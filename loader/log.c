@@ -336,14 +336,6 @@ void log_printf(const char *fmt, ...) {
 #endif
 }
 
-// ---- crash handling -------------------------------------------------------
-// Hardware CPU-fault capture (PC/LR/registers) lives in crash.c via kubridge's
-// kuKernelRegisterExceptionHandler. This log_fatal covers the controlled fatal
-// path the loader itself takes (unresolved symbol, missing file, etc.).
-void log_fatal(const char *reason) {
-  log_printf("[CRASH] %s", reason ? reason : "(unknown)");
-}
-
 void log_init(void) {
   // Ensure ux0:data/kotor exists (ignore EEXIST).
   sceIoMkdir("ux0:data", 0777);
