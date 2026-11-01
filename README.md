@@ -157,6 +157,7 @@ GrassWind=0
 | `DrawDistance` | `0` | Caps how far you can see, in metres, in areas that have fog. It made no measurable difference on Dantooine, so it is off |
 | `ObbCacheKB` | `8192` | RAM kept for recent reads from the game's archives |
 | `TextureBits` | `16` | `32` loads textures at full colour depth: sharper, about the same speed, but it can use up the Vita's video memory in big areas. Also selectable from the **MODS** button |
+| `ShadowDistance` | `35` | How far away, in metres, creatures still cast shadows when Shadows is on. Lower values save a little CPU in crowded areas (about 1 ms at `20` in the Upper City) |
 | `ServerOverlap` | `1` | Runs the game's AI on a second core while the 3D scene draws. `0` puts it back after the scene, as in v0.5.0 |
 
 ## Controls

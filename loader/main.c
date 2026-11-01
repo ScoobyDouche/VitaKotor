@@ -831,6 +831,7 @@ static void hook_named(const char *sym, uintptr_t hook, void **orig, const char 
  * fog off are left alone: forcing fog on would change how they look. */
 static int g_draw_distance = DRAW_DISTANCE_M;   // [Vita Options] DrawDistance
 static int g_grass_wind = GRASS_WIND;           // [Vita Options] GrassWind
+static int g_shadow_dist = SHADOW_DISTANCE_M;    // [Vita Options] ShadowDistance
 static void (*DoFog_orig)(void *scene) = NULL;
 
 static void DoFog_hook(void *scene) {
@@ -1310,6 +1311,8 @@ static void read_vita_options(void) {
       g_grass_wind = atoi(v) != 0;
     if (ini_get(text, "Vita Options", "TextureBits", v, sizeof(v)) && v[0])
       g_gl_tex16 = atoi(v) != 32;
+    if (ini_get(text, "Vita Options", "ShadowDistance", v, sizeof(v)) && v[0])
+      g_shadow_dist = atoi(v);
     if (ini_get(text, "Vita Options", "ServerOverlap", v, sizeof(v)) && v[0])
       g_srv_overlap_enabled = atoi(v) != 0;
     free(text);
@@ -1325,6 +1328,12 @@ static void read_vita_options(void) {
   if (wind) *wind = g_grass_wind;
   log_printf("[perf] grass wind: %s%s", g_grass_wind ? "on" : "off",
              wind ? "" : " (enablegrasswind symbol missing)");
+
+  // Read by Scene::DoGobShadowsForThisLight for every creature, every frame.
+  volatile float *shd = (volatile float *)so_symbol(&kotor_mod, "maxshadowdist");
+  if (shd && g_shadow_dist > 0) *shd = (float)g_shadow_dist;
+  log_printf("[perf] shadow distance: %d m%s", shd ? (int)*shd : g_shadow_dist,
+             shd ? "" : " (maxshadowdist symbol missing)");
 }
 
 // FRAME_LOCK_FPS -> vblanks per flip. vitaGL's display callback waits that

@@ -1122,7 +1122,12 @@ static void glDeleteTextures_e(GLsizei n, const GLuint *tex) {
   memset(g_bound2d, 0, sizeof g_bound2d);
   glDeleteTextures(n, tex);
 }
-static void glPixelStorei_e(GLenum p, GLint v) { GLLOG("glPixelStorei(0x%x,%d)", (unsigned)p, v); Q(glPixelStorei, p, v); }
+static GLint g_unpack_align = 4;          /* GL_UNPACK_ALIGNMENT, for the queued sub-upload */
+static void glPixelStorei_e(GLenum p, GLint v) {
+  GLLOG("glPixelStorei(0x%x,%d)", (unsigned)p, v);
+  if (p == GL_UNPACK_ALIGNMENT && (v == 1 || v == 2 || v == 4 || v == 8)) g_unpack_align = v;
+  Q(glPixelStorei, p, v);
+}
 static void glGenTextures_e(GLsizei n, GLuint *t) { GLLOG("glGenTextures(%d)", (int)n); glGenTextures(n, t); }
 static void glBindTexture_e(GLenum tg, GLuint t) {
   GLLOG("glBindTexture(0x%x,%u)", (unsigned)tg, (unsigned)t);
@@ -1408,6 +1413,54 @@ static void glTexImage2D_body(GLenum tg, GLint l, GLint ifmt, GLsizei w, GLsizei
   }
   tex_upload2d(tg, l, ifmt, w, h, b, f, ty, px);
 }
+/* log-2026-10-31-overlap2: the game sub-uploads one texture every frame, and as
+ * an RPC each one waited for the render thread to drain the whole frame queued
+ * before it: 0.3 ms a frame when calm, 3 ms when the render thread was behind.
+ * It is queued now. The header (the eight scalar arguments) and the pixels go
+ * into one block that the ring copies; the render thread uploads from the copy. */
+static void texsub_run(const uint32_t *b) {
+  glTexSubImage2D((GLenum)b[0], (GLint)b[1], (GLint)b[2], (GLint)b[3], (GLsizei)b[4],
+                  (GLsizei)b[5], (GLenum)b[6], (GLenum)b[7], (const void *)(b + 8));
+}
+/* Bytes GL reads for a w x h upload in this format/type, rows padded to the
+ * unpack alignment except the last; 0 if the pair is one we do not size. */
+static uint32_t texsub_bytes(GLsizei w, GLsizei h, GLenum f, GLenum ty, GLint align) {
+  unsigned bpp;
+  if (ty == GL_UNSIGNED_BYTE)
+    bpp = f == GL_RGBA ? 4u : f == GL_RGB ? 3u : f == GL_LUMINANCE_ALPHA ? 2u :
+          (f == GL_LUMINANCE || f == GL_ALPHA) ? 1u : 0u;
+  else if (ty == GL_UNSIGNED_SHORT_4_4_4_4 || ty == GL_UNSIGNED_SHORT_5_5_5_1 ||
+           ty == GL_UNSIGNED_SHORT_5_6_5)
+    bpp = 2u;
+  else
+    bpp = 0u;
+  if (!bpp || w <= 0 || h <= 0) return 0;
+  uint32_t row = (uint32_t)w * bpp;
+  uint32_t stride = (row + (uint32_t)align - 1u) & ~((uint32_t)align - 1u);
+  return stride * (uint32_t)(h - 1) + row;
+}
+static uint32_t *g_texsub_buf;
+static uint32_t g_texsub_cap;
+/* A header-plus-pixels block of `bytes` pixel bytes, reused across calls (game
+ * thread only); NULL if it cannot grow. */
+static uint32_t *texsub_block(uint32_t bytes) {
+  uint32_t need = 32u + bytes;
+  if (need > g_texsub_cap) {
+    uint32_t cap = need + (need >> 2);
+    uint32_t *nb = (uint32_t *)realloc(g_texsub_buf, cap);
+    if (!nb) return NULL;
+    g_texsub_buf = nb;
+    g_texsub_cap = cap;
+  }
+  return g_texsub_buf;
+}
+static void texsub_queue(GLenum tg, GLint l, GLint xo, GLint yo, GLsizei w, GLsizei h,
+                         GLenum f, GLenum ty, uint32_t *blk, uint32_t bytes) {
+  blk[0] = tg; blk[1] = (uint32_t)l; blk[2] = (uint32_t)xo; blk[3] = (uint32_t)yo;
+  blk[4] = (uint32_t)w; blk[5] = (uint32_t)h; blk[6] = f; blk[7] = ty;
+  QC(texsub_run, 0, 32u + bytes, blk);
+}
+
 /* Must convert exactly as the base upload did, or vitaGL reads byte data as
  * 16-bit and the texture turns to noise. */
 static void glTexSubImage2D_body(GLenum tg, GLint l, GLint xo, GLint yo, GLsizei w, GLsizei h,
@@ -1419,20 +1472,35 @@ static void glTexSubImage2D_body(GLenum tg, GLint l, GLint xo, GLint yo, GLsizei
   uint8_t kind = (g_cur_tex && g_cur_tex < TEXKIND_MAX) ? g_tex16[g_cur_tex] : TEX16_NONE;
   if (px && kind != TEX16_NONE && ty == GL_UNSIGNED_BYTE && w > 0 && h > 0 &&
       ((kind == TEX16_4444 && f == GL_RGBA) || (kind == TEX16_565 && f == GL_RGB))) {
-    uint16_t *cv = (uint16_t *)malloc((size_t)w * h * 2);
-    if (cv) {
+    uint32_t bytes = (uint32_t)w * (uint32_t)h * 2u;
+    uint32_t *blk = texsub_block(bytes);
+    if (blk) {
       /* A sub-upload covers part of the image, so its mean says nothing about
        * the whole texture -- take the conversion, discard the statistic. */
-      tex16_pack(cv, (const unsigned char *)px, w, h, kind, NULL);
-      glTexSubImage2D(tg, l, xo, yo, w, h, f,
-                      (kind == TEX16_4444) ? GL_UNSIGNED_SHORT_4_4_4_4
-                                           : GL_UNSIGNED_SHORT_5_6_5, cv);
-      free(cv);
+      tex16_pack((uint16_t *)(blk + 8), (const unsigned char *)px, w, h, kind, NULL);
+      texsub_queue(tg, l, xo, yo, w, h, f,
+                   (kind == TEX16_4444) ? GL_UNSIGNED_SHORT_4_4_4_4 : GL_UNSIGNED_SHORT_5_6_5,
+                   blk, bytes);
       return;
     }
   }
 #endif
+  uint32_t bytes = px ? texsub_bytes(w, h, f, ty, g_unpack_align) : 0u;
+  uint32_t *blk = bytes ? texsub_block(bytes) : NULL;
+  if (blk) {
+    memcpy(blk + 8, px, bytes);
+    texsub_queue(tg, l, xo, yo, w, h, f, ty, blk, bytes);
+    return;
+  }
+  /* unsized format or no memory: run it in order on the render thread */
+  const uint32_t a[9] = { tg, (uint32_t)l, (uint32_t)xo, (uint32_t)yo, (uint32_t)w,
+                          (uint32_t)h, f, ty, (uint32_t)(uintptr_t)px };
+#if GL_THREAD
+  glq_rpc((const void *)glTexSubImage2D, a);
+#else
   glTexSubImage2D(tg, l, xo, yo, w, h, f, ty, px);
+  (void)a;
+#endif
 }
 /* log238: menu hitches re-create dozens of textures; time every upload path,
  * ours and vitaGL's together, for the hitch blame line. */
@@ -1873,6 +1941,7 @@ static const char *const glq_native[] = {
   "glStencilFunc", "glStencilFuncSeparate", "glStencilMask", "glStencilMaskSeparate",
   "glStencilOp", "glStencilOpSeparate", "glClearColor", "glClearDepthf",
   "glDepthRangef", "glLineWidth", "glPolygonOffset", "glTexParameterf",
+  "glTexSubImage2D",
 };
 #define GLQ_N (sizeof gl_dynlib / sizeof gl_dynlib[0])
 static so_default_dynlib g_glq_table[GLQ_N];

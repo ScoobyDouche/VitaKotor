@@ -40,6 +40,7 @@ static int g_render_depth;
 static volatile int g_render_done;
 static SceUID g_sema_kick, g_sema_done, g_sema_render;
 static SceUID g_worker_thid;
+static SceUID g_game_thid_ov;        /* recorded at the first overlap */
 static uintptr_t g_worker_lo, g_worker_hi;
 static void *volatile g_work_this;
 static volatile uint64_t g_work_us;      /* worker's last tick, us */
@@ -53,44 +54,51 @@ typedef struct {
   uint32_t waits;        /* times it parked the worker mid-render (this window) */
   uint32_t waits_total;
   uint8_t flush;         /* lifecycle point: run an owed tick first */
+  uint8_t defer;         /* calls from a g_defer_site are queued, not parked */
 } stub_t;
 
 static stub_t *g_stub;
 static unsigned g_nstub;
 
-#define STUB_BYTES 80
-static void gate_check(unsigned idx, uintptr_t lr);
+#define STUB_BYTES 96
+static int gate_check(unsigned idx, uintptr_t lr, uint32_t *regs);
 
-/* ARM stub, 72 bytes:
+/* ARM stub, 84 bytes:
  *   ldr ip,[lo]; cmp sp,ip; bls fast; ldr ip,[hi]; cmp sp,ip; bhs fast
- *   push {r0-r3,ip,lr}; mov r1,lr; ldr r0,[idx]; ldr ip,[check]; blx ip
- *   pop {r0-r3,ip,lr}
+ *   push {r0-r3,ip,lr}; mov r1,lr; mov r2,sp; ldr r0,[idx]; ldr ip,[check]; blx ip
+ *   cmp r0,#0; pop {r0-r3,ip,lr}; bxne lr
  * fast:
  *   ldr pc,[orig]
  *   .word lo, hi, orig, idx, check
  * Only a thread whose sp is inside [lo,hi) -- the AI worker, or every thread
  * for a lifecycle point (lo=0, hi=~0) -- takes the call; everyone else pays
- * six instructions. Stack arguments and VFP registers are untouched (the
- * stub never moves sp across the tail jump), so any signature passes through. */
+ * six instructions. gate_check sees r0-r3 at regs[0..3] and the caller's
+ * stack arguments from regs[6]; a non-zero return skips the original (the
+ * call was queued for later) and returns to the caller. Otherwise stack
+ * arguments and VFP registers are untouched (sp is back where it was at the
+ * tail jump), so any signature passes through. */
 static void emit_stub(uint32_t *w, uintptr_t lo, uintptr_t hi, uintptr_t orig, unsigned idx) {
-  w[0]  = 0xe59fc02c;  /* ldr ip, [pc, #0x2c]  -> lo    */
-  w[1]  = 0xe15d000c;  /* cmp sp, ip                    */
-  w[2]  = 0x9a000008;  /* bls fast                      */
-  w[3]  = 0xe59fc024;  /* ldr ip, [pc, #0x24]  -> hi    */
-  w[4]  = 0xe15d000c;  /* cmp sp, ip                    */
-  w[5]  = 0x2a000005;  /* bhs fast                      */
-  w[6]  = 0xe92d500f;  /* push {r0-r3, ip, lr}          */
-  w[7]  = 0xe1a0100e;  /* mov r1, lr                    */
-  w[8]  = 0xe59f0018;  /* ldr r0, [pc, #0x18]  -> idx   */
-  w[9]  = 0xe59fc018;  /* ldr ip, [pc, #0x18]  -> check */
-  w[10] = 0xe12fff3c;  /* blx ip                        */
-  w[11] = 0xe8bd500f;  /* pop {r0-r3, ip, lr}           */
-  w[12] = 0xe59ff004;  /* fast: ldr pc, [pc, #4] -> orig */
-  w[13] = (uint32_t)lo;
-  w[14] = (uint32_t)hi;
-  w[15] = (uint32_t)orig;
-  w[16] = idx;
-  w[17] = (uint32_t)(uintptr_t)&gate_check;
+  w[0]  = 0xe59fc038;  /* ldr ip, [pc, #0x38]  -> lo     */
+  w[1]  = 0xe15d000c;  /* cmp sp, ip                     */
+  w[2]  = 0x9a00000b;  /* bls fast                       */
+  w[3]  = 0xe59fc030;  /* ldr ip, [pc, #0x30]  -> hi     */
+  w[4]  = 0xe15d000c;  /* cmp sp, ip                     */
+  w[5]  = 0x2a000008;  /* bhs fast                       */
+  w[6]  = 0xe92d500f;  /* push {r0-r3, ip, lr}           */
+  w[7]  = 0xe1a0100e;  /* mov r1, lr                     */
+  w[8]  = 0xe1a0200d;  /* mov r2, sp                     */
+  w[9]  = 0xe59f0020;  /* ldr r0, [pc, #0x20]  -> idx    */
+  w[10] = 0xe59fc020;  /* ldr ip, [pc, #0x20]  -> check  */
+  w[11] = 0xe12fff3c;  /* blx ip                         */
+  w[12] = 0xe3500000;  /* cmp r0, #0                     */
+  w[13] = 0xe8bd500f;  /* pop {r0-r3, ip, lr}            */
+  w[14] = 0x112fff1e;  /* bxne lr                        */
+  w[15] = 0xe59ff004;  /* fast: ldr pc, [pc, #4] -> orig */
+  w[16] = (uint32_t)lo;
+  w[17] = (uint32_t)hi;
+  w[18] = (uint32_t)orig;
+  w[19] = idx;
+  w[20] = (uint32_t)(uintptr_t)&gate_check;
 }
 
 /* ---- which engine functions are render-side ------------------------------ */
@@ -139,6 +147,9 @@ static const char *const g_allow[] = {
   "_ZN10CExoResMan6ExistsERK7CResReftPm",
   "_ZN10CExoResMan6ExistsERK7CResReftR10CExoString",
   "_ZN10CExoResMan8GetResIDERK7CResReft",
+  /* overlap2: CRes::CRes() parked 2017 ticks; both constructors only fill the
+   * fresh object's own fields (0x4c8440, 0x4c8470). */
+  "_ZN4CResC1Ev", "_ZN4CResC2Ev", "_ZN4CResC1Em", "_ZN4CResC2Em",
 };
 
 /* Mangled name -> 1 if the worker must not run it during the render pass. */
@@ -210,15 +221,57 @@ static struct {
   unsigned kicks, sync_runs, nested_skips;
   uint64_t ai_us, wait_us, render_us, join_us;
   unsigned gated_ticks, gl_waits;
+  unsigned deferred, defer_full, lock_calls, lock_waits, lock_escapes;
 } g_st;
 static unsigned g_logged_first;
 
 /* ---- the overlap --------------------------------------------------------- */
 
+/* Calls the worker queued instead of parking for (Gob::PlayAnimation from
+ * CSWCAnimBase::SetAnimationInternal). Replayed in order by whichever thread
+ * owns the engine once the render is done: the worker when it next parks, or
+ * the game thread at the join. Only one of them ever runs at a time. */
+#define DEFER_N 256
+typedef struct { uintptr_t fn; uint32_t r0, r2, r3, s0; int null_name; char name[64]; } defer_t;
+static defer_t g_defer[DEFER_N];
+static unsigned g_ndefer;
+static volatile int g_worker_parked;
+
+/* Return addresses (kotor offsets, Thumb bit set) of the virtual calls to
+ * Gob::PlayAnimation whose next instruction overwrites r0, so the caller
+ * provably drops the result. From the *::SetAnimationInternal family; a site
+ * whose next instruction does not write r0 (0x1c8a65, 0x1c989f, the TW and
+ * VisualEffect ones that test it) is left to park. */
+static const uint32_t g_defer_site_off[] = {
+  0x1c1753, 0x1c17ab,              /* CSWCAnimBase */
+  0x1c4393, 0x1c43e3,              /* CSWCAnimBaseDoor */
+  0x1c8a9f,                        /* CSWCAnimBaseTW */
+  0x1c9845, 0x1c9873, 0x1c98d1, 0x1c98fd, 0x1c9929,   /* CSWCAnimBaseWield */
+};
+static int is_defer_site(uintptr_t lr) {
+  uint32_t off = (uint32_t)(lr - kotor_mod.text_base);
+  for (unsigned i = 0; i < sizeof g_defer_site_off / sizeof *g_defer_site_off; i++)
+    if (off == g_defer_site_off[i]) return 1;
+  return 0;
+}
+
+typedef uint32_t (*fn5_t)(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
+static void ov_replay(void) {
+  for (unsigned i = 0; i < g_ndefer; i++) {
+    defer_t *d = &g_defer[i];
+    ((fn5_t)d->fn)(d->r0, d->null_name ? 0u : (uint32_t)(uintptr_t)d->name, d->r2, d->r3, d->s0);
+  }
+  g_ndefer = 0;
+}
+
 static void park_until_render_done(void) {
   uint64_t t0 = sceKernelGetProcessTimeWide();
+  g_worker_parked = 1;
+  __sync_synchronize();
   while (!g_render_done) sceKernelWaitSema(g_sema_render, 1, NULL);
+  g_worker_parked = 0;
   g_work_wait_us += sceKernelGetProcessTimeWide() - t0;
+  ov_replay();
 }
 
 static void run_owed_sync(void) {
@@ -228,14 +281,27 @@ static void run_owed_sync(void) {
   g_ai_orig(g_owed_this);
 }
 
-static void gate_check(unsigned idx, uintptr_t lr) {
+static int gate_check(unsigned idx, uintptr_t lr, uint32_t *regs) {
   stub_t *s = &g_stub[idx];
   if (s->flush) {
     /* lifecycle point: the game thread runs an owed tick before going on */
     if (!g_ov_active && sceKernelGetThreadId() != g_worker_thid) run_owed_sync();
-    return;
+    return 0;
   }
-  if (!g_ov_active || g_render_done || sceKernelGetThreadId() != g_worker_thid) return;
+  if (!g_ov_active || g_render_done || sceKernelGetThreadId() != g_worker_thid) return 0;
+  if (s->defer && is_defer_site(lr)) {
+    const char *nm = (const char *)(uintptr_t)regs[1];
+    size_t n = nm ? strnlen(nm, 64) : 0;
+    if (g_ndefer < DEFER_N && n < 64) {
+      defer_t *d = &g_defer[g_ndefer++];
+      d->fn = s->orig; d->r0 = regs[0]; d->r2 = regs[2]; d->r3 = regs[3]; d->s0 = regs[6];
+      d->null_name = !nm;
+      if (nm) memcpy(d->name, nm, n + 1); else d->name[0] = 0;
+      g_st.deferred++;
+      return 1;
+    }
+    g_st.defer_full++;
+  }
   s->waits++;
   s->waits_total++;
   if (g_logged_first < 40 && s->waits_total == 1) {
@@ -244,6 +310,7 @@ static void gate_check(unsigned idx, uintptr_t lr) {
                s->name, (unsigned)(lr - kotor_mod.text_base));
   }
   park_until_render_done();
+  return 0;
 }
 
 void srv_overlap_gl_guard(void) {
@@ -309,6 +376,7 @@ static uint32_t render_wrap(void *self) {
     g_render_depth--;
     return r;
   }
+  if (!g_game_thid_ov) g_game_thid_ov = sceKernelGetThreadId();
   g_owed = 0;
   g_work_this = g_owed_this;
   g_render_done = 0;
@@ -328,6 +396,7 @@ static uint32_t render_wrap(void *self) {
   sceKernelSignalSema(g_sema_render, 1);
   sceKernelWaitSema(g_sema_done, 1, NULL);
   __sync_synchronize();
+  ov_replay();                     /* whatever the worker queued and did not replay */
   g_ov_active = 0;
   uint64_t t2 = sceKernelGetProcessTimeWide();
 
@@ -339,6 +408,85 @@ static uint32_t render_wrap(void *self) {
   if (g_work_wait_us) g_st.gated_ticks++;
   return r;
 }
+
+/* ---- the resource manager lock -------------------------------------------
+ * overlap2: once CRes::CRes was let through, the script VM's next stop is
+ * CExoResMan::Request / Demand (it re-creates each .ncs resource per run). The
+ * render can demand a texture at the same time, so these get a real lock
+ * instead of a gate -- but only while an overlap is on, and only between the
+ * game thread and the worker; any other thread passes straight through as
+ * before. Every one takes at most four words, so a plain C wrapper passes
+ * them through exactly.
+ * Deadlock: if the worker holds the lock and then parks at a gate (a resource
+ * whose load reaches render code), the game thread would wait on it forever.
+ * So the game thread never blocks on a parked worker: it goes ahead without
+ * the lock. The worker is frozen at a call boundary, not mid-list-edit. */
+static volatile SceUID g_res_owner;
+static unsigned g_res_depth;
+
+static int res_lock(SceUID me, int game) {
+  if (g_res_owner == me) { g_res_depth++; return 1; }
+  int spins = 0;
+  for (;;) {
+    if (__sync_bool_compare_and_swap(&g_res_owner, 0, me)) { g_res_depth = 1; return 1; }
+    if (game && g_worker_parked) { g_st.lock_escapes++; return 0; }
+    if (!spins++) g_st.lock_waits++;
+    if (spins > 64) sceKernelDelayThread(20);
+  }
+}
+static void res_unlock(void) {
+  if (--g_res_depth == 0) { __sync_synchronize(); g_res_owner = 0; }
+}
+
+typedef uint64_t (*fn4_t)(uint32_t, uint32_t, uint32_t, uint32_t);
+static const char *const g_lock_syms[] = {
+  "_ZN10CExoResMan6DemandEP4CRes",
+  "_ZN10CExoResMan7RequestEP4CRes",
+  "_ZN10CExoResMan7ReleaseEP4CRes",
+  "_ZN10CExoResMan16ReleaseResObjectEP4CRes",
+  "_ZN10CExoResMan4FreeEP4CRes",
+  "_ZN10CExoResMan6MallocEP4CRes",
+  "_ZN10CExoResMan13CancelRequestEP4CRes",
+  "_ZN10CExoResMan12SetResObjectERK7CResReftP4CRes",
+  "_ZN10CExoResMan20ServiceFromDirectoryEP4CResi",
+  "_ZN10CExoResMan23ServiceFromEncapsulatedEP4CResi",
+  "_ZN10CExoResMan18ServiceFromResFileEP4CResi",
+  "_ZN10CExoResMan16ServiceFromImageEP4CResi",
+  "_ZN10CExoResMan22ServiceCurrentAsyncResEv",
+  "_ZN4CRes6DemandEv",
+  "_ZN4CRes7RequestEv",
+  "_ZN4CRes7ReleaseEv",
+  "_ZN4CRes13CancelRequestEv",
+  "_ZN4CResD0Ev", "_ZN4CResD1Ev", "_ZN4CResD2Ev",
+  /* log-2026-10-31-lock: parked 230 times inside ServiceFromResFile (lock held) */
+  "_ZN10CExoResMan9FreeChunkEv",
+  "_ZN4CRes9GetResRefER7CResRefRt",
+};
+#define NLOCK (sizeof g_lock_syms / sizeof *g_lock_syms)
+static fn4_t g_lock_orig[NLOCK];
+
+static uint64_t lock_call(unsigned i, uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
+  if (!g_ov_active) return g_lock_orig[i](a, b, c, d);
+  SceUID me = sceKernelGetThreadId();
+  int game = me == g_game_thid_ov;
+  if (!game && me != g_worker_thid) return g_lock_orig[i](a, b, c, d);
+  g_st.lock_calls++;
+  int locked = res_lock(me, game);
+  uint64_t r = g_lock_orig[i](a, b, c, d);
+  if (locked) res_unlock();
+  return r;
+}
+#define LW(i) static uint64_t lock_w##i(uint32_t a, uint32_t b, uint32_t c, uint32_t d) \
+  { return lock_call(i, a, b, c, d); }
+LW(0) LW(1) LW(2) LW(3) LW(4) LW(5) LW(6) LW(7) LW(8) LW(9) LW(10) LW(11) LW(12) LW(13)
+LW(14) LW(15) LW(16) LW(17) LW(18) LW(19) LW(20) LW(21)
+#undef LW
+static fn4_t const g_lock_w[] = {
+  lock_w0, lock_w1, lock_w2, lock_w3, lock_w4, lock_w5, lock_w6, lock_w7, lock_w8, lock_w9,
+  lock_w10, lock_w11, lock_w12, lock_w13, lock_w14, lock_w15, lock_w16, lock_w17, lock_w18,
+  lock_w19, lock_w20, lock_w21,
+};
+_Static_assert(sizeof g_lock_w / sizeof *g_lock_w == NLOCK, "one wrapper per locked symbol");
 
 /* ---- install ------------------------------------------------------------- */
 
@@ -399,6 +547,18 @@ void srv_overlap_install(void) {
   }
   sceKernelWaitSema(g_sema_done, 1, NULL);       /* stack bounds are in */
 
+  /* The resource manager's mutators get the lock instead of a stub. Their
+   * slots then hold the wrappers, which pass 1 below does not match. */
+  unsigned n_lock = 0, n_lock_fn = 0;
+  for (unsigned i = 0; i < NLOCK; i++) {
+    uintptr_t a = so_symbol(m, g_lock_syms[i]);
+    if (!a) { log_printf("[ov] lock: %s missing", g_lock_syms[i]); g_lock_orig[i] = NULL; continue; }
+    g_lock_orig[i] = (fn4_t)a;
+    unsigned n = redirect_value(m, a, (uintptr_t)g_lock_w[i]);
+    n_lock += n;
+    if (n) n_lock_fn++;
+  }
+
   /* Pass 1: every slot that should go through a stub, keyed by its value. */
   int nrel = NRELS(m);
   ovkey_t *keys = malloc(sizeof(ovkey_t) * (size_t)nrel);
@@ -457,6 +617,10 @@ void srv_overlap_install(void) {
     g_stub[i].name = keys[i].name;
     g_stub[i].orig = keys[i].key;
     g_stub[i].flush = (uint8_t)keys[i].flush;
+    /* overlap2: 2888 parks, from the SetAnimationInternal family, which drops
+     * the result at the sites in g_defer_site_off. Queue those. */
+    if (keys[i].name && !strcmp(keys[i].name, "_ZN3Gob13PlayAnimationEPcfif"))
+      g_stub[i].defer = 1;
     keys[i].stub = i;
     uintptr_t lo = keys[i].flush ? 0 : g_worker_lo;
     uintptr_t hi = keys[i].flush ? ~(uintptr_t)0 : g_worker_hi;
@@ -487,6 +651,8 @@ void srv_overlap_install(void) {
   free(keys);
   free(defs);
   free(flush_addr);
+  log_printf("[ov] resource lock on %u functions (%u slots); PlayAnimation queued from %u call sites",
+             n_lock_fn, n_lock, (unsigned)(sizeof g_defer_site_off / sizeof *g_defer_site_off));
   log_printf("[ov] armed: AI tick slots=%u, render slots=%u, server-loop slots=%u; "
              "%u stubs over %u slots (%u lifecycle); worker stack %p-%p",
              n_ai, n_rs, n_sl, nu, n_slots, n_flush, (void *)g_worker_lo, (void *)g_worker_hi);
@@ -505,6 +671,9 @@ void srv_overlap_window_report(void) {
                k ? g_st.render_us / 1000.0 / k : 0.0, k ? g_st.ai_us / 1000.0 / k : 0.0,
                k ? g_st.wait_us / 1000.0 / k : 0.0, k ? g_st.join_us / 1000.0 / k : 0.0,
                g_st.gated_ticks, g_st.gl_waits, g_st.nested_skips);
+    log_printf("[ov]   queued %u PlayAnimation (%u parked: queue full or long name); "
+               "resource lock %u calls, %u waited, %u went ahead past a parked AI",
+               g_st.deferred, g_st.defer_full, g_st.lock_calls, g_st.lock_waits, g_st.lock_escapes);
     /* the gates that parked the AI most this window */
     char b[480];
     int o = snprintf(b, sizeof b, "[ov]   gates:");

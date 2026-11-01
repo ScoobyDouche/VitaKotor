@@ -497,6 +497,15 @@
 // swkotor.ini [Vita Options] FrameLock overrides it.
 #define FRAME_LOCK_FPS 30
 
+// Shadow distance, in metres: creatures farther than this from the camera
+// cast no shadow. The engine's own value (libKOTOR maxshadowdist) is 35.
+// log-2026-10-31-32bit: with Shadows on, Upper City South spends 10-13 ms a
+// frame building shadow volumes on the CPU for every creature in range.
+// log-2026-10-31-shadow20: 20 m saved ~1 ms there (8.2 -> 7.4), inside the
+// area's own variance, so the default stays the original 35.
+// swkotor.ini [Vita Options] ShadowDistance overrides it.
+#define SHADOW_DISTANCE_M 35
+
 // Server/render overlap (srv_overlap.h): the server's AI tick runs on core 1
 // during the 3D pass instead of after it. SRV_OVERLAP_BUILD 0 compiles it out;
 // SRV_OVERLAP is the default, swkotor.ini [Vita Options] ServerOverlap
