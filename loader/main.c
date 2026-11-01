@@ -1405,6 +1405,26 @@ static void apply_frame_lock(void) {
   eglSwapInterval(NULL, vblanks);
   log_printf("[perf] frame lock: FrameLock=%d -> flip every %d vblank(s), %d fps max",
              fps, vblanks, 60 / vblanks);
+
+  // The game's own limiter in SDL_main: when a frame took <= 24 ms it sleeps
+  // 25 - elapsed (SDL_Delay at +0x18d0fa), a hard 40 fps cap. Only a 60 lock
+  // needs it lifted: the two Thumb-2 immediates become 15/16 (~62 fps; vsync
+  // caps the rest). At 30 or 20 the flip wait is the longer one anyway.
+  if (vblanks == 1) {
+    uintptr_t cmp = kotor_mod.text_base + 0x18d0e8;   // rsbs r2, r0, #24
+    uintptr_t sub = kotor_mod.text_base + 0x18d0f6;   // rsbcs r0, r0, #25
+    const uint16_t *c = (const uint16_t *)cmp, *s = (const uint16_t *)sub;
+    if (c[0] == 0xf1d0 && c[1] == 0x0218 && s[0] == 0xf1c0 && s[1] == 0x0019) {
+      uint16_t ci = 0x020f, si = 0x0010;
+      kuKernelCpuUnrestrictedMemcpy((void *)(cmp + 2), &ci, 2);
+      kuKernelCpuUnrestrictedMemcpy((void *)(sub + 2), &si, 2);
+      so_flush_caches(&kotor_mod);
+      log_printf("[perf] game frame limiter: 25 ms -> 16 ms (40 -> 60 fps cap)");
+    } else {
+      log_printf("[perf] game frame limiter: bytes differ (%04x %04x / %04x %04x), left at 40 fps",
+                 c[0], c[1], s[0], s[1]);
+    }
+  }
 }
 
 // Replace the ini with `need` bytes of `out`, via a temp file: an interrupted

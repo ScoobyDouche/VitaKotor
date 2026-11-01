@@ -152,7 +152,7 @@ GrassWind=0
 
 | Key | Default | What it does |
 |---|---|---|
-| `FrameLock` | `30` | Frame rate cap. At 30 every frame stays on screen for the same time, so motion is even. `20` for a lower, steadier cap; `0` unlocks it (up to 40 fps, but frames alternate between two and three screen refreshes and motion judders) |
+| `FrameLock` | `30` | Frame rate cap. At 30 every frame stays on screen for the same time, so motion is even. `20` for a lower, steadier cap; `60` unlocks it and lifts the game's own 40 fps cap, so small interiors can run up to 60, but busy areas fall back to 20-30 and motion judders as frames alternate between screen refreshes |
 | `GrassWind` | `0` | `1` makes the grass sway again, at a CPU cost every frame |
 | `DrawDistance` | `0` | Caps how far you can see, in metres, in areas that have fog. It made no measurable difference on Dantooine, so it is off |
 | `ObbCacheKB` | `8192` | RAM kept for recent reads from the game's archives |

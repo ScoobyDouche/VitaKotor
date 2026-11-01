@@ -512,7 +512,8 @@
 // log232: frames run 25-38 ms, so unlocked each one stays up for 2 or 3
 // vblanks in turn and motion judders even at 30+ fps. A 30 lock shows every
 // frame that fits in 33 ms for exactly 33 ms, and one that does not for 50.
-// 0 or 60 = unlocked (vblank every frame, the old behaviour); 30; 20.
+// 0 or 60 = unlocked (vblank every frame) and the game's own 40 fps limiter
+// lifted to 60 (main.c apply_frame_lock); 30; 20.
 // swkotor.ini [Vita Options] FrameLock overrides it.
 #define FRAME_LOCK_FPS 30
 
