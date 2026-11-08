@@ -118,7 +118,26 @@ static void ime_configure(void) {
 
 // ---- the two entry points libKOTOR imports from libandroid_port ----
 
+/* 1.0.43's CSWGuiEditbox::HandleKeyPress drops every key unless
+ * SDL_IsTextInputActive(), and CExoInputInternal::GetEvents changes course on
+ * it too. On Android text input is off until an editbox takes focus
+ * and off again when it is done. The name screens call SDL_StartTextInput
+ * themselves only on a Chromebook; on a phone it is ASLPlat_ShowVirtualKeyboard
+ * that starts it -- the original is a tail call to SDL_StartTextInput -- and we
+ * replace that function, so ours has to start it too.
+ *
+ * Never forward to Vita SDL2's own Start/StopTextInput: its StartTextInput opens
+ * SDL's sceIme keyboard, which never draws under vitaGL and holds the IME, so
+ * our dialog's sceImeDialogInit then fails with 0x80020401 and the game waits
+ * forever on an invisible keyboard. Our dialog pushes SDL_TEXTINPUT itself, so
+ * all the game needs is the flag. */
+static int s_text_input;
+static void SDL_StartTextInput_hook(void) { s_text_input = 1; }
+static void SDL_StopTextInput_hook(void)  { s_text_input = 0; }
+static SDL_bool SDL_IsTextInputActive_hook(void) { return s_text_input ? SDL_TRUE : SDL_FALSE; }
+
 static void ASLPlat_ShowVirtualKeyboard_hook(const char *current, unsigned int max_len) {
+  SDL_StartTextInput_hook();         // what the original does, see above
   if (s_state != IME_IDLE) {           // a second tap while the dialog is up
     log_printf("[ime] ShowVirtualKeyboard ignored -- dialog already open");
     return;
@@ -221,6 +240,9 @@ void ime_pump(void) {
 static const so_default_dynlib ime_dynlib[] = {
   { "_Z27ASLPlat_ShowVirtualKeyboardPKcj", (uintptr_t)&ASLPlat_ShowVirtualKeyboard_hook },
   { "_Z32ASLPlat_IsVirtualKeyboardVisiblev", (uintptr_t)&ASLPlat_IsVirtualKeyboardVisible_hook },
+  { "SDL_StartTextInput", (uintptr_t)&SDL_StartTextInput_hook },
+  { "SDL_StopTextInput", (uintptr_t)&SDL_StopTextInput_hook },
+  { "SDL_IsTextInputActive", (uintptr_t)&SDL_IsTextInputActive_hook },
 };
 const int ime_dynlib_size = sizeof(ime_dynlib);
 const so_default_dynlib *ime_get_dynlib(void) { return ime_dynlib; }

@@ -939,7 +939,7 @@ static void *(*SndDemand_orig)(void *) = NULL;
 static void *(*StreamInit_orig)(void *) = NULL;
 static void *(*FmodCreateSound_orig)(void *, char *, int, void *, unsigned, int, int) = NULL;
 static void *(*FmodCreateStream_orig)(void *, char *, void *, int, int, int, int, int) = NULL;
-static void *(*FmodPlaySound_orig)(void *, int) = NULL;
+static void *(*FmodPlaySound_orig)(void *, int, int) = NULL;
 
 // Upstream of Demand: does the game ever ASK for a sound at all? If these two
 // stay silent, nothing below them can ever fire and the gate is higher than the
@@ -1150,10 +1150,12 @@ static int FmodInitSystem_hook(void *self, int n) {
   return FmodInitSystem_orig(self, n < want ? want : n);
 }
 
-static void *FmodPlaySound_hook(void *self, int id) {
+/* 1.0.43 adds a second argument, the "start paused" flag it used to read from
+ * the object; older builds ignore the extra register, so pass it either way. */
+static void *FmodPlaySound_hook(void *self, int id, int paused) {
   slots_attach(self);
   audio_slots_ensure_free();
-  void *rc = FmodPlaySound_orig(self, id);
+  void *rc = FmodPlaySound_orig(self, id, paused);
   g_fmod_play++; if (!rc) g_fmod_play_null++;
   return rc;
 }
@@ -1539,8 +1541,12 @@ static void install_sound_hooks(void) {
   hook_named_port("_ZN15FModAudioSystem12CreateStreamEPcP9SDL_RWopsiiiii",
                   (uintptr_t)&FmodCreateStream_probe,
                   (void **)&FmodCreateStream_orig, "FModAudioSystem::CreateStream");
-  hook_named_port("_ZN15FModAudioSystem9PlaySoundEi", (uintptr_t)&FmodPlaySound_hook,
-                  (void **)&FmodPlaySound_orig, "FModAudioSystem::PlaySound");
+  if (so_symbol(&port_mod, "_ZN15FModAudioSystem9PlaySoundEii"))  // 1.0.43
+    hook_named_port("_ZN15FModAudioSystem9PlaySoundEii", (uintptr_t)&FmodPlaySound_hook,
+                    (void **)&FmodPlaySound_orig, "FModAudioSystem::PlaySound(int,int)");
+  else
+    hook_named_port("_ZN15FModAudioSystem9PlaySoundEi", (uintptr_t)&FmodPlaySound_hook,
+                    (void **)&FmodPlaySound_orig, "FModAudioSystem::PlaySound");
   hook_named_port("_ZN15FModAudioSystem10PlayStreamEmi", (uintptr_t)&FmodPlayStream_hook,
                   (void **)&FmodPlayStream_orig, "FModAudioSystem::PlayStream");
   hook_named_port("_ZN15FModAudioSystem11StopChannelEm", (uintptr_t)&FmodStopChannel_hook,

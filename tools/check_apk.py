@@ -117,6 +117,12 @@ def pc_relative(code):
 # ------------------------------------------------------------------- report
 
 CORE = ("libKOTOR.so", "libandroid_port.so")
+
+# Symbols the loader looks up under either name, whichever the build has.
+ALTERNATIVES = (
+    {"_ZN15FModAudioSystem9PlaySoundEi",    # 1.0.10 and older
+     "_ZN15FModAudioSystem9PlaySoundEii"},  # 1.0.43: adds a start-paused flag
+)
 EXTRA = ("libminiz.so", "libLzmaLib.so")
 
 
@@ -141,7 +147,13 @@ def main(argv):
             if "armeabi" in entry:
                 names[base] = entry
     if not names:
-        print("no armeabi native libraries in %s" % os.path.basename(apk))
+        if any("/arm64-v8a/" in "/" + e for e in z.namelist()):
+            print("%s holds only 64-bit (arm64-v8a) libraries." % os.path.basename(apk))
+            print("The Vita is 32-bit and cannot run them. A 64-bit phone gets this")
+            print("from Google Play; the README says how to get the 32-bit")
+            print("split_config.armeabi_v7a.apk instead.")
+        else:
+            print("no armeabi native libraries in %s" % os.path.basename(apk))
         return 2
 
     print("APK: %s" % os.path.basename(apk))
@@ -180,8 +192,12 @@ def main(argv):
     if unresolved:
         print()
 
-    absent = sorted(s for s in referenced
-                    if not any(s in lib.defined() for lib in libs.values()))
+    def present(sym):
+        return any(sym in lib.defined() for lib in libs.values())
+    def satisfied(sym):
+        group = next((g for g in ALTERNATIVES if sym in g), {sym})
+        return any(present(alt) for alt in group)
+    absent = sorted(s for s in referenced if not satisfied(s))
     hooked = len(referenced) - len(absent)
     print("symbols the loader binds to: %d found, %d missing" % (hooked, len(absent)))
     for a in absent:

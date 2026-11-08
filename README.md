@@ -71,6 +71,7 @@ just a zip — open it with any archive tool to get at the libraries inside.
 
 | APK | Status |
 |---|---|
+| **1.0.43** (Google Play, Nov 2026) | Works with its **32-bit** libraries — tested on hardware: menus, character naming, saves, movies, gameplay |
 | **1.0.10** | Works — the version this port was built on |
 | **1.0.9 build 54** | Works — its libraries are identical to 1.0.10's |
 | **1.0.7 / 1.0.71** | Works — tested on hardware: menus, saves, movies, sound, MODS |
@@ -81,6 +82,15 @@ To tell them apart, look inside `lib/armeabi-v7a/` in the APK: if it has
 instead, it is the Amazon Underground build. With the repository checked out,
 `python3 tools/check_apk.py yourfile.apk` reports whether the loader has
 everything a given APK needs.
+
+**The libraries must be the 32-bit ones** (`lib/armeabi-v7a/`). The Vita
+cannot run 64-bit code. Older APKs carry both, but Google Play now splits
+1.0.43 by phone: a 64-bit phone downloads only `lib/arm64-v8a/`, which will
+not work. To get the 32-bit libraries, install the game through
+[Aurora Store](https://auroraoss.com) with a 32-bit device picked in its
+Spoof manager (for example *Samsung A13 5G*). The installed app then holds
+`split_config.armeabi_v7a.apk`, which has the `lib/armeabi-v7a/` folder you
+need. The `.obb` files are the same as every other version's.
 
 ---
 
