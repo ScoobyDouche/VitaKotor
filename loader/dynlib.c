@@ -36,6 +36,7 @@
 #include "config.h"
 #include "obb_index.h"
 #include "obb_cache.h"
+#include "snd_prefetch.h"
 #include "bigalloc.h"
 #include "loadscreen.h"
 
@@ -598,6 +599,7 @@ static size_t fread_diag(void *p, size_t sz, size_t n, FILE *f) {
       g_vreads++;
     }
 
+    if (got > 0) snd_prefetch_note_read(strstr(sf->path, "patch") != NULL, v->pos, p, got);
     v->pos += got;
     if (got < want) v->eof = 1;
 
@@ -808,6 +810,32 @@ static int FT_Init_FreeType_t(void *lib) {
 // Resolution order mirrors SDL_RWFromFile_hook: the VPK copy first so the font
 // always travels with the loader (hand-copying assets to the card has been
 // unreliable), then the card via fs_translate.
+/* Open a face from RAM instead of from the file. log-2026-11-15-perf-a: each
+ * new dialogue line stalled 25-220 ms inside FTFace::Glyph (FT_Load_Glyph),
+ * a handful of new glyphs at several ms each -- FreeType seeks and reads the
+ * glyph's outline from the font file every time, and that file is inside the
+ * VPK. One 856 KB read at first use makes every later glyph load pure CPU.
+ * The buffer must outlive the face, so it is kept (one font, opened once);
+ * a second open of the same path reuses it. Returns nonzero to fall back. */
+static int ft_new_face_in_ram(void *lib, const char *path, long idx, void *face) {
+  static char held_path[512];
+  static unsigned char *held;
+  static long held_size;
+  if (!held || strcmp(held_path, path)) {
+    SceUID fd = sceIoOpen(path, SCE_O_RDONLY, 0);
+    if (fd < 0) return -1;
+    long size = (long)sceIoLseek(fd, 0, SCE_SEEK_END);
+    sceIoLseek(fd, 0, SCE_SEEK_SET);
+    unsigned char *buf = (size > 0 && size < (8 << 20) && !held) ? malloc((size_t)size) : NULL;
+    int ok = buf && sceIoRead(fd, buf, (SceSize)size) == (int)size;
+    sceIoClose(fd);
+    if (!ok) { free(buf); return -1; }
+    held = buf; held_size = size;
+    snprintf(held_path, sizeof held_path, "%s", path);
+  }
+  return FT_New_Memory_Face(lib, held, held_size, idx, face);
+}
+
 static int FT_New_Face_t(void *lib, const char *path, long idx, void *face) {
   char cand[512];
   const char *slash = path ? strrchr(path, '/') : NULL;
@@ -815,6 +843,10 @@ static int FT_New_Face_t(void *lib, const char *path, long idx, void *face) {
 
   if (base) {
     snprintf(cand, sizeof cand, "app0:fonts/%s", base);
+    if (ft_new_face_in_ram(lib, cand, idx, face) == 0) {
+      log_printf("[FT] New_Face(\"%s\" -> %s) -> 0 (VPK, held in RAM)", path, cand);
+      return 0;
+    }
     int r = FT_New_Face(lib, cand, idx, face);
     if (r == 0) {
       log_printf("[FT] New_Face(\"%s\" -> %s) -> 0 (VPK)", path, cand);

@@ -498,6 +498,11 @@
 // resource cache lets go of it in between. One ring allocated at boot, so it
 // cannot fragment the heap; outputs over 2 MB (area-load textures) are not kept.
 #define LZMA_CACHE_KB (8 * 1024)
+// Sounds get their own ring so an area load's burst of textures cannot flush
+// them (it did: the same ambient was decompressed twice two minutes apart),
+// and SND_PREFETCH fills it on an idle core while the area loads.
+#define LZMA_SOUND_CACHE_KB (12 * 1024)
+#define SND_PREFETCH 1
 
 // Skip CExoIniInternal::WriteIniEntry calls that repeat a write already made
 // this session (ini_write.c). log245: entering the equip tab rewrote the whole

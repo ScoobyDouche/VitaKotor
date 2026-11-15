@@ -40,6 +40,7 @@
 #include "gxm_patcher.h"
 #include "gameprof.h"
 #include "lzma_cache.h"
+#include "snd_prefetch.h"
 #include "obb_cache.h"
 #include "threads.h"
 #include "ini_write.h"
@@ -778,8 +779,9 @@ static int LzmaUncompress_hook(unsigned char *dest, size_t *destLen,
 #if LZMA_CACHE_KB
   size_t dl_in = destLen ? *destLen : 0;
   size_t sl_in = srcLen ? *srcLen : 0;
-  uint64_t key = 0;
-  if (lzma_cache_get(&key, dest, destLen, src, srcLen, props, propsSize))
+  uint64_t key = (dest && destLen && srcLen) ? lzma_cache_key(src, sl_in, props, propsSize) : 0;
+  if (lzma_cache_get(LZMA_POOL_SOUND, key, dest, destLen, srcLen) ||
+      lzma_cache_get(LZMA_POOL_GENERAL, key, dest, destLen, srcLen))
     return 0;                                   /* SZ_OK, from the cache */
   uint64_t t0 = sceKernelGetProcessTimeWide();
 #endif
@@ -796,23 +798,33 @@ static int LzmaUncompress_hook(unsigned char *dest, size_t *destLen,
                (unsigned)(sl_in >> 10), (unsigned)(*destLen >> 10),
                sceKernelGetThreadId() == g_game_thid ? "game thread" : "other thread",
                __builtin_return_address(0));
-  if (rc == 0 && key)
-    lzma_cache_put(key, dl_in, sl_in, dest, *destLen, *srcLen);
+  if (rc == 0 && key) {
+    /* RIFF (PCM or the 58-byte fake header), a bare MP3 frame, or ID3. */
+    int audio = *destLen >= 4 && (!memcmp(dest, "RIFF", 4) || !memcmp(dest, "ID3", 3) ||
+                                  (dest[0] == 0xFF && (dest[1] & 0xE0) == 0xE0));
+    lzma_cache_put(audio ? LZMA_POOL_SOUND : LZMA_POOL_GENERAL, key, dl_in, sl_in,
+                   dest, *destLen, *srcLen);
+    if (audio && sceKernelGetThreadId() == g_game_thid)
+      snd_prefetch_learn(src, sl_in, dl_in, props, propsSize);
+  }
 #endif
   return rc;
 }
 
 static void install_lzma_cache(void) {
 #if LZMA_CACHE_KB
-  lzma_cache_init((size_t)LZMA_CACHE_KB * 1024u);
+  lzma_cache_init(LZMA_POOL_GENERAL, (size_t)LZMA_CACHE_KB * 1024u);
+  lzma_cache_init(LZMA_POOL_SOUND, (size_t)LZMA_SOUND_CACHE_KB * 1024u);
 #endif
   uintptr_t lu = so_symbol(&lzma_mod, "LzmaUncompress");
   if (!lu) { log_printf("[lzma] LzmaUncompress symbol MISSING in libLzmaLib"); return; }
   LzmaUncompress_orig = (int (*)(unsigned char *, size_t *, const unsigned char *,
                                  size_t *, const unsigned char *, size_t))
       build_thumb_trampoline(lu, thumb_patch_len(lu));
-  if (LzmaUncompress_orig) hook_thumb(lu, (uintptr_t)&LzmaUncompress_hook);
-  else log_printf("[lzma] LzmaUncompress trampoline FAILED");
+  if (LzmaUncompress_orig) {
+    hook_thumb(lu, (uintptr_t)&LzmaUncompress_hook);
+    snd_prefetch_init(LzmaUncompress_orig);
+  } else log_printf("[lzma] LzmaUncompress trampoline FAILED");
 }
 
 /* NewCAurObject instantiates every model by name; timed for the [hitch] line. */

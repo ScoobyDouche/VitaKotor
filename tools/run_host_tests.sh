@@ -21,6 +21,9 @@ build() { $CC "$@"; }
 build $STRICT -o "$OUT/test_audio_ring" tools/test_audio_ring.c loader/audio_ring.c
 run audio_ring "$OUT/test_audio_ring"
 
+build $STRICT -DLZMA_CACHE_HOST_TEST -o "$OUT/test_lzma_cache" tools/test_lzma_cache.c loader/lzma_cache.c
+run lzma_cache "$OUT/test_lzma_cache"
+
 build $STRICT -o "$OUT/test_ini" tools/test_ini.c loader/ini.c
 run ini "$OUT/test_ini"
 

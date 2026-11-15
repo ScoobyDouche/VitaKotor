@@ -38,6 +38,7 @@
 #include "gameprof.h"
 #include "srv_overlap.h"
 #include "lzma_cache.h"
+#include "snd_prefetch.h"
 #include "obb_cache.h"
 #include "gl_thread.h"
 
@@ -806,6 +807,7 @@ void gl_patch_on_swap(uint64_t swap_begin_us, uint64_t swap_end_us) {
     gameprof_window_report();
     srv_overlap_window_report();
     lzma_cache_report();
+    snd_prefetch_report();
     obb_cache_report();
     sdl_miss_cache_report();
     log_printf("[GL]   policy groups skip 0/1/3/6/10/other=%u/%u/%u/%u/%u/%u "

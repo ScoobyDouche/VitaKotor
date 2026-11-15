@@ -20,6 +20,7 @@
 
 #include "config.h"
 #include "sdl_patch.h"
+#include "snd_prefetch.h"
 #include "dynlib.h"   // g_game_threads registry (watchdog sweeps it)
 #include "threads.h"
 #include "fs_patch.h"
@@ -866,6 +867,7 @@ static SDL_RWops *SDL_RWFromFile_body(const char *fname, const char *mode, int *
     Sint64 sz = SDL_RWsize(rw);
     log_printf("[SDL] size: %s (%s) -> %lld bytes", fname, mode ? mode : "?",
                (long long)sz);
+    if (strstr(fname, "modules/") && strstr(fname, ".rim")) snd_prefetch_module(fname);
   }
   return rw;
 }
