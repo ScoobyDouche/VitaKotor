@@ -12,6 +12,9 @@
  * and has since returned to it. Read the top call sites against the
  * disassembly. Off unless swkotor.ini [Vita Options] Profile=1; it costs a few
  * instructions per call and turns the AI overlap off for the run.
+ *
+ * Profile=2 is a different tool on the same trick: it counts every call
+ * libKOTOR makes into the port layer, by function (see census_install).
  */
 #pragma once
 
@@ -20,4 +23,4 @@
 /* Point every PLT slot of both game libraries at a sampling stub and start
  * the tick thread. `game_thid` is read at each sample, so it may still be
  * unset now. Call after the ini is read and before srv_overlap_install. */
-void sampler_install(volatile SceUID *game_thid);
+void sampler_install(volatile SceUID *game_thid, int mode);

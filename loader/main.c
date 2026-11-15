@@ -1403,7 +1403,7 @@ static void read_vita_options(void) {
     if (ini_get(text, "Vita Options", "ServerOverlap", v, sizeof(v)) && v[0])
       g_srv_overlap_enabled = atoi(v) != 0;
     if (ini_get(text, "Vita Options", "Profile", v, sizeof(v)) && v[0])
-      g_profile = atoi(v) != 0;
+      g_profile = atoi(v);
     free(text);
     break;
   }
@@ -1947,7 +1947,7 @@ int main(int argc, char *argv[]) {
   read_vita_options();
   if (g_profile) {         // the sampler's stubs and the overlap's both own the
     g_srv_overlap_enabled = 0;   // call slots; a profile run goes without overlap
-    sampler_install(&g_game_thid);
+    sampler_install(&g_game_thid, g_profile);
   }
   srv_overlap_install();   // after the ini (ServerOverlap) and every body hook
   repair_sound_bias();
