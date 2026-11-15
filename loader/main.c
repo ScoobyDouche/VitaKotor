@@ -1423,9 +1423,19 @@ static void apply_frame_lock(void) {
   // needs it lifted: the two Thumb-2 immediates become 15/16 (~62 fps; vsync
   // caps the rest). At 30 or 20 the flip wait is the longer one anyway.
   if (vblanks == 1) {
-    uintptr_t cmp = kotor_mod.text_base + 0x18d0e8;   // rsbs r2, r0, #24
-    uintptr_t sub = kotor_mod.text_base + 0x18d0f6;   // rsbcs r0, r0, #25
-    const uint16_t *c = (const uint16_t *)cmp, *s = (const uint16_t *)sub;
+    // Found by pattern inside SDL_main, since each APK build puts it elsewhere
+    // (+0x1cb8 in 1.0.10, +0x1b28 in 1.0.43): rsbs r2, r0, #24, then within
+    // the next few instructions rsbcs r0, r0, #25.
+    static const uint16_t none[2] = { 0, 0 };
+    uintptr_t cmp = 0, sub = 0;
+    uintptr_t sm = so_symbol(&kotor_mod, "SDL_main") & ~(uintptr_t)1;
+    for (uintptr_t a = sm; sm && !cmp && a < sm + 0x3000; a += 2) {
+      const uint16_t *w = (const uint16_t *)a;
+      if (w[0] != 0xf1d0 || w[1] != 0x0218) continue;
+      for (int k = 2; k <= 8; k++)
+        if (w[k] == 0xf1c0 && w[k + 1] == 0x0019) { cmp = a; sub = a + 2 * k; break; }
+    }
+    const uint16_t *c = cmp ? (const uint16_t *)cmp : none, *s = sub ? (const uint16_t *)sub : none;
     if (c[0] == 0xf1d0 && c[1] == 0x0218 && s[0] == 0xf1c0 && s[1] == 0x0019) {
       uint16_t ci = 0x020f, si = 0x0010;
       kuKernelCpuUnrestrictedMemcpy((void *)(cmp + 2), &ci, 2);
@@ -1433,8 +1443,7 @@ static void apply_frame_lock(void) {
       so_flush_caches(&kotor_mod);
       log_printf("[perf] game frame limiter: 25 ms -> 16 ms (40 -> 60 fps cap)");
     } else {
-      log_printf("[perf] game frame limiter: bytes differ (%04x %04x / %04x %04x), left at 40 fps",
-                 c[0], c[1], s[0], s[1]);
+      log_printf("[perf] game frame limiter: not found in SDL_main, left at 40 fps");
     }
   }
 }

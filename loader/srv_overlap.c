@@ -242,16 +242,35 @@ static volatile int g_worker_parked;
  * provably drops the result. From the *::SetAnimationInternal family; a site
  * whose next instruction does not write r0 (0x1c8a65, 0x1c989f, the TW and
  * VisualEffect ones that test it) is left to park. */
-static const uint32_t g_defer_site_off[] = {
-  0x1c1753, 0x1c17ab,              /* CSWCAnimBase */
-  0x1c4393, 0x1c43e3,              /* CSWCAnimBaseDoor */
-  0x1c8a9f,                        /* CSWCAnimBaseTW */
-  0x1c9845, 0x1c9873, 0x1c98d1, 0x1c98fd, 0x1c9929,   /* CSWCAnimBaseWield */
+/* Sites are function-relative (return address with the Thumb bit, minus the
+ * function's even start), so one table serves every APK build: 1.0.10 and
+ * 1.0.43 place the functions differently but compile them identically. */
+static const struct { const char *sym; uint16_t off[5]; } g_defer_site_def[] = {
+  { "_ZN12CSWCAnimBase20SetAnimationInternalEP10CAurObjecttfif",      { 0x213, 0x26b } },
+  { "_ZN16CSWCAnimBaseDoor20SetAnimationInternalEP10CAurObjecttfif",  { 0x9b, 0xeb } },
+  { "_ZN14CSWCAnimBaseTW20SetAnimationInternalEP10CAurObjecttfif",    { 0xcf } },
+  { "_ZN17CSWCAnimBaseWield20SetAnimationInternalEP10CAurObjecttfif", { 0xc5, 0xf3, 0x151, 0x17d, 0x1a9 } },
 };
+static uintptr_t g_defer_site[10];
+static unsigned g_n_defer_site;
+/* Resolve the table once. A site is kept only if the instruction before it
+ * really is `blx rN`; anything else means this build compiled the function
+ * differently, and that call then parks as before. */
+static void defer_sites_resolve(void) {
+  g_n_defer_site = 0;
+  for (unsigned i = 0; i < sizeof g_defer_site_def / sizeof *g_defer_site_def; i++) {
+    uintptr_t fn = so_symbol(&kotor_mod, g_defer_site_def[i].sym) & ~(uintptr_t)1;
+    if (!fn) continue;
+    for (unsigned j = 0; j < 5 && g_defer_site_def[i].off[j]; j++) {
+      uintptr_t ret = fn + g_defer_site_def[i].off[j];
+      uint16_t insn = *(const uint16_t *)((ret & ~(uintptr_t)1) - 2);
+      if ((insn & 0xff87) == 0x4780) g_defer_site[g_n_defer_site++] = ret;
+    }
+  }
+}
 static int is_defer_site(uintptr_t lr) {
-  uint32_t off = (uint32_t)(lr - kotor_mod.text_base);
-  for (unsigned i = 0; i < sizeof g_defer_site_off / sizeof *g_defer_site_off; i++)
-    if (off == g_defer_site_off[i]) return 1;
+  for (unsigned i = 0; i < g_n_defer_site; i++)
+    if (lr == g_defer_site[i]) return 1;
   return 0;
 }
 
@@ -618,7 +637,7 @@ void srv_overlap_install(void) {
     g_stub[i].orig = keys[i].key;
     g_stub[i].flush = (uint8_t)keys[i].flush;
     /* overlap2: 2888 parks, from the SetAnimationInternal family, which drops
-     * the result at the sites in g_defer_site_off. Queue those. */
+     * the result at the sites in g_defer_site_def. Queue those. */
     if (keys[i].name && !strcmp(keys[i].name, "_ZN3Gob13PlayAnimationEPcfif"))
       g_stub[i].defer = 1;
     keys[i].stub = i;
@@ -630,6 +649,8 @@ void srv_overlap_install(void) {
   kuKernelFlushCaches(base, (size_t)nu * STUB_BYTES);
   free(buf);
   g_nstub = nu;
+
+  defer_sites_resolve();
 
   /* Pass 2: write the slots. The three wrappers first, by value. */
   g_ai_orig = (ai_fn_t)ai;
@@ -652,7 +673,7 @@ void srv_overlap_install(void) {
   free(defs);
   free(flush_addr);
   log_printf("[ov] resource lock on %u functions (%u slots); PlayAnimation queued from %u call sites",
-             n_lock_fn, n_lock, (unsigned)(sizeof g_defer_site_off / sizeof *g_defer_site_off));
+             n_lock_fn, n_lock, g_n_defer_site);
   log_printf("[ov] armed: AI tick slots=%u, render slots=%u, server-loop slots=%u; "
              "%u stubs over %u slots (%u lifecycle); worker stack %p-%p",
              n_ai, n_rs, n_sl, nu, n_slots, n_flush, (void *)g_worker_lo, (void *)g_worker_hi);
