@@ -169,7 +169,7 @@ void sampler_install(volatile SceUID *game_thid) {
     }
   }
 
-  SceUID th = sceKernelCreateThread("kotor_samp", tick_thread, 0x100000A0, 0x4000, 0,
+  SceUID th = sceKernelCreateThread("kotor_samp", tick_thread, 0x100000F0, 0x4000, 0,
                                     thread_mask(CPU_AUX_B), NULL);
   if (th < 0 || sceKernelStartThread(th, 0, NULL) < 0)
     log_printf("[samp] tick thread did not start (0x%x)", (unsigned)th);
