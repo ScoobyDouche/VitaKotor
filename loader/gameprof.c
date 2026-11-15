@@ -146,6 +146,14 @@ static hook_t g_hook[] = {
   { "_ZN7CResTPC18OnResourceServicedEv",                       "tpcServiced"  },
   { "_ZN13CSWGuiManager4DrawEf",                               "guiDraw"      },
   { "_ZN13CSWGuiManager6UpdateEf",                             "guiUpdate"    },
+  /* What a new dialogue line's 60-100 ms of guiDraw is made of: the dialogue
+   * panel filling itself, the bitmap-font string layout, or FreeType. */
+  { "_ZN10CGuiInGame15ShowDialogEntryERK10CExoStringmm",       "dlgEntry"     },
+  { "_ZN10CGuiInGame17ShowDialogRepliesEmm",                   "dlgReplies"   },
+  { "_ZN20CSWGuiInGameMessages17AddDialogMessagesEP23CGuiInGameDialogMessagem", "dlgMsgs" },
+  { "_ZN21CAurGUIStringInternal19GetIdealPixelHeightEi",       "strIdealPx"   },
+  { "_ZN21CAurGUIStringInternal14SetFontTextureEPc",           "strFontTex"   },
+  { "_ZN6FTFace5GlyphEji",                                     "ftLoad",   1  },
 #if GAME_PROF_DRAW
   /* Per-mesh split of dynGeo (log-only diagnostic; ~10 timers a draw, so it
    * costs several ms a frame itself). Only targets of at most six argument
@@ -197,9 +205,9 @@ static inline uint64_t timed(hook_t *hk, uint32_t a, uint32_t b, uint32_t c, uin
 P(0) P(1) P(2) P(3) P(4) P(5) P(6) P(7) P(8) P(9) P(10) P(11) P(12) P(14) P(15) P(16)
 P(17) P(18) P(19) P(20) P(21) P(22) P(23) P(24) P(25) P(26) P(27) P(28) P(29) P(30) P(31)
 P(32) P(33) P(34) P(35) P(36) P(37) P(38) P(39) P(40) P(41) P(42) P(43) P(44) P(45)
-P(46) P(47) P(48) P(49) P(50) P(51)
+P(46) P(47) P(48) P(49) P(50) P(51) P(52) P(53) P(54) P(55) P(56) P(57)
 #if GAME_PROF_DRAW
-P(52) P(53) P(54) P(55) P(56) P(57) P(58) P(59) P(60) P(61) P(62)
+P(58) P(59) P(60) P(61) P(62) P(63) P(64) P(65) P(66) P(67) P(68)
 #endif
 #undef P
 
@@ -233,10 +241,10 @@ static fn6_t const g_probe[] = {
   probe_25, probe_26, probe_27, probe_28, probe_29, probe_30, probe_31, probe_32,
   probe_33, probe_34, probe_35, probe_36, probe_37, probe_38, probe_39, probe_40,
   probe_41, probe_42, probe_43, probe_44, probe_45, probe_46, probe_47, probe_48,
-  probe_49, probe_50, probe_51,
+  probe_49, probe_50, probe_51, probe_52, probe_53, probe_54, probe_55, probe_56, probe_57,
 #if GAME_PROF_DRAW
-  probe_52, probe_53, probe_54, probe_55, probe_56, probe_57, probe_58, probe_59,
-  probe_60, probe_61, probe_62,
+  probe_58, probe_59, probe_60, probe_61, probe_62, probe_63, probe_64, probe_65,
+  probe_66, probe_67, probe_68,
 #endif
 };
 _Static_assert(sizeof g_probe / sizeof g_probe[0] == HOOK_N, "one probe per hook");
