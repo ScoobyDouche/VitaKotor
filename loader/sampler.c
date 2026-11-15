@@ -22,13 +22,21 @@ static volatile SceUID *g_game_thid_p;
 #define STUB_WORDS   9
 #define TICK_US      1000
 #define WINDOW_TICKS 15000         /* a report every ~15 s */
-#define TOP_SITES    60
-#define TOP_CALLEES  30
+#define TOP_SITES    500
+#define TOP_CALLEES  150
 
 typedef struct { uint32_t key, n; } Slot;
 static Slot g_site[TAB_N], g_callee[TAB_N];
 static volatile uint32_t g_flag;
 static volatile uint32_t g_samples, g_dropped;
+/* Samples by where the call site and the callee live: libKOTOR, the port
+ * layer, or neither (the loader: GL queue, libc, libm). */
+static volatile uint32_t g_cls[3][3];
+static int cls_of(uint32_t a) {
+  if (a - kotor_mod.text_base < kotor_mod.text_size) return 0;
+  if (a - port_mod.text_base < port_mod.text_size) return 1;
+  return 2;
+}
 
 static void tally(Slot *t, uint32_t key) {
   uint32_t i = (key * 2654435761u) >> 20;
@@ -47,6 +55,7 @@ __attribute__((used)) void samp_record(uint32_t lr, uint32_t target) {
   g_flag = 0;
   tally(g_site, lr);
   tally(g_callee, target);
+  g_cls[cls_of(lr)][cls_of(target)]++;
   g_samples++;
 }
 
@@ -85,11 +94,11 @@ static void report(const char *what, Slot *t, int top) {
   qsort(copy, TAB_N, sizeof *copy, by_n);
   char line[400];
   int len = 0;
-  for (int i = 0; i < top && copy[i].n; i++) {
+  for (int i = 0; i < top && copy[i].n >= 3; i++) {
     char nm[24];
     name_addr(copy[i].key, nm, sizeof nm);
     len += snprintf(line + len, sizeof line - (size_t)len, " %s:%u", nm, (unsigned)copy[i].n);
-    if (len > 300 || i == top - 1 || !copy[i + 1].n) {
+    if (len > 300 || i == top - 1 || copy[i + 1].n < 3) {
       log_printf("[samp]   %s%s", what, line);
       len = 0;
     }
@@ -108,6 +117,12 @@ static int tick_thread(SceSize args, void *argp) {
     g_samples = 0; g_dropped = 0;
     log_printf("[samp] window %u: %u samples in %u ticks (%u not tallied: table full)",
                ++window, (unsigned)n, WINDOW_TICKS, (unsigned)d);
+    log_printf("[samp]   from libKOTOR -> libKOTOR %u, port %u, loader %u | from port -> libKOTOR %u, "
+               "port %u, loader %u | from loader -> %u/%u/%u",
+               (unsigned)g_cls[0][0], (unsigned)g_cls[0][1], (unsigned)g_cls[0][2],
+               (unsigned)g_cls[1][0], (unsigned)g_cls[1][1], (unsigned)g_cls[1][2],
+               (unsigned)g_cls[2][0], (unsigned)g_cls[2][1], (unsigned)g_cls[2][2]);
+    memset((void *)g_cls, 0, sizeof g_cls);
     report("site", g_site, TOP_SITES);
     report("callee", g_callee, TOP_CALLEES);
   }
