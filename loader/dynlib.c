@@ -49,6 +49,10 @@ int ret1(void) { return 1; }
 // routes the message to our log -- miniz only fprintf()s on error paths, but a
 // real fprintf on a bogus FILE* would fault.
 char __sF[0x400];
+/* A pointer into __sF is one of bionic's std streams, not a newlib FILE. */
+static int is_bionic_std(const void *f) {
+  return (const char *)f >= __sF && (const char *)f < __sF + sizeof(__sF);
+}
 static int fprintf_safe(void *stream, const char *fmt, ...) {
   (void)stream;
   char buf[512];
@@ -626,7 +630,7 @@ static void rewind_diag(FILE *f) {
   if (v) { v->pos = 0; v->eof = v->err = 0; return; }
   if (f) rewind(f);
 }
-static int fflush_diag(FILE *f) { if (vf_of(f)) return 0; return f ? fflush(f) : 0; }
+static int fflush_diag(FILE *f) { if (vf_of(f) || is_bionic_std(f)) return 0; return f ? fflush(f) : 0; }
 /* Virtual archive handles are backed by a SceUID, not a newlib FILE*; hand
  * that back. Nothing in the .so does more than test it for validity. */
 static int fileno_diag(FILE *f) { VFile *v = vf_of(f); if (v) return (int)v->sf->fd; return f ? fileno(f) : -1; }
@@ -636,13 +640,18 @@ static int setvbuf_diag(FILE *f, char *b, int m, size_t n) {
 }
 static size_t fwrite_diag(const void *p, size_t sz, size_t n, FILE *f) {
   if (vf_of(f)) { log_printf("[io] fwrite to a read-only archive REFUSED"); return 0; }
+  if (is_bionic_std(f)) {
+    if (p) log_printf("[stdio] %.*s", (int)(sz * n), (const char *)p);
+    return n;
+  }
   return (f && p) ? fwrite(p, sz, n, f) : 0;
 }
 static int fputs_diag(const char *str, FILE *f) {
   if (vf_of(f)) return -1;
+  if (is_bionic_std(f)) { if (str) log_printf("[stdio] %s", str); return 0; }
   return (f && str) ? fputs(str, f) : -1;
 }
-static int fputc_diag(int c, FILE *f) { if (vf_of(f)) return -1; return f ? fputc(c, f) : -1; }
+static int fputc_diag(int c, FILE *f) { if (vf_of(f)) return -1; if (is_bionic_std(f)) return c & 0xff; return f ? fputc(c, f) : -1; }
 static int fgetc_diag(FILE *f) {
   VFile *v = vf_of(f);
   if (v) { unsigned char c; return fread_diag(&c, 1, 1, f) == 1 ? (int)c : -1; }
@@ -835,6 +844,142 @@ static int FT_Load_Glyph_t(void *face, unsigned gi, int flags) {
   static int once = 0;
   if (!once) { once = 1; log_printf("[FT] Load_Glyph(gi=%u flags=0x%x) -> %d (first)", gi, flags, r); }
   return r;
+}
+
+/* ---- the 1.0.43 APK's newer-NDK imports ------------------------------------
+ * Play's 1.0.43 was rebuilt with a newer NDK: _FORTIFY_SOURCE turns string and
+ * memory calls into their __*_chk forms, libandroid_port now carries libc++
+ * with its locale and wide-character layer, and newer bionic exports `stderr`
+ * as a variable. None of these are imported by 1.0.10 or 1.0.71. */
+
+/* Android aborts on a failed check; do the same, but say which one first. */
+static void chk_fail(const char *fn, size_t need, size_t have) {
+  log_printf("[libc] %s overflow: %u bytes into a %u-byte buffer -- aborting",
+             fn, (unsigned)need, (unsigned)have);
+  abort();
+}
+static void *memcpy_chk(void *d, const void *s, size_t n, size_t dl) {
+  if (n > dl) chk_fail("__memcpy_chk", n, dl);
+  return sceClibMemcpy(d, s, n);
+}
+static void *memmove_chk(void *d, const void *s, size_t n, size_t dl) {
+  if (n > dl) chk_fail("__memmove_chk", n, dl);
+  return sceClibMemmove(d, s, n);
+}
+static void *memset_chk(void *d, int c, size_t n, size_t dl) {
+  if (n > dl) chk_fail("__memset_chk", n, dl);
+  return memset(d, c, n);
+}
+static char *strcat_chk(char *d, const char *s, size_t dl) {
+  size_t need = strlen(d) + strlen(s) + 1;
+  if (need > dl) chk_fail("__strcat_chk", need, dl);
+  return strcat(d, s);
+}
+static char *strcpy_chk(char *d, const char *s, size_t dl) {
+  size_t need = strlen(s) + 1;
+  if (need > dl) chk_fail("__strcpy_chk", need, dl);
+  return strcpy(d, s);
+}
+static char *strncpy_chk(char *d, const char *s, size_t n, size_t dl) {
+  if (n > dl) chk_fail("__strncpy_chk", n, dl);
+  return strncpy(d, s, n);
+}
+static char *strncpy_chk2(char *d, const char *s, size_t n, size_t dl, size_t sl) {
+  (void)sl;
+  if (n > dl) chk_fail("__strncpy_chk2", n, dl);
+  return strncpy(d, s, n);
+}
+static char *strchr_chk(const char *s, int c, size_t sl) { (void)sl; return strchr(s, c); }
+static size_t strlen_chk(const char *s, size_t sl) {
+  size_t n = strlen(s);
+  if (n >= sl) chk_fail("__strlen_chk", n + 1, sl);
+  return n;
+}
+static int vsnprintf_chk(char *b, size_t len, int flags, size_t sl, const char *fmt, va_list ap) {
+  (void)flags;
+  if (len > sl) chk_fail("__vsnprintf_chk", len, sl);
+  return vsnprintf(b, len, fmt, ap);
+}
+static int vsprintf_chk(char *b, int flags, size_t sl, const char *fmt, va_list ap) {
+  (void)flags;
+  int n = vsnprintf(b, sl, fmt, ap);
+  if (n >= 0 && (size_t)n >= sl) chk_fail("__vsprintf_chk", (size_t)n + 1, sl);
+  return n;
+}
+
+/* bionic's stdio streams: stderr is &__sF[2] and its FILE is 84 bytes. The
+ * newer NDK reads it through an exported `FILE *stderr` variable instead of
+ * computing the address, so give that variable something to point at. */
+static void *bionic_stderr = __sF + 2 * 84;
+
+/* Locale: KOTOR only ever runs in "C", and libc++ only needs a handle it can
+ * pass back to the *_l functions. bionic's locale_t is an opaque pointer. */
+static int g_c_locale;
+static const char *setlocale_c(int cat, const char *name) { (void)cat; (void)name; return "C"; }
+static void *newlocale_c(int mask, const char *name, void *base) {
+  (void)mask; (void)name; (void)base; return &g_c_locale;
+}
+static void freelocale_c(void *l) { (void)l; }
+static void *uselocale_c(void *l) { (void)l; return &g_c_locale; }
+/* bionic's struct lconv: ten strings, then fourteen chars. */
+static struct {
+  const char *s[10];
+  char c[14];
+} g_bionic_lconv = {
+  { ".", "", "", "", "", "", "", "", "", "" },
+  { 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127 },
+};
+static void *localeconv_c(void) { return &g_bionic_lconv; }
+/* long double is a double on 32-bit ARM Android, returned softfp in r0:r1. */
+static uint64_t sfp_strtold_l(const char *s, char **e, void *l) { (void)l; return d2u(strtod(s, e)); }
+static long long strtoll_l_c(const char *s, char **e, int b, void *l) { (void)l; return strtoll(s, e, b); }
+static unsigned long long strtoull_l_c(const char *s, char **e, int b, void *l) { (void)l; return strtoull(s, e, b); }
+static uint64_t sfp_wcstod(const wchar_t *s, wchar_t **e) { return d2u(wcstod(s, e)); }
+static uint32_t sfp_wcstof(const wchar_t *s, wchar_t **e) { return f2u(wcstof(s, e)); }
+
+/* Multibyte <-> wide in the C locale: one byte is one character. bionic's
+ * mbstate_t is 4 bytes and newlib's is 8, so the newlib versions would write
+ * past the caller's state; these never touch it. */
+static size_t mbrtowc_c(wchar_t *pwc, const char *s, size_t n, void *ps) {
+  (void)ps;
+  if (!s) return 0;
+  if (!n) return (size_t)-2;
+  wchar_t wc = (unsigned char)*s;
+  if (pwc) *pwc = wc;
+  return wc ? 1 : 0;
+}
+static size_t wcrtomb_c(char *s, wchar_t wc, void *ps) {
+  (void)ps;
+  if (!s) return 1;
+  if ((unsigned)wc > 0xff) { errno = EILSEQ; return (size_t)-1; }
+  *s = (char)wc;
+  return 1;
+}
+static size_t mbsnrtowcs_c(wchar_t *dst, const char **src, size_t nms, size_t len, void *ps) {
+  (void)ps;
+  const unsigned char *s = (const unsigned char *)*src;
+  size_t i = 0;
+  for (; i < nms && (!dst || i < len); i++) {
+    if (dst) dst[i] = s[i];
+    if (!s[i]) { if (dst) *src = NULL; return i; }
+  }
+  if (dst) *src = (const char *)s + i;
+  return i;
+}
+static size_t mbsrtowcs_c(wchar_t *dst, const char **src, size_t len, void *ps) {
+  return mbsnrtowcs_c(dst, src, (size_t)-1, len, ps);
+}
+static size_t wcsnrtombs_c(char *dst, const wchar_t **src, size_t nwc, size_t len, void *ps) {
+  (void)ps;
+  const wchar_t *s = *src;
+  size_t i = 0;
+  for (; i < nwc && (!dst || i < len); i++) {
+    if ((unsigned)s[i] > 0xff) { errno = EILSEQ; if (dst) *src = s + i; return (size_t)-1; }
+    if (dst) dst[i] = (char)s[i];
+    if (!s[i]) { if (dst) *src = NULL; return i; }
+  }
+  if (dst) *src = s + i;
+  return i;
 }
 
 so_default_dynlib default_dynlib[] = {
@@ -1033,6 +1178,33 @@ so_default_dynlib default_dynlib[] = {
   { "FT_Render_Glyph", (uintptr_t)&FT_Render_Glyph }, { "FT_Get_Kerning", (uintptr_t)&FT_Get_Kerning },
   { "FT_Select_Charmap", (uintptr_t)&FT_Select_Charmap }, { "FT_Set_Charmap", (uintptr_t)&FT_Set_Charmap },
   { "FT_Outline_Get_CBox", (uintptr_t)&FT_Outline_Get_CBox },
+
+  // ============ 1.0.43: fortified libc (newer NDK _FORTIFY_SOURCE) ============
+  { "__memcpy_chk", (uintptr_t)&memcpy_chk }, { "__memmove_chk", (uintptr_t)&memmove_chk },
+  { "__memset_chk", (uintptr_t)&memset_chk }, { "__strcat_chk", (uintptr_t)&strcat_chk },
+  { "__strchr_chk", (uintptr_t)&strchr_chk }, { "__strcpy_chk", (uintptr_t)&strcpy_chk },
+  { "__strlen_chk", (uintptr_t)&strlen_chk }, { "__strncpy_chk", (uintptr_t)&strncpy_chk },
+  { "__strncpy_chk2", (uintptr_t)&strncpy_chk2 },
+  { "__vsnprintf_chk", (uintptr_t)&vsnprintf_chk }, { "__vsprintf_chk", (uintptr_t)&vsprintf_chk },
+  { "__register_atfork", (uintptr_t)&ret0 },
+  { "stderr", (uintptr_t)&bionic_stderr },
+
+  // ============ 1.0.43: libc++ locale + wide-char layer ============
+  { "setlocale", (uintptr_t)&setlocale_c }, { "newlocale", (uintptr_t)&newlocale_c },
+  { "freelocale", (uintptr_t)&freelocale_c }, { "uselocale", (uintptr_t)&uselocale_c },
+  { "localeconv", (uintptr_t)&localeconv_c },
+  { "strtold_l", (uintptr_t)&sfp_strtold_l }, { "strtoll_l", (uintptr_t)&strtoll_l_c },
+  { "strtoull_l", (uintptr_t)&strtoull_l_c },
+  { "mbrtowc", (uintptr_t)&mbrtowc_c }, { "wcrtomb", (uintptr_t)&wcrtomb_c },
+  { "mbsrtowcs", (uintptr_t)&mbsrtowcs_c }, { "mbsnrtowcs", (uintptr_t)&mbsnrtowcs_c },
+  { "wcsnrtombs", (uintptr_t)&wcsnrtombs_c },
+  { "wcstod", (uintptr_t)&sfp_wcstod }, { "wcstof", (uintptr_t)&sfp_wcstof },
+  { "wcstol", (uintptr_t)&wcstol }, { "wcstoll", (uintptr_t)&wcstoll },
+  { "wcstoul", (uintptr_t)&wcstoul }, { "wcstoull", (uintptr_t)&wcstoull },
+  { "wcslen", (uintptr_t)&wcslen }, { "wcsncmp", (uintptr_t)&wcsncmp },
+  { "wmemchr", (uintptr_t)&wmemchr }, { "wmemcmp", (uintptr_t)&wmemcmp },
+  { "wmemcpy", (uintptr_t)&wmemcpy }, { "wmemmove", (uintptr_t)&wmemmove },
+  { "wmemset", (uintptr_t)&wmemset }, { "swprintf", (uintptr_t)&swprintf },
 };
 
 const int default_dynlib_size = sizeof(default_dynlib);

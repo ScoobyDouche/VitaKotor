@@ -949,8 +949,15 @@ static const so_default_dynlib sdl_dynlib[] = {
   { "SDL_JoystickClose",           (uintptr_t)&SDL_JoystickClose },
   { "SDL_JoystickGetAttached",     (uintptr_t)&SDL_JoystickGetAttached },
   { "SDL_JoystickInstanceID",      (uintptr_t)&SDL_JoystickInstanceID },
-  { "SDL_StartTextInput",          (uintptr_t)&SDL_StartTextInput },
-  { "SDL_StopTextInput",           (uintptr_t)&SDL_StopTextInput },
+  // SDL_Start/StopTextInput: ime_patch.c, which tracks the state for 1.0.43
+  // 1.0.43's newer SDL headers turned the SDL_RW* macros into calls. Same
+  // SDL_RWops layout, so native SDL2's versions do what the macros did.
+  { "SDL_RWsize",                  (uintptr_t)&SDL_RWsize },
+  { "SDL_RWseek",                  (uintptr_t)&SDL_RWseek },
+  { "SDL_RWtell",                  (uintptr_t)&SDL_RWtell },
+  { "SDL_RWread",                  (uintptr_t)&SDL_RWread },
+  { "SDL_RWwrite",                 (uintptr_t)&SDL_RWwrite },
+  { "SDL_RWclose",                 (uintptr_t)&SDL_RWclose },
   // file IO (translate Android paths)
   { "SDL_RWFromFile",              (uintptr_t)&SDL_RWFromFile_hook },
   // RWops alloc/free: ObbFile::RWFromFile builds a custom RWops (its own
