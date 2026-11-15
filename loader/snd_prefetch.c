@@ -31,7 +31,7 @@
 #if SND_PREFETCH && LZMA_SOUND_CACHE_KB
 
 #define SPF_PATH    DATA_PATH "/sndprefetch.dat"
-#define SPF_MAGIC   0x31465053u   /* "SPF1" */
+#define SPF_MAGIC   0x32465053u   /* "SPF2": records carry the read range */
 #define SPF_MAX     4096
 #define SPF_MAX_SRC (2u * 1024u * 1024u)
 #define SPF_MAX_DST (2u * 1024u * 1024u)
@@ -45,7 +45,20 @@ typedef struct {
   uint8_t  props[5];
   uint16_t pad;
   uint32_t off, src_len, dst_len;
+  uint32_t read_off, read_len;   /* the game's own fread that held the input */
 } Rec;
+
+/* The compressed bytes of the current module's sounds, as the game will read
+ * them. A cache hit still cost 20-30 ms (log perf-c) because the game re-reads
+ * the 150-600 KB file from the card before LzmaUncompress is even called;
+ * answering that read from here leaves a memcpy. One block, taken at boot. */
+#define SPF_STORE_BYTES (4u * 1024u * 1024u)
+#define SPF_STORE_N     256
+typedef struct { uint8_t which; uint32_t off, len, at; } Held;
+static unsigned char *g_store;
+static uint32_t g_store_used;
+static Held     g_held[SPF_STORE_N];
+static unsigned g_nheld, g_served;
 
 typedef struct { int which; long off, len; const unsigned char *buf; } ReadNote;
 
@@ -69,6 +82,23 @@ void snd_prefetch_note_read(int which, long off, const void *buf, long len) {
   ReadNote *n = &g_note[g_note_i++ & 3];
   n->which = which; n->off = off; n->len = len; n->buf = (const unsigned char *)buf;
   unlock();
+}
+
+int snd_prefetch_serve(int which, long off, void *buf, long len) {
+  if (!g_nheld) return 0;
+  int hit = 0;
+  lock();
+  for (unsigned i = 0; i < g_nheld; i++) {
+    const Held *h = &g_held[i];
+    if (h->off == (uint32_t)off && h->len == (uint32_t)len && h->which == which) {
+      memcpy(buf, g_store + h->at, (size_t)len);
+      g_served++;
+      hit = 1;
+      break;
+    }
+  }
+  unlock();
+  return hit;
 }
 
 void snd_prefetch_learn(const unsigned char *src, size_t src_len, size_t dst_len,
@@ -102,6 +132,10 @@ void snd_prefetch_learn(const unsigned char *src, size_t src_len, size_t dst_len
     r->which = (uint8_t)hit->which;
     memcpy(r->props, props, 5);
     r->off = off; r->src_len = (uint32_t)src_len; r->dst_len = (uint32_t)dst_len;
+    r->read_off = (uint32_t)hit->off; r->read_len = (uint32_t)hit->len;
+    if (r->read_len > SPF_MAX_SRC) {      /* part of a huge read: fetch just the input */
+      r->read_off = off; r->read_len = (uint32_t)src_len;
+    }
     g_dirty = 1;
     g_learned++;
   }
@@ -158,7 +192,7 @@ static void load_file(void) {
 static void replay(void) {
   static Rec todo[256];
   unsigned n = 0, gen;
-  uint32_t max_src = 0, max_dst = 0;
+  uint32_t max_read = 0, max_dst = 0;
   char mod[16];
   lock();
   gen = g_gen;
@@ -166,30 +200,48 @@ static void replay(void) {
   for (unsigned i = 0; i < g_nrec && n < 256; i++)
     if (!strcmp(g_rec[i].mod, mod)) {
       todo[n++] = g_rec[i];
-      if (g_rec[i].src_len > max_src) max_src = g_rec[i].src_len;
+      if (g_rec[i].read_len > max_read) max_read = g_rec[i].read_len;
       if (g_rec[i].dst_len > max_dst) max_dst = g_rec[i].dst_len;
     }
   unlock();
   if (!n || !g_decode) return;
 
-  unsigned char *src = (unsigned char *)malloc(max_src);
+  lock();                       /* the last module's reads are no use now */
+  g_nheld = 0;
+  g_store_used = 0;
+  unlock();
+
+  unsigned char *src = (unsigned char *)malloc(max_read);
   unsigned char *dst = (unsigned char *)malloc(max_dst);
   SceUID fd[2] = { -1, -1 };
-  unsigned done = 0, had = 0, failed = 0;
+  unsigned done = 0, had = 0, failed = 0, kept = 0;
   size_t total = 0;
   uint64_t t0 = sceKernelGetProcessTimeWide();
   for (unsigned i = 0; src && dst && i < n && g_gen == gen && total < SPF_BUDGET; i++) {
     const Rec *r = &todo[i];
     int w = r->which ? 1 : 0;
+    uint32_t in = r->off - r->read_off;          /* input's place inside the read */
+    if (r->off < r->read_off || in + r->src_len > r->read_len) { failed++; continue; }
     if (fd[w] < 0) fd[w] = sceIoOpen(w ? OBB_PATCH_PATH : OBB_MAIN_PATH, SCE_O_RDONLY, 0);
     if (fd[w] < 0 ||
-        sceIoPread(fd[w], src, r->src_len, (SceOff)r->off) != (int)r->src_len) { failed++; continue; }
-    uint64_t key = lzma_cache_key(src, r->src_len, r->props, 5);
+        sceIoPread(fd[w], src, r->read_len, (SceOff)r->read_off) != (int)r->read_len) { failed++; continue; }
+    lock();
+    if (g_gen == gen && g_store && g_nheld < SPF_STORE_N &&
+        g_store_used + r->read_len <= SPF_STORE_BYTES) {
+      Held *h = &g_held[g_nheld];
+      h->which = (uint8_t)w; h->off = r->read_off; h->len = r->read_len; h->at = g_store_used;
+      memcpy(g_store + g_store_used, src, r->read_len);
+      g_store_used += r->read_len;
+      g_nheld++;
+      kept++;
+    }
+    unlock();
+    uint64_t key = lzma_cache_key(src + in, r->src_len, r->props, 5);
     if (lzma_cache_has(LZMA_POOL_SOUND, key, r->dst_len, r->src_len)) {
       had++; total += r->dst_len; continue;
     }
     size_t dl = r->dst_len, sl = r->src_len;
-    if (g_decode(dst, &dl, src, &sl, r->props, 5) != 0 || !dl) { failed++; continue; }
+    if (g_decode(dst, &dl, src + in, &sl, r->props, 5) != 0 || !dl) { failed++; continue; }
     lzma_cache_put(LZMA_POOL_SOUND, key, r->dst_len, r->src_len, dst, dl, sl);
     total += dl;
     done++;
@@ -200,8 +252,8 @@ static void replay(void) {
   free(src);
   free(dst);
   log_printf("[sndpf] %s: %u sounds known, %u decompressed ahead (%u KB), %u already held, "
-             "%u failed, %u ms on the worker%s",
-             mod, n, done, (unsigned)(total >> 10), had, failed,
+             "%u failed, %u reads kept in RAM (%u KB), %u ms on the worker%s",
+             mod, n, done, (unsigned)(total >> 10), had, failed, kept, (unsigned)(g_store_used >> 10),
              (unsigned)((sceKernelGetProcessTimeWide() - t0) / 1000),
              g_gen != gen ? " (cut short: another module opened)" : "");
 }
@@ -220,6 +272,7 @@ void snd_prefetch_init(snd_prefetch_decode_fn decode) {
   if (g_rec) return;
   g_decode = decode;
   g_rec = (Rec *)malloc(SPF_MAX * sizeof(Rec));
+  g_store = (unsigned char *)malloc(SPF_STORE_BYTES);   /* optional: NULL = reads stay on the card */
   g_mtx = sceKernelCreateMutex("kotor_sndpf", 0, 0, NULL);
   g_wake = sceKernelCreateSema("kotor_sndpf_wake", 0, 0, 16, NULL);
   if (!g_rec || g_mtx < 0 || g_wake < 0) { free(g_rec); g_rec = NULL; return; }
@@ -237,11 +290,12 @@ void snd_prefetch_init(snd_prefetch_decode_fn decode) {
 }
 
 void snd_prefetch_report(void) {
-  static unsigned last;
-  if (!g_rec || g_learned == last) return;
-  last = g_learned;
-  log_printf("[sndpf] learned %u new sounds this session (%u could not be placed), %u known",
-             g_learned, g_unlocated, g_nrec);
+  static unsigned last, last_served;
+  if (!g_rec || (g_learned == last && g_served == last_served)) return;
+  last = g_learned; last_served = g_served;
+  log_printf("[sndpf] learned %u new sounds this session (%u could not be placed), %u known; "
+             "%u sound reads answered from RAM",
+             g_learned, g_unlocated, g_nrec, g_served);
 }
 
 #else
@@ -249,6 +303,9 @@ void snd_prefetch_report(void) {
 void snd_prefetch_init(snd_prefetch_decode_fn decode) { (void)decode; }
 void snd_prefetch_note_read(int which, long off, const void *buf, long len) {
   (void)which; (void)off; (void)buf; (void)len;
+}
+int snd_prefetch_serve(int which, long off, void *buf, long len) {
+  (void)which; (void)off; (void)buf; (void)len; return 0;
 }
 void snd_prefetch_learn(const unsigned char *src, size_t src_len, size_t dst_len,
                         const unsigned char *props, size_t props_size) {

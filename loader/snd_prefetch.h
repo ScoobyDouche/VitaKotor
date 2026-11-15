@@ -24,6 +24,10 @@ void snd_prefetch_init(snd_prefetch_decode_fn decode);
 /* An OBB read just landed `len` bytes from archive offset `off` in `buf`. */
 void snd_prefetch_note_read(int which, long off, const void *buf, long len);
 
+/* If this exact read is one of the current module's sounds, fill `buf` from
+ * RAM and return 1; the card is not touched. */
+int snd_prefetch_serve(int which, long off, void *buf, long len);
+
 /* A cache miss whose output was audio: remember where its input came from. */
 void snd_prefetch_learn(const unsigned char *src, size_t src_len, size_t dst_len,
                         const unsigned char *props, size_t props_size);

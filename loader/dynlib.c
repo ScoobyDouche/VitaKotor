@@ -579,6 +579,10 @@ static size_t fread_diag(void *p, size_t sz, size_t n, FILE *f) {
     if (obbidx_serve(sf->idx, v->pos, p, want)) {
       got = want;
       g_vhits++;
+    } else if (snd_prefetch_serve(strstr(sf->path, "patch") != NULL, v->pos, p, want)) {
+      /* 1a. A sound the prefetcher read while this area loaded. */
+      got = want;
+      g_vcache_hits++;
     } else if (obb_cache_get(sf->cache_id, v->pos, want, p)) {
       /* 1b. Recently read in game: the equipment preview re-reads the same
        *     textures on every hover. */
