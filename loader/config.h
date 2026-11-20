@@ -164,6 +164,14 @@
 // the first thing to rule out if a boot regresses.
 #define LOADSCREEN_ART            1
 
+// After the game issues its first GL (~4 s into a warm boot) the art can no
+// longer be redrawn, and a still picture for the remaining ~20 s looked like a
+// hang. With this on, the bar alone keeps filling: scissor+clear over the art
+// already sitting in every display buffer, with the game's scissor and clear
+// state put back and nothing drawn while one of its framebuffers is bound.
+// Set to 0 to go back to the still frame.
+#define LOADSCREEN_BAR_AFTER_FREEZE 1
+
 // Bar geometry in the ART's own pixels, not loadscreen.gui's.
 //
 // The first attempt used PB_PROGRESS's extent from loadscreen.gui (LEFT 380,

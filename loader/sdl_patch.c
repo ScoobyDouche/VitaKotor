@@ -28,6 +28,7 @@
 #include "gl_patch.h"
 #include "gl_thread.h"
 #include "ime_patch.h"
+#include "loadscreen.h"
 #include "input_patch.h"
 #include "so_util.h"
 #include "translation.h"
@@ -524,6 +525,7 @@ static int poll_one(SDL_Event *e);
 
 static int SDL_PollEvent_hook(SDL_Event *e) {
   int r;
+  loadscreen_game_loop_started();   /* no-op after the first call */
   if (!e) return poll_one(e);
   while ((r = poll_one(e)) && dpad_guard(e))
     ;

@@ -33,6 +33,7 @@ static uint64_t g_last   = 0;
 static uint64_t g_expect = 0;    /* us this boot is predicted to take */
 static int      g_game_gl = 0;   /* the game has started issuing GL of its own */
 static int      g_art     = 0;   /* the art loaded, so the freeze applies */
+static int      g_loop    = 0;   /* the game's main loop is running: hands off */
 #if LOADSCREEN_ART
 static GLuint   g_tex    = 0;    /* background art, 0 when we never got any */
 static GLuint   g_logo   = 0;
@@ -322,6 +323,41 @@ static void art_draw(float frac) {
 }
 #endif  /* LOADSCREEN_ART */
 
+#if LOADSCREEN_ART && LOADSCREEN_BAR_AFTER_FREEZE
+/* After the freeze: move the bar and nothing else.
+ *
+ * This runs inside the game's own GL calls, so it may use only what the plain
+ * bar always did there -- scissor+clear and a swap -- and must hand back the
+ * scissor and clear state it found. Every display buffer still holds the full
+ * art from the frames drawn before the freeze (no scene clears it), and the bar
+ * only ever grows, so filling [0, w) on whichever buffer is next is enough.
+ * Skipped while the game has a framebuffer object bound: the clear would land
+ * in its FBO, and the swap would end a scene the game is still building. */
+static void bar_only(float frac) {
+  GLint fb = 0;
+  glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fb);
+  if (fb) return;
+
+  GLboolean sc = glIsEnabled(GL_SCISSOR_TEST);
+  GLint box[4];
+  GLfloat cc[4];
+  glGetIntegerv(GL_SCISSOR_BOX, box);
+  glGetFloatv(GL_COLOR_CLEAR_VALUE, cc);
+
+  int bx = ART_SX(ART_BAR_X);
+  int bw = ART_SX(ART_BAR_W);
+  int bh = ART_SY(ART_BAR_H);
+  int by = SCREEN_H - ART_SY(ART_BAR_Y) - bh;
+  int w = (int)(bw * frac);
+  if (w > 0) fill(bx, by, w, bh, BAR_R, BAR_G, BAR_B);
+  vglSwapBuffers(GL_FALSE);
+
+  glScissor(box[0], box[1], box[2], box[3]);
+  if (sc) glEnable(GL_SCISSOR_TEST); else glDisable(GL_SCISSOR_TEST);
+  glClearColor(cc[0], cc[1], cc[2], cc[3]);
+}
+#endif
+
 static void draw(float frac) {
   if (frac < 0.0f) frac = 0.0f;
   if (frac > 1.0f) frac = 1.0f;
@@ -410,8 +446,10 @@ void loadscreen_note_gl(void) {
     unsigned ms = (unsigned)((now - g_t0) / 1000);
     if (g_art)
       log_printf("[loadscreen] frozen at %u.%03us -- the game has begun issuing "
-                 "GL, so the art stops here and the last frame stays on screen",
-                 ms / 1000, ms % 1000);
+                 "GL, so the art stops here; %s",
+                 ms / 1000, ms % 1000,
+                 LOADSCREEN_BAR_AFTER_FREEZE ? "the bar keeps filling over it"
+                                             : "the last frame stays on screen");
     else
       log_printf("[loadscreen] game began issuing GL at %u.%03us (plain bar, "
                  "keeps drawing)", ms / 1000, ms % 1000);
@@ -438,7 +476,9 @@ void loadscreen_note_gl(void) {
 void loadscreen_tick(void) {
 #if LOADSCREEN_ENABLE
   if (!g_active || g_busy) return;
+#if !(LOADSCREEN_ART && LOADSCREEN_BAR_AFTER_FREEZE)
   if (g_art && g_game_gl) return;   /* frozen: see loadscreen.h */
+#endif
   if (sceKernelGetThreadId() != g_owner) return;    /* never GL off-thread */
 
   uint64_t now = sceKernelGetProcessTimeWide();
@@ -451,7 +491,31 @@ void loadscreen_tick(void) {
   float f = g_expect ? (float)(now - g_t0) / (float)g_expect : 0.0f;
   if (f > 0.99f) f = 0.99f;
 
-  g_busy = 1; draw(f); g_busy = 0;
+  g_busy = 1;
+#if LOADSCREEN_ART && LOADSCREEN_BAR_AFTER_FREEZE
+  if (g_art && g_game_gl) {
+    if (!g_loop) bar_only(f);   /* frozen art: only the bar moves */
+  }
+  else
+#endif
+    draw(f);
+  g_busy = 0;
+#endif
+}
+
+/* log-2026-11-20-loadbar-a: the game's main loop starts ~3 s before its first
+ * draw (music at the same moment) and clears the default framebuffer every
+ * frame meanwhile. Swapping the bar in then presented those cleared buffers,
+ * so the art flashed black. From here on the bar stays where it is. */
+void loadscreen_game_loop_started(void) {
+#if LOADSCREEN_ENABLE
+  if (g_loop || !g_active) return;
+  g_loop = 1;
+  if (g_art && g_game_gl) {
+    unsigned ms = (unsigned)((sceKernelGetProcessTimeWide() - g_t0) / 1000);
+    log_printf("[loadscreen] game loop running at %u.%03us -- bar stops, art holds",
+               ms / 1000, ms % 1000);
+  }
 #endif
 }
 

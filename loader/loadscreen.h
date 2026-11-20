@@ -39,7 +39,11 @@
  * of its own. The last swapped frame stays on screen -- a still loading screen,
  * which is the right picture with a stopped bar -- and from then on the tick
  * only records what the game had bound, for whoever tries to keep drawing for
- * the whole boot later. */
+ * the whole boot later.
+ *
+ * A still frame for the remaining ~20 s read as a hang, so with
+ * LOADSCREEN_BAR_AFTER_FREEZE the bar alone keeps filling after the freeze,
+ * drawn the one way that is safe there (scissor+clear, game state restored). */
 
 #ifndef __LOADSCREEN_H__
 #define __LOADSCREEN_H__
@@ -51,6 +55,10 @@ void loadscreen_begin(int warm);
 /* Draw a frame if due. Cheap, throttled, safe to call from any hot path; it
  * no-ops off-thread, before begin, and after end. */
 void loadscreen_tick(void);
+
+/* The game has begun polling SDL events (its main loop runs; it clears the
+ * screen each frame before it ever draws). Stops the post-freeze bar. */
+void loadscreen_game_loop_started(void);
 
 /* Hand the screen to the game. Called from the first draw call. Records how
  * long this boot actually took, so the next one estimates better. */
