@@ -35,7 +35,7 @@ few rough edges. One rare crash has been seen, and no save has been lost. See
 
 | | |
 |---|---|
-| Startup | ~2 min on first launch, then under a minute |
+| Startup | ~2 min on first launch, then about 30 seconds |
 | Area loads | Under a second to load; the loading screen then stays up 15–20 s while textures upload |
 | Frame rate | Locked to 30 fps; holds it in most areas with Grass, Shadows and Frame Buffer off (see [Graphics settings](#graphics-settings)); dense scenes dip to ~20 |
 | Playthrough | Completed start to finish, unmodded |
@@ -118,9 +118,9 @@ need. The `.obb` files are the same as every other version's.
 
 5. **Launch it.** The **first** boot takes around two minutes: it reads through
    the 2.1 GB archive and records what it needed into `main.obb.idx` beside it.
-   Every boot after that reuses the recording and reaches the game in under a
-   minute. A progress bar is on screen throughout, so you can tell it is
-   working rather than hung.
+   Every boot after that reuses the recording and reaches the main menu in
+   about 30 seconds. A loading bar keeps moving throughout, so you can tell it
+   is working rather than hung.
 
    Delete the `.idx` files if you ever replace an `.obb`; they are rebuilt
    automatically, and a mismatched one is ignored rather than trusted.
@@ -168,7 +168,7 @@ GrassWind=0
 | `ObbCacheKB` | `8192` | RAM kept for recent reads from the game's archives |
 | `TextureBits` | `16` | `32` loads textures at full colour depth: sharper, about the same speed, but it can use up the Vita's video memory in big areas. Also selectable from the **MODS** button |
 | `ShadowDistance` | `35` | How far away, in metres, creatures still cast shadows when Shadows is on. Lower values save a little CPU in crowded areas (about 1 ms at `20` in the Upper City) |
-| `ServerOverlap` | `1` | Runs the game's AI on a second core while the 3D scene draws. `0` puts it back after the scene, as in v0.5.0 |
+| `ServerOverlap` | `1` | Runs the game's AI on a second core while the 3D scene draws. `0` runs it after the scene instead, the way releases before v0.5.2 did |
 
 ## Controls
 
@@ -359,17 +359,17 @@ because you may hit it. Save regularly.
   so the new area's sounds and conversations can start before you see it. Once,
   after dying and reloading, a line from the fight that killed you played over
   the loading screen; that one is being traced.
-- **Some shiny armour looks off.** Reflective materials can shine too strongly
-  or with a colour tint, and Sith armour can turn a bright solid colour (green
-  has been seen) that changes from one area to the next. Each area loads its
-  own reflection maps, and which of them goes wrong is being traced.
+- **Some shiny armour may still look off** (issue #11). Reflective materials
+  could shine in neon colours or show another surface's reflection. v0.5.2
+  fixes the two causes found so far; if you still see it, please report where,
+  with `log.txt`.
 - **Busy areas run at around 20 fps.** The Lower City holds the 30 fps lock,
   while the Upper City and the Undercity sit near 20 with a crowd on screen. Most
   of that frame time is the game's own rendering code on one CPU core,
   preparing several hundred objects a frame; the graphics chip is not the
-  limit. The GL calls run on a second core and the AI on a third, which
-  together took about a seventh off each busy frame; what is left is the game's
-  own code. Video memory is also full for most of a session, so textures loaded
+  limit. The GL calls run on a second core and the AI on a third, which took
+  about a tenth plus 3.5 ms off each busy frame; what is left is the game's own
+  code. Video memory is also full for most of a session, so textures loaded
   after the first minute are served from ordinary RAM.
 - **The loading screen runs twice when you load a save.** It fills once without
   a tip, then again, quickly, with one. Nothing is lost and the save loads
@@ -391,13 +391,13 @@ because you may hit it. Save regularly.
 - **Short stalls in play** *(v0.5.2)*: a hitch about once a second from the log
   writer, sound dropouts during area-change saves, pauses when an area's ambient
   sounds started on a return visit, and pauses as dialogue lines appeared.
-- **Busy scenes ran slower** *(v0.5.0)*. The game's GL calls now run on a
+- **Busy scenes ran slower** *(v0.5.2)*. The game's GL calls now run on a
   second CPU core, so the core running the game no longer waits on the graphics
   library: about 10% more frames in the Upper City and the Endar Spire fights.
-- **Setup mistakes looked like a hang** *(v0.5.0)*. A missing
+- **Setup mistakes looked like a hang** *(v0.5.2)*. A missing
   `kubridge`, `libshacccg`, `.so` file or `.obb` left a black screen. A message
   box now says what is missing and where it goes.
-- **Textures could be corrupted with 16-bit textures on** *(v0.5.0)*,
+- **Textures could be corrupted with 16-bit textures on** *(v0.5.2)*,
   when the game re-uploaded a texture or updated one on a texture unit it had
   not just bound.
 - **The 1.0.7 / 1.0.71 APK would not run** *(v0.4.3)*. It is an older build

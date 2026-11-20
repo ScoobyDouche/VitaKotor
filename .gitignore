@@ -29,3 +29,6 @@ OGHARDWARE/
 
 # Hardware logs pulled from the card (large, machine-local)
 logs/
+
+# Downloaded APKs and other third-party files (large, machine-local)
+downloads/
