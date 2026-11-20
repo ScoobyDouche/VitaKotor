@@ -343,6 +343,10 @@ because you may hit it. Save regularly.
   already finished, so nothing was lost. It looks like a freeze because the
   crash handler parks the app. Relaunch and load; the same exit worked on the
   next try. If it happens to you, please send `log.txt`.
+- **Loading a save can occasionally take about 15 seconds longer.** It was
+  seen in 3 of about 10 loads of one large save (12.7 MB): one long pause right
+  after the loading screen appears, then the load finishes normally. The
+  cause is being traced; nothing is lost.
 
 ### Rough edges
 
@@ -363,8 +367,9 @@ because you may hit it. Save regularly.
   while the Upper City and the Undercity sit near 20 with a crowd on screen. Most
   of that frame time is the game's own rendering code on one CPU core,
   preparing several hundred objects a frame; the graphics chip is not the
-  limit. Since v0.5.0 the GL calls themselves run on a second core, which took
-  about a tenth off each busy frame; what is left is the game's own code. Video memory is also full for most of a session, so textures loaded
+  limit. The GL calls run on a second core and the AI on a third, which
+  together took about a seventh off each busy frame; what is left is the game's
+  own code. Video memory is also full for most of a session, so textures loaded
   after the first minute are served from ordinary RAM.
 - **The loading screen runs twice when you load a save.** It fills once without
   a tip, then again, quickly, with one. Nothing is lost and the save loads
@@ -373,6 +378,19 @@ because you may hit it. Save regularly.
 
 ### Recently fixed
 
+- **A d-pad tap could move a menu selection twice** *(v0.5.2)*. In menus the
+  game also reads the left stick as a d-pad, and stick updates landing between
+  a press and its release made the release count as a second tap.
+- **The boot screen looked frozen** *(v0.5.2)* for about 20 seconds. The
+  loading bar now keeps moving until the game is about to show the menu.
+- **The Google Play 1.0.43 APK would not run** *(v0.5.2)*. It works with its
+  32-bit libraries; see [Requirements](#requirements).
+- **The AI waited for the scene to finish drawing** *(v0.5.2)*. It now runs on
+  another core while the scene draws, about 3.5 ms off each busy frame.
+  `ServerOverlap=0` turns it off.
+- **Short stalls in play** *(v0.5.2)*: a hitch about once a second from the log
+  writer, sound dropouts during area-change saves, pauses when an area's ambient
+  sounds started on a return visit, and pauses as dialogue lines appeared.
 - **Busy scenes ran slower** *(v0.5.0)*. The game's GL calls now run on a
   second CPU core, so the core running the game no longer waits on the graphics
   library: about 10% more frames in the Upper City and the Endar Spire fights.
