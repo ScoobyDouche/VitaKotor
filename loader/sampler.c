@@ -38,6 +38,8 @@ static int cls_of(uint32_t a) {
   return 2;
 }
 
+static void name_addr(uint32_t a, char *out, size_t n);
+
 static void tally(Slot *t, uint32_t key) {
   uint32_t i = (key * 2654435761u) >> 20;
   for (unsigned probe = 0; probe < 64; probe++, i = (i + 1) & (TAB_N - 1)) {
@@ -50,9 +52,33 @@ static void tally(Slot *t, uint32_t key) {
 /* Reached from samp_slow with the flag raised: r0 = the caller's return
  * address, r1 = the function it is calling. Any thread can land here; only
  * the game thread's call takes the sample. */
+/* Stall finder. A flag raised by the tick thread and not taken for many ticks
+ * means the game thread ran that long without one PLT call: a loop with no
+ * calls in it, or one long call into code that is not instrumented (the
+ * loader, libc). Its one eventual sample says nothing about how long it took,
+ * so time it here: the call that finally takes the flag is the first one after
+ * the stretch, and the previous sample is the last thing seen before it. */
+#define STALL_LOG_MS 100
+static volatile uint32_t g_ticks_total, g_raised_at;
+static uint32_t g_prev_lr, g_prev_target;
+static unsigned g_stall_logs;
+
 __attribute__((used)) void samp_record(uint32_t lr, uint32_t target) {
   if (sceKernelGetThreadId() != *g_game_thid_p) return;
   g_flag = 0;
+  uint32_t stall = g_ticks_total - g_raised_at;
+  if (stall >= STALL_LOG_MS && g_stall_logs < 400) {
+    char a[24], b[24], c[24], d[24];
+    g_stall_logs++;
+    name_addr(lr, a, sizeof a);
+    name_addr(target, b, sizeof b);
+    name_addr(g_prev_lr, c, sizeof c);
+    name_addr(g_prev_target, d, sizeof d);
+    log_printf("[samp] STALL %u ms with no call: ended at site %s -> %s; last sample before was %s -> %s",
+               (unsigned)stall, a, b, c, d);
+  }
+  g_prev_lr = lr;
+  g_prev_target = target;
   tally(g_site, lr);
   tally(g_callee, target);
   g_cls[cls_of(lr)][cls_of(target)]++;
@@ -110,7 +136,8 @@ static int tick_thread(SceSize args, void *argp) {
   unsigned ticks = 0, window = 0;
   for (;;) {
     sceKernelDelayThread(TICK_US);
-    g_flag = 1;
+    g_ticks_total++;
+    if (!g_flag) { g_raised_at = g_ticks_total; g_flag = 1; }
     if (++ticks < WINDOW_TICKS) continue;
     ticks = 0;
     uint32_t n = g_samples, d = g_dropped;
