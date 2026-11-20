@@ -223,6 +223,8 @@ static volatile unsigned g_pumps = 0;
 static unsigned g_stick_dropped, g_stick_released;
 /* Axis events re-delivered after a menu closed (resync_next). */
 static unsigned g_resync_n;
+/* Centred left-stick events held back while the d-pad is down (dpad_guard). */
+static unsigned g_dpad_guarded;
 
 static void axis_window_reset(void) {
   for (int a = 0; a < 4; a++)
@@ -309,9 +311,10 @@ void sdl_input_census(void) {
                   a ? " | " : "", a, g_axis[a].n, g_axis[a].jumps,
                   g_axis[a].n ? g_axis[a].lo : 0, g_axis[a].n ? g_axis[a].hi : 0);
   log_printf("[input] axes: %s; pumps=%u; stick filter dropped %u released %u; "
-             "re-synced %u",
-             buf, g_pumps, g_stick_dropped, g_stick_released, g_resync_n);
+             "re-synced %u; d-pad guard held back %u",
+             buf, g_pumps, g_stick_dropped, g_stick_released, g_resync_n, g_dpad_guarded);
   g_stick_dropped = g_stick_released = 0;
+  g_dpad_guarded = 0;
   g_resync_n = 0;
   axis_window_reset();
 }
@@ -454,7 +457,80 @@ static int resync_next(SDL_Event *e) {
   return 0;
 }
 
+/* D-pad guard (issue #15: one d-pad tap moved menu selections twice).
+ *
+ * In a menu the game reads the left stick as a second d-pad. Its JOYAXISMOTION
+ * handler sets a d-pad bit when axis 0/1 is pushed past +-10000 and otherwise
+ * CLEARS that axis's d-pad pair from pressedGamepadButtons (0xc00 for axis 0,
+ * 0x300 for axis 1) -- held d-pad buttons included. Its JOYBUTTONUP handler
+ * then treats a release of a button it does not think is held as a tap and
+ * fires the button again. So any centred left-stick event landing between a
+ * d-pad press and its release turns the release into a second step: our stick
+ * re-sync (120/450 ms after every release) and the Vita sticks' idle noise
+ * both do it. log-2026-11-20-dpad-a: every doubled release had a re-sync in
+ * between, every clean one did not.
+ *
+ * While a d-pad button is held, hold back left-stick events inside the game's
+ * dead zone. They carry no d-pad meaning, and the re-sync scheduled by the
+ * release re-sends the real axis values right after, so the movement code
+ * never keeps a stale value. Self-healing: if SDL says the d-pad is no longer
+ * down for a while and we never saw the release, stop guarding. */
+#define DPAD_FIRST_ANDROID 11      /* after normalize_joy_event: 11..14 */
+#define DPAD_LAST_ANDROID  14
+#define DPAD_STICK_DEADZONE 10000  /* the game's own threshold */
+#define DPAD_STALE_MS 500
+static unsigned g_dpad_held;               /* bit per Android d-pad index */
+static SDL_JoystickID g_dpad_joy = -1;
+static Uint32 g_dpad_up_since;             /* 0 = SDL still reports a d-pad press */
+
+static int dpad_physically_down(void) {
+  SDL_Joystick *js = g_dpad_joy >= 0 ? SDL_JoystickFromInstanceID(g_dpad_joy) : NULL;
+  if (!js) return 1;                       /* cannot tell: trust the events */
+  for (int b = 6; b <= 9; b++)             /* Vita SDL d-pad indices */
+    if (SDL_JoystickGetButton(js, b)) return 1;
+  return 0;
+}
+
+/* 1 = swallow this event. Call on events already remapped to Android indices. */
+static int dpad_guard(const SDL_Event *e) {
+  if (e->type == SDL_JOYBUTTONDOWN || e->type == SDL_JOYBUTTONUP) {
+    unsigned b = e->jbutton.button;
+    if (b >= DPAD_FIRST_ANDROID && b <= DPAD_LAST_ANDROID) {
+      unsigned bit = 1u << (b - DPAD_FIRST_ANDROID);
+      if (e->type == SDL_JOYBUTTONDOWN) g_dpad_held |= bit;
+      else g_dpad_held &= ~bit;
+      g_dpad_joy = e->jbutton.which;
+      g_dpad_up_since = 0;
+    }
+    return 0;
+  }
+  if (!g_dpad_held || e->type != SDL_JOYAXISMOTION || e->jaxis.axis > 1) return 0;
+  if (!dpad_physically_down()) {
+    Uint32 now = SDL_GetTicks();
+    if (!g_dpad_up_since) g_dpad_up_since = now ? now : 1;
+    else if (now - g_dpad_up_since >= DPAD_STALE_MS) {
+      g_dpad_held = 0;                     /* missed the release: stand down */
+      return 0;
+    }
+  }
+  int v = e->jaxis.value;
+  if (v < 0) v = -v;
+  if (v > DPAD_STICK_DEADZONE) return 0;   /* a real push: let the stick have it */
+  g_dpad_guarded++;
+  return 1;
+}
+
+static int poll_one(SDL_Event *e);
+
 static int SDL_PollEvent_hook(SDL_Event *e) {
+  int r;
+  if (!e) return poll_one(e);
+  while ((r = poll_one(e)) && dpad_guard(e))
+    ;
+  return r;
+}
+
+static int poll_one(SDL_Event *e) {
   if (e && resync_next(e)) {
     log_event("PollEvent", e);
     return 1;
