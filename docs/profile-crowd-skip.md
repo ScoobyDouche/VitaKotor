@@ -24,7 +24,23 @@ invisible to it. This one sees the instruction.
    ```
    The windows are the `[pcs] window N` lines spent in the crowd.
 
-The output ranks functions by time and lists the hottest instructions. That
+Each window also logs a summary line:
+
+    [pcs]   game thread busy 93% of the window; samples in libKOTOR 11800, port 1200; ...
+
+`busy` is the game thread's own CPU time: the rest of the window it was
+blocked (waiting on the graphics thread, the vblank, a lock). Samples are
+taken in libKOTOR and libandroid_port; busy time missing from both is the
+loader, vitaGL or libc.
+
+The report prints four tables:
+- **by function containing the PC** -- self time, where the CPU actually is;
+- **by return address** -- who called the leaf;
+- **inclusive** -- samples anywhere inside a function *or the functions it
+  called*, from call sites found on the game thread's stack. This is the
+  one that says which engine system (scene walk, animation, lighting,
+  shadows, object updates) the frame belongs to;
+- **hottest instructions** -- offsets to look up in the disassembly. That
 list decides the next step: a few hot leaf functions can be replaced with
 NEON versions through the existing hook mechanism; one self-contained
 per-object loop is the only real candidate for splitting across cores.
@@ -47,15 +63,6 @@ With the census on as well, compare frame times and the per-class ms against
 the run above. Then narrow it with `CrowdClasses=` set to the pedestrian
 class name the census showed, so doors and placeables are left alone. Try
 20, 30 and 40 m and note where pop-in becomes noticeable.
-
-## 4. The CPU prefetch plugin
-
-[vita_cpu_tweaks](https://github.com/devnoname120/vita_cpu_tweaks) turns on
-the Cortex-A9/PL310 data prefetchers. It is a system-wide kernel plugin
-(firmware 3.60–3.74 only), so it is not bundled; install it per its README
-with `enable = once` first. Compare the same crowd scene with it on and off
-using `[prof]` frame times. Expect a few percent at most: the crowd cost is
-mostly pointer-heavy engine code, which prefetching helps least.
 
 ## Not in this branch: multithreading the scene
 

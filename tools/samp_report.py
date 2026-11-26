@@ -5,7 +5,13 @@ usage: samp_report.py LOG KOTOR_SYMS PORT_SYMS FIRST_WINDOW LAST_WINDOW
 
 Reads both profilers:
   Profile=1  [samp] lines: call sites and callees (sampler.c)
-  Profile=3  [pcs]  lines: program counters and return addresses (pcsamp.c)
+  Profile=3  [pcs]  lines: program counters, return addresses and the call
+             sites found on the game thread's stack (pcsamp.c)
+
+For Profile=3 it also prints an inclusive table: the share of samples taken
+anywhere inside a function or the functions it called. That is the table
+that says which engine system the frame belongs to.
+
 The two symbol files are `arm-vita-eabi-nm -D -C --defined-only` of the
 libKOTOR.so and libandroid_port.so the log was recorded with. An offset is
 put down to the nearest exported symbol at or below it, so a static function
@@ -43,6 +49,7 @@ tot = 0
 fn = collections.Counter()       # by function: call site (samp) or PC (pcs)
 cal = collections.Counter()      # callee (samp) or return address (pcs)
 hot = collections.Counter()      # raw PC buckets, for the disassembly
+stk = collections.Counter()      # call sites on the stack, by function (pcs)
 listed = 0
 kind = None
 for l in open(sys.argv[1], errors='replace'):
@@ -53,11 +60,13 @@ for l in open(sys.argv[1], errors='replace'):
         if lo <= win <= hi:
             tot += int(m.group(3))
         continue
-    m = re.search(r'\[(?:samp|pcs)\]   (site|callee|pc|lr) (.*)$', l)
+    m = re.search(r'\[(?:samp|pcs)\]   (site|callee|pc|lr|stk) (.*)$', l)
     if m and lo <= win <= hi:
         for tag, n in re.findall(r'(\S+):(\d+)', m.group(2)):
             n = int(n)
-            if m.group(1) in ('site', 'pc'):
+            if m.group(1) == 'stk':
+                stk[sym(tag)] += n
+            elif m.group(1) in ('site', 'pc'):
                 fn[sym(tag)] += n
                 listed += n
                 if m.group(1) == 'pc':
@@ -76,7 +85,14 @@ for k, v in fn.most_common(45):
 print('--- by function of the', second)
 for k, v in cal.most_common(30):
     print('%5.1f%%  %s' % (100 * v / tot, k[:100]))
+if stk:
+    incl = collections.Counter(fn)
+    incl.update(stk)
+    print('--- inclusive: samples inside the function or anything it called')
+    print('    (stale words on the stack can add a little; recursion counts twice)')
+    for k, v in incl.most_common(60):
+        print('%5.1f%%  self %5.1f%%  %s' % (min(100.0, 100 * v / tot), 100 * fn[k] / tot, k[:90]))
 if hot:
-    print('--- hottest instructions (libKOTOR offset)')
+    print('--- hottest instructions (k+ libKOTOR, p+ port offset)')
     for k, v in hot.most_common(25):
         print('%5.1f%%  %-10s %s' % (100 * v / tot, k, sym(k)[:80]))
