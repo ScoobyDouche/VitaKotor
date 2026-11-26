@@ -30,3 +30,11 @@
 /* Call after crash_init (the crash handler stays behind this one) and after
  * libKOTOR is loaded. `game_thid` may still be unset now. */
 void pcsamp_install(volatile SceUID *game_thid, unsigned tick_us);
+
+/* Labels for each window, so a log says which windows were spent where.
+ * pcsamp_note_module: a module .rim was opened (the area being entered).
+ * pcsamp_on_swap: a frame was presented. Both are cheap and always safe. */
+void pcsamp_note_module(const char *path);
+void pcsamp_on_swap(void);
+/* The area last entered ("tar_m03ae"), or "?" before the first one. */
+const char *pcsamp_area(void);

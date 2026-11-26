@@ -53,7 +53,7 @@ stk = collections.Counter()      # call sites on the stack, by function (pcs)
 listed = 0
 kind = None
 for l in open(sys.argv[1], errors='replace'):
-    m = re.search(r'\[(samp|pcs)\] window (\d+): (\d+) samples', l)
+    m = re.search(r'\[(samp|pcs)\] window (\d+): (?:area .*?; )?(\d+) samples', l)
     if m:
         kind = m.group(1)
         win = int(m.group(2))

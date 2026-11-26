@@ -39,6 +39,28 @@ static volatile uint32_t g_in_mod[2], g_depth_sum;
 static volatile uint32_t g_ticks, g_missed;
 static KuKernelExceptionHandler g_prev;
 
+static char g_area[24] = "?";        /* written by the opener, read by reports */
+static volatile uint32_t g_swaps;
+
+void pcsamp_note_module(const char *path) {
+  if (!path) return;
+  const char *b = strrchr(path, '/');
+  b = b ? b + 1 : path;
+  char name[sizeof g_area];
+  size_t n = 0;
+  while (b[n] && b[n] != '.' && n < sizeof name - 1) {
+    char ch = b[n];
+    name[n++] = (ch >= 'A' && ch <= 'Z') ? (char)(ch - 'A' + 'a') : ch;
+  }
+  name[n] = 0;
+  if (n > 2 && !strcmp(name + n - 2, "_s")) name[n - 2] = 0;   /* tar_m04aa_s.rim */
+  if (name[0]) memcpy(g_area, name, sizeof name);
+}
+
+void pcsamp_on_swap(void) { g_swaps++; }
+
+const char *pcsamp_area(void) { return g_area; }
+
 static int protect(int exec) {
   int r = 0;
   for (int i = 0; i < 2; i++) {
@@ -188,6 +210,7 @@ static int tick_thread(SceSize args, void *argp) {
   (void)args; (void)argp;
   while (!find_game_stack()) sceKernelDelayThread(100 * 1000);
   uint64_t start = sceKernelGetProcessTimeWide(), run0 = game_run_us();
+  uint32_t swaps0 = g_swaps;
   unsigned window = 0;
   for (;;) {
     sceKernelDelayThread(g_tick_us);
@@ -204,9 +227,11 @@ static int tick_thread(SceSize args, void *argp) {
     uint64_t run = game_run_us();
     unsigned busy = (unsigned)((run - run0) * 100u / (now - start));
     unsigned n = g_game;
-    log_printf("[pcs] window %u: %u samples in %u ticks (other threads %u, idle ticks %u, "
-               "not tallied %u)", ++window, n, (unsigned)g_ticks, (unsigned)g_other,
-               (unsigned)g_missed, (unsigned)g_dropped);
+    uint32_t sw = g_swaps;
+    double fps = (double)(sw - swaps0) * 1e6 / (double)(now - start);
+    log_printf("[pcs] window %u: area %s, %.1f fps; %u samples in %u ticks (other threads %u, "
+               "idle ticks %u, not tallied %u)", ++window, g_area, fps, n, (unsigned)g_ticks,
+               (unsigned)g_other, (unsigned)g_missed, (unsigned)g_dropped);
     /* busy: the game thread's own CPU time over the window. Whatever is not
      * busy, it spent blocked (GL ring, vblank, locks). Of the busy part, the
      * samples say how much was libKOTOR, the port layer, and -- by what is
@@ -222,6 +247,7 @@ static int tick_thread(SceSize args, void *argp) {
     report("stk", g_stk, TOP_STK);
     start = sceKernelGetProcessTimeWide();
     run0 = game_run_us();
+    swaps0 = g_swaps;
   }
   return 0;
 }

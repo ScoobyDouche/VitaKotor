@@ -34,6 +34,7 @@
 #include "translation.h"
 #include "log.h"
 #include "gameprof.h"
+#include "pcsamp.h"
 #include "main.h"   /* kotor_mod */
 
 extern int ret0(void);   // from dynlib.c
@@ -75,6 +76,7 @@ static void SDL_GL_SwapWindow_hook(SDL_Window *w) {
   uint64_t swap_end = sceKernelGetProcessTimeWide();
   gl_patch_on_swap(swap_begin, swap_end);
   bink_patch_on_swap(swap_end);
+  pcsamp_on_swap();
   input_touch_pump();  // front touch as SDL finger events; the pad goes through SDL
   ime_pump();          // collect what the on-screen keyboard produced
 }
@@ -945,7 +947,10 @@ static SDL_RWops *SDL_RWFromFile_body(const char *fname, const char *mode, int *
     Sint64 sz = SDL_RWsize(rw);
     log_printf("[SDL] size: %s (%s) -> %lld bytes", fname, mode ? mode : "?",
                (long long)sz);
-    if (strstr(fname, "modules/") && strstr(fname, ".rim")) snd_prefetch_module(fname);
+    if (strstr(fname, "modules/") && strstr(fname, ".rim")) {
+      snd_prefetch_module(fname);
+      pcsamp_note_module(fname);
+    }
   }
   return rw;
 }

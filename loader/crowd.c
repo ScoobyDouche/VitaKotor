@@ -9,6 +9,7 @@
 #include "config.h"
 #include "crowd.h"
 #include "log.h"
+#include "pcsamp.h"
 #include "so_util.h"
 
 extern so_module kotor_mod;
@@ -188,9 +189,9 @@ static cls_t *class_of(const uint32_t *ti) {
 }
 
 static void census_report(void) {
-  log_printf("[crowd] %u frames: culled %u (beyond %d m), no position %u; drawn at <10:%u "
+  log_printf("[crowd] %s, %u frames: culled %u (beyond %d m), no position %u; drawn at <10:%u "
              "<20:%u <30:%u <50:%u <80:%u more:%u m; camera at %.1f %.1f %.1f",
-             (unsigned)g_frames, (unsigned)g_tot_culled, g_crowd_dist, (unsigned)g_nopos,
+             pcsamp_area(), (unsigned)g_frames, (unsigned)g_tot_culled, g_crowd_dist, (unsigned)g_nopos,
              (unsigned)g_hist[0], (unsigned)g_hist[1], (unsigned)g_hist[2], (unsigned)g_hist[3],
              (unsigned)g_hist[4], (unsigned)g_hist[5], (double)g_cam_pos[0],
              (double)g_cam_pos[1], (double)g_cam_pos[2]);
