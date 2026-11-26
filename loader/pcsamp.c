@@ -37,7 +37,8 @@ static volatile uint32_t g_armed;    /* text is (being) made non-executable */
 static volatile uint32_t g_game, g_other, g_dropped, g_spurious;
 static volatile uint32_t g_in_mod[2], g_depth_sum;
 static volatile uint32_t g_ticks, g_missed;
-static KuKernelExceptionHandler g_prev;
+static KuKernelExceptionHandler g_prev, g_prev_data;
+static volatile uint32_t g_reads;    /* data reads that hit the lock */
 
 static char g_area[24] = "?";        /* written by the opener, read by reports */
 static volatile uint32_t g_swaps;
@@ -151,6 +152,25 @@ static void pcs_handler(KuKernelExceptionContext *c) {
   if (g_prev) g_prev(c);
 }
 
+/* Locking the text takes away read access as well as execute (FSR 7, a
+ * translation fault), and code outside the libraries -- so_symbol walking a
+ * symbol table, libc copying a string literal, vitaGL reading a constant --
+ * reads library pages all the time. Such a read is not a sample: give the
+ * access back and retry the load. Same few-in-a-row allowance as above. */
+static void pcs_data_handler(KuKernelExceptionContext *c) {
+  if (mod_of(c->FAR) >= 0) {
+    if (g_armed) {
+      protect(1);
+      g_armed = 0;
+      g_spurious = 0;
+      g_reads++;
+      return;
+    }
+    if (g_spurious++ < 4) { protect(1); return; }
+  }
+  if (g_prev_data) g_prev_data(c);
+}
+
 static void name_addr(uint32_t a, char *out, size_t n) {
   if (a - kotor_mod.text_base < kotor_mod.text_size)
     snprintf(out, n, "k+%x", (unsigned)(a - kotor_mod.text_base));
@@ -230,8 +250,9 @@ static int tick_thread(SceSize args, void *argp) {
     uint32_t sw = g_swaps;
     double fps = (double)(sw - swaps0) * 1e6 / (double)(now - start);
     log_printf("[pcs] window %u: area %s, %.1f fps; %u samples in %u ticks (other threads %u, "
-               "idle ticks %u, not tallied %u)", ++window, g_area, fps, n, (unsigned)g_ticks,
-               (unsigned)g_other, (unsigned)g_missed, (unsigned)g_dropped);
+               "idle ticks %u, reads unlocked %u, not tallied %u)", ++window, g_area, fps, n,
+               (unsigned)g_ticks, (unsigned)g_other, (unsigned)g_missed, (unsigned)g_reads,
+               (unsigned)g_dropped);
     /* busy: the game thread's own CPU time over the window. Whatever is not
      * busy, it spent blocked (GL ring, vblank, locks). Of the busy part, the
      * samples say how much was libKOTOR, the port layer, and -- by what is
@@ -239,7 +260,7 @@ static int tick_thread(SceSize args, void *argp) {
     log_printf("[pcs]   game thread busy %u%% of the window; samples in libKOTOR %u, "
                "port %u; stack depth found %.1f", busy, (unsigned)g_in_mod[0],
                (unsigned)g_in_mod[1], n ? (double)g_depth_sum / n : 0.0);
-    g_game = g_other = g_ticks = g_missed = g_dropped = 0;
+    g_game = g_other = g_ticks = g_missed = g_dropped = g_reads = 0;
     g_in_mod[0] = g_in_mod[1] = 0;
     g_depth_sum = 0;
     report("pc", g_pc, TOP_PC);
@@ -281,6 +302,14 @@ void pcsamp_install(volatile SceUID *game_thid, unsigned tick_us) {
                                            pcs_handler, &g_prev, &opt);
   if (r < 0) {
     log_printf("[pcs] exception handler not registered (0x%x): PC sampler off", (unsigned)r);
+    return;
+  }
+  /* Without the data side, the first read of a locked page is a crash. */
+  r = kuKernelRegisterExceptionHandler(KU_KERNEL_EXCEPTION_TYPE_DATA_ABORT, pcs_data_handler,
+                                       &g_prev_data, &opt);
+  if (r < 0) {
+    kuKernelRegisterExceptionHandler(KU_KERNEL_EXCEPTION_TYPE_PREFETCH_ABORT, g_prev, NULL, &opt);
+    log_printf("[pcs] data abort handler not registered (0x%x): PC sampler off", (unsigned)r);
     return;
   }
   SceUID th = sceKernelCreateThread("kotor_pcs", tick_thread, 0x100000F0, 0x4000, 0,

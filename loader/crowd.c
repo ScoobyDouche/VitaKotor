@@ -76,15 +76,21 @@ static int derives(const uint32_t *ti, const char *want, int depth) {
   return derives((const uint32_t *)(uintptr_t)w2, want, depth + 1);
 }
 
-/* Gob::SetPosition(Vector): `this` in r0 and, the .so being softfp, the
- * Vector's x, y, z in r1, r2, r3. Follow the base registers derived from r0
- * through MOV/ADD and record where r1-r3 get stored. Returns the offset of x
- * when y and z land right after it. */
-static int find_pos_offset(uintptr_t fn) {
-  const uint16_t *c = (const uint16_t *)(fn & ~(uintptr_t)1);
-  int base[16], off[4] = { -1, -1, -1, -1 };
-  for (int i = 0; i < 16; i++) base[i] = -1;
-  base[0] = 0;
+/* Gob::SetPosition(Vector). The .so is softfp, so the Vector travels in core
+ * registers, in one of two shapes:
+ *   void   form: `this` r0, x y z in r1 r2 r3;
+ *   Vector form (it returns the new position): result pointer r0, `this` r1,
+ *                x y in r2 r3, z on the stack at [sp] -- the libKOTOR build
+ *                on hardware is this one (Nov 26 log: stores at r1+120..128).
+ * Follow the base registers derived from `this` through MOV/ADD, note which
+ * register holds which component, and record where each one is stored.
+ * Returns the offset of x when y and z land right after it, else -1. */
+static int scan_pos(const uint16_t *c, int this_reg, const int arg_comp[4]) {
+  int base[16], comp[16], pos[3] = { -1, -1, -1 };
+  for (int i = 0; i < 16; i++) { base[i] = -1; comp[i] = -1; }
+  base[this_reg] = 0;
+  for (int r = 0; r < 4; r++) comp[r] = arg_comp[r];
+#define STORE(rt, at) do { int k_ = comp[(rt)]; if (k_ >= 0 && pos[k_] < 0) pos[k_] = (at); } while (0)
   for (int i = 0; i < 48; i++) {
     uint16_t h = c[i];
     if (h == 0x4770 || (h & 0xFF00) == 0xBD00) break;           /* bx lr / pop {..pc} */
@@ -92,21 +98,23 @@ static int find_pos_offset(uintptr_t fn) {
       uint16_t h2 = c[++i];
       if ((h & 0xFFF0) == 0xF8C0) {                              /* STR.W Rt,[Rn,#imm12] */
         int rn = h & 0xF, rt = h2 >> 12;
-        if (rt >= 1 && rt <= 3 && base[rn] >= 0 && off[rt] < 0) off[rt] = base[rn] + (h2 & 0xFFF);
+        if (base[rn] >= 0) STORE(rt, base[rn] + (h2 & 0xFFF));
+      } else if (h == 0xF8DD) {                                  /* LDR.W Rt,[SP,#imm12] */
+        int rt = h2 >> 12;
+        comp[rt] = (h2 & 0xFFF) == 0 && arg_comp[0] == -2 ? 2 : -1;
+        base[rt] = -1;
       } else if ((h & 0xFFF0) == 0xE9C0) {                       /* STRD Rt,Rt2,[Rn,#imm8*4] */
         int rn = h & 0xF, rt = h2 >> 12, rt2 = (h2 >> 8) & 0xF, im = (h2 & 0xFF) * 4;
-        if (base[rn] >= 0) {
-          if (rt >= 1 && rt <= 3 && off[rt] < 0) off[rt] = base[rn] + im;
-          if (rt2 >= 1 && rt2 <= 3 && off[rt2] < 0) off[rt2] = base[rn] + im + 4;
-        }
+        if (base[rn] >= 0) { STORE(rt, base[rn] + im); STORE(rt2, base[rn] + im + 4); }
       } else if ((h & 0xFFD0) == 0xE880) {                       /* STM.W Rn,{list} */
         int rn = h & 0xF, at = base[rn];
         if (at >= 0)
           for (int r = 0; r < 16; r++)
-            if (h2 & (1u << r)) { if (r >= 1 && r <= 3 && off[r] < 0) off[r] = at; at += 4; }
+            if (h2 & (1u << r)) { STORE(r, at); at += 4; }
       } else if ((h & 0xFBE0) == 0xF100 || (h & 0xFBF0) == 0xF200) { /* ADD.W / ADDW */
         int rn = h & 0xF, rd = (h2 >> 8) & 0xF;
         int imm = ((h >> 10) & 1) << 11 | ((h2 >> 12) & 7) << 8 | (h2 & 0xFF);
+        comp[rd] = -1;
         if ((h & 0xFBE0) == 0xF100 && (imm >> 8)) { base[rd] = -1; continue; } /* rotated */
         base[rd] = base[rn] >= 0 ? base[rn] + imm : -1;
       } else if ((h & 0xF800) == 0xF000 && (h2 & 0x8000)) {
@@ -116,28 +124,47 @@ static int find_pos_offset(uintptr_t fn) {
     }
     if ((h & 0xF800) == 0x6000) {                                /* STR Rt,[Rn,#imm5*4] */
       int rn = (h >> 3) & 7, rt = h & 7;
-      if (rt >= 1 && rt <= 3 && base[rn] >= 0 && off[rt] < 0) off[rt] = base[rn] + ((h >> 6) & 0x1F) * 4;
+      if (base[rn] >= 0) STORE(rt, base[rn] + ((h >> 6) & 0x1F) * 4);
+    } else if ((h & 0xF800) == 0x9800) {                         /* LDR Rt,[SP,#imm8*4] */
+      int rt = (h >> 8) & 7;
+      comp[rt] = (h & 0xFF) == 0 && arg_comp[0] == -2 ? 2 : -1;
+      base[rt] = -1;
     } else if ((h & 0xF800) == 0xC000) {                         /* STMIA Rn!,{list} */
       int rn = (h >> 8) & 7, at = base[rn];
       if (at >= 0)
         for (int r = 0; r < 8; r++)
-          if (h & (1u << r)) { if (r >= 1 && r <= 3 && off[r] < 0) off[r] = at; at += 4; }
+          if (h & (1u << r)) { STORE(r, at); at += 4; }
     } else if ((h & 0xFE00) == 0x1C00) {                         /* ADDS Rd,Rn,#imm3 */
-      int rn = (h >> 3) & 7;
-      base[h & 7] = base[rn] >= 0 ? base[rn] + ((h >> 6) & 7) : -1;
+      int rn = (h >> 3) & 7, rd = h & 7;
+      base[rd] = base[rn] >= 0 ? base[rn] + ((h >> 6) & 7) : -1;
+      comp[rd] = -1;
     } else if ((h & 0xF800) == 0x3000) {                         /* ADDS Rdn,#imm8 */
       int rd = (h >> 8) & 7;
       base[rd] = base[rd] >= 0 ? base[rd] + (h & 0xFF) : -1;
+      comp[rd] = -1;
     } else if ((h & 0xFF00) == 0x4600) {                         /* MOV Rd,Rm */
       int rd = (h & 7) | ((h >> 4) & 8), rm = (h >> 3) & 0xF;
       base[rd] = base[rm];
+      comp[rd] = comp[rm];
     } else if ((h & 0xF000) == 0xD000 || (h & 0xF800) == 0xE000 || (h & 0xF500) == 0xB100) {
       break;                                                     /* a branch */
     }
   }
-  if (off[1] >= 0 && off[2] == off[1] + 4 && off[3] == off[1] + 8) return off[1];
-  log_printf("[crowd] Gob::SetPosition not understood (x@%d y@%d z@%d); code:", off[1], off[2],
-             off[3]);
+#undef STORE
+  if (pos[0] >= 0 && pos[1] == pos[0] + 4 && pos[2] == pos[0] + 8) return pos[0];
+  return -1;
+}
+
+static int find_pos_offset(uintptr_t fn) {
+  const uint16_t *c = (const uint16_t *)(fn & ~(uintptr_t)1);
+  /* comp per argument register r0-r3; -2 in r0's slot marks the Vector form,
+   * whose z is the first stack word. */
+  static const int void_form[4] = { -1, 0, 1, 2 };
+  static const int vec_form[4] = { -2, -1, 0, 1 };
+  int off = scan_pos(c, 0, void_form);
+  if (off < 0) off = scan_pos(c, 1, vec_form);
+  if (off >= 0) return off;
+  log_printf("[crowd] Gob::SetPosition not understood; code:");
   for (int i = 0; i < 32; i += 8)
     log_printf("[crowd]   %04x %04x %04x %04x %04x %04x %04x %04x", c[i], c[i + 1], c[i + 2],
                c[i + 3], c[i + 4], c[i + 5], c[i + 6], c[i + 7]);
