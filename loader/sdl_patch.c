@@ -790,7 +790,7 @@ static SDL_RWops *SDL_RWFromFile_body(const char *fname, const char *mode, int *
 
 static SDL_RWops *SDL_RWFromFile_hook(const char *fname, const char *mode) {
   uint64_t t0 = sceKernelGetProcessTimeWide();
-  if (g_miss_mtx < 0) g_miss_mtx = sceKernelCreateMutex("kotor_rwmiss", 0, 0, NULL);
+  mutex_once(&g_miss_mtx, "kotor_rwmiss");
   int reading = fname && mode && mode[0] == 'r' && !strchr(mode, '+');
   char t[512];
   uint64_t h = 0;

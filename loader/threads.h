@@ -40,4 +40,9 @@ void thread_census_add(SceUID thid, const char *tag);
  * the last call, plus a per-core total. Called from the watchdog. */
 void thread_census_log(void);
 
+/* Create the mutex in *slot on first use, safely when two threads get there
+ * at once: the one that loses the race deletes its copy. Returns the mutex,
+ * or a negative error if none could be created. */
+SceUID mutex_once(SceUID *slot, const char *name);
+
 #endif

@@ -110,3 +110,15 @@ void thread_census_log(void) {
                core_pm[0] / 10, core_pm[0] % 10, core_pm[1] / 10, core_pm[1] % 10,
                core_pm[2] / 10, core_pm[2] % 10);
 }
+
+SceUID mutex_once(SceUID *slot, const char *name) {
+  SceUID m = __atomic_load_n(slot, __ATOMIC_ACQUIRE);
+  if (m >= 0) return m;
+  m = sceKernelCreateMutex(name, 0, 0, NULL);
+  if (m < 0) return m;
+  SceUID expect = -1;
+  if (__atomic_compare_exchange_n(slot, &expect, m, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+    return m;
+  sceKernelDeleteMutex(m);
+  return expect;                 /* the winner's */
+}

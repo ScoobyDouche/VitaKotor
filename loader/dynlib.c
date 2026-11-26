@@ -352,11 +352,14 @@ static uint64_t   g_vread_bytes = 0, g_vread_us = 0;
 static int        g_vlive = 0;
 
 static void io_lock(void) {
-  if (g_io_mutex < 0) g_io_mutex = sceKernelCreateMutex("kotor_io", 0, 0, NULL);
-  if (g_io_mutex >= 0) sceKernelLockMutex(g_io_mutex, 1, NULL);
+  /* mutex_once: two threads opening their first file at once used to create
+   * one mutex each and both hold "the" lock. */
+  SceUID m = mutex_once(&g_io_mutex, "kotor_io");
+  if (m >= 0) sceKernelLockMutex(m, 1, NULL);
 }
 static void io_unlock(void) {
-  if (g_io_mutex >= 0) sceKernelUnlockMutex(g_io_mutex, 1);
+  SceUID m = __atomic_load_n(&g_io_mutex, __ATOMIC_ACQUIRE);
+  if (m >= 0) sceKernelUnlockMutex(m, 1);
 }
 
 /* Non-NULL only for pointers that are really one of our virtual handles. */

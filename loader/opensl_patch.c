@@ -17,6 +17,7 @@
 #include "bink_patch.h"
 #include "opensl_patch.h"
 #include "log.h"
+#include "threads.h"
 
 #define BINK_SL_MAX_PLAYERS 4
 
@@ -93,9 +94,8 @@ const SLInterfaceID bink_sl_iid_volume = &g_iid_volume_value;
 const SLInterfaceID bink_sl_iid_bufferqueue = &g_iid_bufferqueue_value;
 
 static void ensure_mutexes(void) {
-  if (g_mutex < 0) g_mutex = sceKernelCreateMutex("kotor_bink_sl", 0, 0, NULL);
-  if (g_callback_mutex < 0)
-    g_callback_mutex = sceKernelCreateMutex("kotor_bink_cb", 0, 0, NULL);
+  mutex_once(&g_mutex, "kotor_bink_sl");
+  mutex_once(&g_callback_mutex, "kotor_bink_cb");
 }
 
 static void state_lock(void) {
