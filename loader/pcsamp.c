@@ -34,7 +34,7 @@ static uintptr_t g_stk_lo, g_stk_hi; /* the game thread's stack */
 static unsigned g_tick_us;
 
 static volatile uint32_t g_armed;    /* text is (being) made non-executable */
-static volatile uint32_t g_game, g_other, g_dropped, g_spurious;
+static volatile uint32_t g_game, g_other, g_dropped;
 static volatile uint32_t g_in_mod[2], g_depth_sum;
 static volatile uint32_t g_ticks, g_missed;
 static KuKernelExceptionHandler g_prev, g_prev_data;
@@ -122,53 +122,48 @@ static void walk_stack(uint32_t sp) {
   g_depth_sum += n;
 }
 
-/* Every prefetch abort lands here first. One inside a protected library while
- * the sampler has the text locked is a sample: give execute back and return,
- * and the instruction runs again. Any thread can take it; only the game
- * thread's are tallied. Two threads can fault on the same lock, so a fault in
- * the text after the lock has been lifted is let through as well -- but only
- * a few in a row, so a real jump into garbage still reaches the crash handler. */
+/* Every prefetch abort lands here first. The libraries' text is always valid,
+ * mapped code, so an abort fetching from it can only be our lock: unlock and
+ * return, and the instruction runs again. Never hand such a fault on -- the
+ * crash handler parks the thread, which on Nov 26 silenced the music (an audio
+ * thread) and then hung the save load waiting on it. The lock is not atomic
+ * across the two libraries: a thread can trap and unlock both while the tick
+ * thread is still locking the second, leaving it locked with nothing armed,
+ * so unarmed faults are expected and simply unlocked.
+ *
+ * The first fault after each arming is the sample (taken atomically, once).
+ * Any thread can take it; only the game thread's are tallied. */
 static void pcs_handler(KuKernelExceptionContext *c) {
   uint32_t pc = c->pc;
   int m = mod_of(pc);
-  if (m >= 0) {
-    if (g_armed) {
-      protect(1);
-      g_armed = 0;
-      g_spurious = 0;
-      if (c->sp - g_stk_lo < g_stk_hi - g_stk_lo) {
-        tally(g_pc, pc & ~1u);
-        tally(g_lr, c->lr);
-        walk_stack(c->sp);
-        g_in_mod[m]++;
-        g_game++;
-      } else {
-        g_other++;
-      }
-      return;
-    }
-    if (g_spurious++ < 4) { protect(1); return; }
+  if (m < 0) { if (g_prev) g_prev(c); return; }
+  int took = __sync_lock_test_and_set(&g_armed, 0) != 0;
+  if (protect(1) < 0) { if (g_prev) g_prev(c); return; }   /* cannot unlock: a real crash */
+  if (!took) return;
+  if (c->sp - g_stk_lo < g_stk_hi - g_stk_lo) {
+    tally(g_pc, pc & ~1u);
+    tally(g_lr, c->lr);
+    walk_stack(c->sp);
+    g_in_mod[m]++;
+    g_game++;
+  } else {
+    g_other++;
   }
-  if (g_prev) g_prev(c);
 }
 
 /* Locking the text takes away read access as well as execute (FSR 7, a
  * translation fault), and code outside the libraries -- so_symbol walking a
  * symbol table, libc copying a string literal, vitaGL reading a constant --
- * reads library pages all the time. Such a read is not a sample: give the
- * access back and retry the load. Same few-in-a-row allowance as above. */
+ * reads library pages all the time. Unlock and retry the load; not a sample.
+ * A write to the text is a real bug (it is never writable) and goes on to the
+ * crash handler. */
 static void pcs_data_handler(KuKernelExceptionContext *c) {
-  if (mod_of(c->FAR) >= 0) {
-    if (g_armed) {
-      protect(1);
-      g_armed = 0;
-      g_spurious = 0;
-      g_reads++;
-      return;
-    }
-    if (g_spurious++ < 4) { protect(1); return; }
+  if (mod_of(c->FAR) < 0 || (c->FSR & 0x800) || protect(1) < 0) {
+    if (g_prev_data) g_prev_data(c);
+    return;
   }
-  if (g_prev_data) g_prev_data(c);
+  __sync_lock_test_and_set(&g_armed, 0);
+  g_reads++;
 }
 
 static void name_addr(uint32_t a, char *out, size_t n) {
@@ -235,13 +230,12 @@ static int tick_thread(SceSize args, void *argp) {
   for (;;) {
     sceKernelDelayThread(g_tick_us);
     g_ticks++;
-    if (g_armed) {
-      g_missed++;                    /* no thread ran library code for a whole tick */
-    } else {
-      g_armed = 1;
-      __sync_synchronize();
-      if (protect(0) < 0) { g_armed = 0; g_missed++; }
-    }
+    /* Still armed: no thread ran library code for a whole tick. Lock again
+     * anyway, so a lock lost to the race in pcs_handler cannot leave the
+     * sampler armed over unlocked text for good. */
+    if (__sync_lock_test_and_set(&g_armed, 1)) g_missed++;
+    __sync_synchronize();
+    if (protect(0) < 0) { __sync_lock_release(&g_armed); g_missed++; }
     uint64_t now = sceKernelGetProcessTimeWide();
     if (now - start < WINDOW_US) continue;
     uint64_t run = game_run_us();
