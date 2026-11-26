@@ -145,6 +145,9 @@ static int seg_add(void) {
   h->inuse = 0;
   h->magic = MAGIC;
 
+  /* bigalloc_owns reads s_seg without the lock: the segment must be visible
+   * on every core before the count that covers it. */
+  __sync_synchronize();
   s_nseg++;
   log_printf("[big] segment %d: %u MB at %p", s_nseg, (unsigned)BIGALLOC_SEG_MB, (void *)base);
   return 1;
@@ -201,7 +204,10 @@ static void *take(size_t n) {
   lock();
   Seg *s = NULL;
   Hdr *h = find_fit(need, &s);
-  if (!h && seg_add()) h = find_fit(need, &s);
+  /* A fresh segment only helps a request that fits in one; a larger request
+   * used to take a segment it could never use. */
+  if (!h && need <= (uint32_t)BIGALLOC_SEG_MB * 1024u * 1024u && seg_add())
+    h = find_fit(need, &s);
   if (!h) {
     s_nfallback++;
     s_fb_bytes += need;

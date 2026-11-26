@@ -16,12 +16,8 @@ rm -rf /tmp/vitaGL
 git clone -q https://github.com/Rinnegatamante/vitaGL /tmp/vitaGL
 cd /tmp/vitaGL
 git checkout -q "$VITAGL_COMMIT"
-if git apply --unidiff-zero "$ROOT/patches/vitaGL-packed-vbo-offset.patch"; then
-  echo "vitaGL: applied vitaGL-packed-vbo-offset.patch"
-else
-  git apply "$ROOT/patches/vitagl-vbo-offset-64k.patch"
-  echo "vitaGL: applied vitagl-vbo-offset-64k.patch"
-fi
+git apply "$ROOT/patches/vitagl-vbo-offset-64k.patch"
+echo "vitaGL: applied vitagl-vbo-offset-64k.patch"
 make clean >/dev/null
 make LOG_ERRORS=1 HAVE_SHADER_CACHE=1 -j"$(nproc)"
 make install

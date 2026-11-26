@@ -169,6 +169,9 @@ GrassWind=0
 | `TextureBits` | `16` | `32` loads textures at full colour depth: sharper, about the same speed, but it can use up the Vita's video memory in big areas. Also selectable from the **MODS** button |
 | `ShadowDistance` | `35` | How far away, in metres, creatures still cast shadows when Shadows is on. Lower values save a little CPU in crowded areas (about 1 ms at `20` in the Upper City) |
 | `ServerOverlap` | `1` | Runs the game's AI on a second core while the 3D scene draws. `0` runs it after the scene instead, the way releases before v0.5.2 did |
+| `CrowdDistance` | `0` | *Experimental.* Creatures and objects farther than this many metres from the camera are not drawn, fog or no fog. `0` is off. Their AI and shadows are unaffected, so they reappear as soon as they come back into range |
+| `CrowdClasses` | *(empty)* | *Experimental.* Limits `CrowdDistance` to objects whose class name contains one of these comma-separated words (the names `CrowdCensus` prints). Empty means every object |
+| `CrowdCensus` | `0` | *Diagnostic.* `1` writes, every 15 seconds, how many objects of each class were drawn, how long they took, and how far away they were |
 
 ## Controls
 

@@ -583,10 +583,15 @@ void srv_overlap_install(void) {
   ovkey_t *keys = malloc(sizeof(ovkey_t) * (size_t)nrel);
   unsigned nk = 0;
   uintptr_t *flush_addr = calloc(NFLUSH, sizeof(uintptr_t));
-  for (unsigned i = 0; i < NFLUSH; i++) flush_addr[i] = so_symbol(m, g_flush_syms[i]);
-
   /* defined functions by address, for slots that carry no symbol (RELATIVE) */
   ovkey_t *defs = malloc(sizeof(ovkey_t) * (size_t)m->num_dynsym);
+  if (!keys || !flush_addr || !defs) {   /* were written to before any check */
+    log_printf("[ov] key tables: no memory; overlap off");
+    free(keys); free(flush_addr); free(defs);
+    g_srv_overlap_enabled = 0;
+    return;
+  }
+  for (unsigned i = 0; i < NFLUSH; i++) flush_addr[i] = so_symbol(m, g_flush_syms[i]);
   unsigned nd = 0;
   for (int i = 0; i < m->num_dynsym; i++) {
     Elf32_Sym *s = &m->dynsym[i];
@@ -627,8 +632,9 @@ void srv_overlap_install(void) {
   void *base = NULL;
   g_stub = calloc(nu ? nu : 1, sizeof *g_stub);
   uint32_t *buf = malloc(bytes);
-  if (blk < 0 || sceKernelGetMemBlockBase(blk, &base) < 0 || !base || !g_stub || !buf || !keys) {
+  if (blk < 0 || sceKernelGetMemBlockBase(blk, &base) < 0 || !base || !g_stub || !buf) {
     log_printf("[ov] stub memory failed (%u stubs); overlap off", nu);
+    free(buf); free(keys); free(defs); free(flush_addr);
     g_srv_overlap_enabled = 0;
     return;
   }
