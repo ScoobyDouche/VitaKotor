@@ -74,6 +74,8 @@ add_executable(KOTOR
   loader/lzma_cache.c
   loader/snd_prefetch.c
   loader/sampler.c
+  loader/pcsamp.c
+  loader/crowd.c
   loader/log.c
   loader/sce_pad.c
   loader/threads.c

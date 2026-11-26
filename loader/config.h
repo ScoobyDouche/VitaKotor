@@ -557,6 +557,11 @@
 // swkotor.ini [Vita Options] DrawDistance overrides it.
 #define DRAW_DISTANCE_M 0
 
+// Crowd distance, in metres; 0 = off. Objects in the dynamic pass (creatures,
+// placeables, doors) farther than this from the camera are not drawn, whatever
+// the fog (crowd.h). swkotor.ini [Vita Options] CrowdDistance overrides it.
+#define CROWD_DISTANCE_M 0
+
 // Grass wind. With Grass on, CAurTriangleBin::UpdateGrassForWind re-bends every
 // blade on the CPU each frame; log250: Grass+Shadows+Frame Buffer took Dantooine
 // from 26-29 fps to 18-20. 0 clears the engine's enablegrasswind so the grass

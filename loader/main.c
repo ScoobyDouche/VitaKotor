@@ -42,6 +42,8 @@
 #include "lzma_cache.h"
 #include "snd_prefetch.h"
 #include "sampler.h"
+#include "pcsamp.h"
+#include "crowd.h"
 #include "obb_cache.h"
 #include "threads.h"
 #include "ini_write.h"
@@ -1378,7 +1380,7 @@ static char *read_whole_ini(const char *path) {
 // than through slurp_ini's 4 KB, since a section added at the end of a long
 // ini is exactly where a player would put it.
 static int g_frame_lock_fps = FRAME_LOCK_FPS;
-static int g_profile;   // ini [Vita Options] Profile=1: call-site sampler (sampler.h)
+static int g_profile;   // ini [Vita Options] Profile: 1 call sites, 2 port census (sampler.h), 3 PCs (pcsamp.h)
 
 static void read_vita_options(void) {
   int cache_kb = OBB_READ_CACHE_KB;
@@ -1402,6 +1404,15 @@ static void read_vita_options(void) {
       g_shadow_dist = atoi(v);
     if (ini_get(text, "Vita Options", "ServerOverlap", v, sizeof(v)) && v[0])
       g_srv_overlap_enabled = atoi(v) != 0;
+    if (ini_get(text, "Vita Options", "CrowdDistance", v, sizeof(v)) && v[0])
+      g_crowd_dist = atoi(v);
+    if (ini_get(text, "Vita Options", "CrowdCensus", v, sizeof(v)) && v[0])
+      g_crowd_census = atoi(v) != 0;
+    {
+      char cls[sizeof g_crowd_classes];
+      if (ini_get(text, "Vita Options", "CrowdClasses", cls, sizeof cls))
+        memcpy(g_crowd_classes, cls, sizeof cls);
+    }
     if (ini_get(text, "Vita Options", "Profile", v, sizeof(v)) && v[0])
       g_profile = atoi(v);
     free(text);
@@ -1945,10 +1956,13 @@ int main(int argc, char *argv[]) {
   // game polls getCurrentLanguage from its first frame onwards.
   resolve_language();
   read_vita_options();
-  if (g_profile) {         // the sampler's stubs and the overlap's both own the
+  if (g_profile == 3) {    // no call slots touched: the overlap stays on
+    pcsamp_install(&g_game_thid, 1000);
+  } else if (g_profile) {  // the sampler's stubs and the overlap's both own the
     g_srv_overlap_enabled = 0;   // call slots; a profile run goes without overlap
     sampler_install(&g_game_thid, g_profile);
   }
+  crowd_install();         // after the ini, chained onto gameprof's body hooks
   srv_overlap_install();   // after the ini (ServerOverlap) and every body hook
   repair_sound_bias();
   modset_scan();          // before the game opens anything on the card

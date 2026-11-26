@@ -9,7 +9,7 @@ name: Build VPK
 
 on:
   push:
-    branches: [fixingIt]
+    branches: [fixingIt, ProfileCrowdSkip]
   workflow_dispatch:
 
 permissions:
@@ -41,19 +41,19 @@ jobs:
           mkdir vpk && cd vpk
           unzip -q ../base/KOTOR.vpk
           cp ../build/eboot.bin eboot.bin
-          rm -f ../KOTOR-fixingIt.vpk
-          zip -q -r -X ../KOTOR-fixingIt.vpk .
+          rm -f "../KOTOR-$GITHUB_REF_NAME.vpk"
+          zip -q -r -X "../KOTOR-$GITHUB_REF_NAME.vpk" .
           cd ..
-          unzip -l KOTOR-fixingIt.vpk | tail -n 20
+          unzip -l "KOTOR-$GITHUB_REF_NAME.vpk" | tail -n 20
           short=$(git rev-parse --short HEAD)
           echo "SHORT=$short" >> "$GITHUB_ENV"
           echo "BASE=$tag" >> "$GITHUB_ENV"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: KOTOR-fixingIt-${{ env.SHORT }}
+          name: KOTOR-${{ github.ref_name }}-${{ env.SHORT }}
           path: |
-            KOTOR-fixingIt.vpk
+            KOTOR-${{ github.ref_name }}.vpk
             build/eboot.bin
 
       # Earlier versions of this workflow published a "fixingit-latest"

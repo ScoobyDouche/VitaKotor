@@ -134,8 +134,27 @@ static size_t thumb_relocate(uintptr_t orig_fn, size_t len, uint16_t *out,
 
 #define TRAMP_PAGE 0x1000
 
+/* hook_thumb's own patch: an optional NOP (when the function is only 2-byte
+ * aligned), then LDR.W PC,[PC,#0] and the destination word. Returns that
+ * destination if `fn` already carries it, else 0. */
+static uintptr_t existing_thumb_hook(uintptr_t fn) {
+  const uint16_t *c = (const uint16_t *)fn;
+  size_t k = 0;
+  if (fn & 2) {
+    if (c[0] != 0xbf00) return 0;
+    k = 1;
+  }
+  if (c[k] != 0xf8df || c[k + 1] != 0xf000) return 0;
+  return *(const uint32_t *)&c[k + 2];
+}
+
 uintptr_t build_thumb_trampoline(uintptr_t orig_fn, size_t len) {
   orig_fn &= ~(uintptr_t)1;
+  /* Already hooked: the earlier hook is a whole function that ends up in the
+   * original, so the new hook chains through it. Relocating the patch itself
+   * would fail (it loads PC), which used to leave the second hook out. */
+  uintptr_t prev = existing_thumb_hook(orig_fn);
+  if (prev) return prev;
   uint16_t code[16];
   uint32_t lit[4];
   size_t nlit, lit_at[4];
