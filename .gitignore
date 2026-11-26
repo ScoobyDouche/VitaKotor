@@ -32,3 +32,4 @@ logs/
 
 # Downloaded APKs and other third-party files (large, machine-local)
 downloads/
+__pycache__/
