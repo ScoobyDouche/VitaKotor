@@ -169,9 +169,9 @@ static uint32_t g_tot_culled;
 
 static int class_matches(const char *name) {
   if (!g_crowd_classes[0]) return 1;
-  char buf[sizeof g_crowd_classes];
+  char buf[sizeof g_crowd_classes], *save = NULL;
   strcpy(buf, g_crowd_classes);
-  for (char *tok = strtok(buf, ", "); tok; tok = strtok(NULL, ", "))
+  for (char *tok = strtok_r(buf, ", ", &save); tok; tok = strtok_r(NULL, ", ", &save))
     if (strstr(name, tok)) return 1;
   return 0;
 }
